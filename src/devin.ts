@@ -307,6 +307,8 @@ export async function* streamChat(params: ChatParams): AsyncGenerator<ChatStream
     "chat",
   );
 
+  let cleanupReader: (() => Promise<void>) | undefined;
+  try {
   if (!response.ok) {
     const text = await response.text();
     currentResponsesDiagnostic()?.recordUpstreamError({
@@ -327,6 +329,10 @@ export async function* streamChat(params: ChatParams): AsyncGenerator<ChatStream
   }
 
   const reader = response.body.getReader();
+  cleanupReader = async () => {
+    try { await reader.cancel(); } catch { /* Preserve the original stream error. */ }
+    reader.releaseLock();
+  };
   let pending = Buffer.alloc(0);
   let lastStopReason = 0;
   let lastUsage: GetChatMessageResponse["usage"] = null;
@@ -434,6 +440,11 @@ export async function* streamChat(params: ChatParams): AsyncGenerator<ChatStream
 
   clearTimeout(idleTimer);
   yield { type: "done", stopReason: lastStopReason, usage: lastUsage };
+  } finally {
+    clearTimeout(idleTimer);
+    chatController.abort();
+    await cleanupReader?.();
+  }
 }
 
 // ─── Model discovery (optional) ──────────────────────────────────────────────

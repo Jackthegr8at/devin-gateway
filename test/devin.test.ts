@@ -351,6 +351,25 @@ const baseChatParams = (baseUrl: string) => ({
 });
 
 describe("streamChat", () => {
+  test("early consumer exit cancels the upstream reader and releases its lock", async () => {
+    const originalFetch = globalThis.fetch;
+    let cancelled = false;
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) { controller.enqueue(connectFrame(0, encodeGetChatMessageResponseBytes({ deltaText: "one" }))); },
+      cancel() { cancelled = true; },
+    });
+    globalThis.fetch = (async (input: string | URL | Request) => String(input).endsWith(AUTH_PATH)
+      ? new Response(Uint8Array.from(encodeGetUserJwtResponseBytes({ userJwt: "fixture" })))
+      : new Response(body)) as typeof fetch;
+    try {
+      for await (const event of streamChat(baseChatParams("http://localhost"))) {
+        expect(event.type).toBe("text");
+        break;
+      }
+      expect(cancelled).toBe(true);
+      expect(body.locked).toBe(false);
+    } finally { globalThis.fetch = originalFetch; }
+  });
   test("single text frame yields a text event then done", async () => {
     const frame = connectFrame(
       FLAG_NORMAL,
