@@ -11,6 +11,15 @@ function Assert-CollapseGuard([string]$Name, [bool]$Actual, [bool]$Expected) {
     Write-Host "PASS: $Name"
 }
 
+$boundedProcess = [pscustomobject]@{ ExitCode = 0; Killed = $false; WaitMilliseconds = 0 }
+$boundedProcess | Add-Member ScriptMethod WaitForExit { param($Milliseconds) $this.WaitMilliseconds = $Milliseconds; return $false }
+$boundedProcess | Add-Member ScriptMethod Kill { $this.Killed = $true }
+$timedOut = $false
+try {
+    $null = Invoke-CodexDevinAttachedProcess -FilePath 'synthetic-ssh' -Arguments @('synthetic') -TimeoutSeconds 2 -ProcessStarter { param($File, $Arguments) return $boundedProcess }
+} catch { $timedOut = $_.Exception.Message -like '*bounded timeout*' }
+Assert-CollapseGuard 'restart timeout stops only its owned child and fails closed' ($timedOut -and $boundedProcess.Killed -and $boundedProcess.WaitMilliseconds -eq 2000) $true
+
 $netstat = @(
     '  TCP    127.0.0.1:38643      0.0.0.0:0              LISTENING       34560'
     '  TCP    0.0.0.0:38643        0.0.0.0:0              LISTENING       777'

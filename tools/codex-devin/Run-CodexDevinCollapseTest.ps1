@@ -108,7 +108,8 @@ function Invoke-CodexDevinRemoteSshCommand {
     # Launch outside PowerShell's success/error pipelines. Besides preserving
     # interactive stdin for SSH login, this ensures captured child output
     # cannot be mistaken for a truthy login result by the auth guard.
-    return (Invoke-CodexDevinAttachedProcess -FilePath $ssh.Source -Arguments $sshArguments)
+    $timeoutSeconds = if ($Action -ceq 'Restart') { 120 } else { 0 }
+    return (Invoke-CodexDevinAttachedProcess -FilePath $ssh.Source -Arguments $sshArguments -TimeoutSeconds $timeoutSeconds)
 }
 
 function Get-CodexDevinCollapseModelIds($Response) {

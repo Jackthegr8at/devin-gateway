@@ -155,6 +155,7 @@ function Invoke-CodexDevinAttachedProcess {
     param(
         [Parameter(Mandatory)][string]$FilePath,
         [Parameter(Mandatory)][string[]]$Arguments,
+        [ValidateRange(0, 3600)][int]$TimeoutSeconds = 0,
         [scriptblock]$ProcessStarter
     )
 
@@ -164,7 +165,14 @@ function Invoke-CodexDevinAttachedProcess {
     } else {
         # No redirected stdio: SSH inherits this console's input/output, while
         # Start-Process keeps child output out of this function's success stream.
-        $process = Start-Process -FilePath $FilePath -ArgumentList $argumentLine -NoNewWindow -Wait -PassThru -ErrorAction Stop
+        $process = Start-Process -FilePath $FilePath -ArgumentList $argumentLine -NoNewWindow -PassThru -ErrorAction Stop
+        if ($TimeoutSeconds -eq 0) { $process.WaitForExit() }
+    }
+
+    if ($TimeoutSeconds -gt 0 -and $null -ne $process -and -not $process.WaitForExit($TimeoutSeconds * 1000)) {
+        # Only the child created above is stopped; remote service state may need inspection.
+        $process.Kill()
+        throw 'The attached restart process exceeded its bounded timeout; inspect remote service state before retrying.'
     }
 
     if ($null -eq $process -or $null -eq $process.PSObject.Properties['ExitCode']) {

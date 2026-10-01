@@ -463,7 +463,10 @@ export async function discoverModels(
   apiKey: string,
   baseUrl: string = DEVIN_API_URL,
   signal?: AbortSignal,
+  timeoutMs = 30_000,
 ): Promise<DiscoveredModel[]> {
+  const timeout = AbortSignal.timeout(timeoutMs);
+  const discoverySignal = signal ? AbortSignal.any([signal, timeout]) : timeout;
   const token = normalizeToken(apiKey);
   const enc = new ProtoEncoder();
   enc.message(1, (e) => {
@@ -483,7 +486,7 @@ export async function discoverModels(
       accept: "*/*",
     },
     body: enc.finish(),
-    signal,
+    signal: discoverySignal,
   });
   if (!res.ok) {
     const text = await res.text().catch(() => "");

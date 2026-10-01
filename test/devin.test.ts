@@ -351,6 +351,15 @@ const baseChatParams = (baseUrl: string) => ({
 });
 
 describe("streamChat", () => {
+  test("model discovery has a bounded default-independent deadline", async () => {
+    const original = globalThis.fetch;
+    globalThis.fetch = ((_input: unknown, init?: RequestInit) => new Promise((_resolve, reject) => {
+      init!.signal!.addEventListener("abort", () => reject(init!.signal!.reason), { once: true });
+    })) as typeof fetch;
+    try {
+      await expect(discoverModels("fixture", "http://localhost", undefined, 20)).rejects.toThrow();
+    } finally { globalThis.fetch = original; }
+  });
   test("rejects malformed Connect frames rather than reporting successful completion", async () => {
     for (const bytes of [
       Buffer.from([0, 0]),
