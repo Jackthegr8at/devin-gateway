@@ -400,7 +400,7 @@ describe("ProtoDecoder.skip", () => {
     // field 1, wire 3 -> tag = (1<<3)|3 = 0x0b
     const bytes = Uint8Array.from([0x0b]);
     const dec = new ProtoDecoder(bytes);
-    dec.readTag();
+    expect(() => dec.readTag()).toThrow(/Invalid protobuf tag/);
     expect(() => dec.skip(3)).toThrow(/Unknown wire type/);
   });
 });

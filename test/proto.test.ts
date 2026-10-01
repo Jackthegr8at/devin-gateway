@@ -1,6 +1,18 @@
 import { expect, test } from "bun:test";
 
-import { decodeGetChatMessageResponse } from "../src/proto.ts";
+import { decodeGetChatMessageResponse, ProtoDecoder } from "../src/proto.ts";
+
+test("rejects truncated and overflowing protobuf values", () => {
+  for (const bytes of [[0x80], Array(10).fill(0xff)]) {
+    expect(() => new ProtoDecoder(Uint8Array.from(bytes)).readVarint()).toThrow();
+  }
+  expect(() => new ProtoDecoder(Uint8Array.of(4, 1)).readBytes()).toThrow("Truncated");
+  expect(() => new ProtoDecoder(Uint8Array.of(0)).readTag()).toThrow("Invalid");
+  for (const wire of [1, 2, 5]) {
+    expect(() => new ProtoDecoder(Uint8Array.of(9)).skip(wire)).toThrow("Truncated");
+  }
+  expect(() => new ProtoDecoder(Uint8Array.of(1, 0xff)).readString()).toThrow();
+});
 
 test("decodes delta_text after an unknown length-delimited field", () => {
   const responseBytes = Uint8Array.of(

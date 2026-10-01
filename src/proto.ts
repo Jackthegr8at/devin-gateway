@@ -115,35 +115,45 @@ export class ProtoDecoder {
   readVarint(): bigint {
     let result = 0n;
     let shift = 0n;
-    while (this.pos < this.bytes.length) {
+    for (let i = 0; i < 10; i++) {
+      this.requireBytes(1);
       const byte = this.bytes[this.pos++];
+      if (i === 9 && byte > 1) throw new Error("Invalid protobuf varint");
       result |= BigInt(byte & 0x7f) << shift;
-      if ((byte & 0x80) === 0) break;
+      if ((byte & 0x80) === 0) return result;
       shift += 7n;
     }
-    return result;
+    throw new Error("Invalid protobuf varint");
+  }
+
+  private requireBytes(length: number): void {
+    if (!Number.isSafeInteger(length) || length < 0 || length > this.bytes.length - this.pos) {
+      throw new Error("Truncated protobuf payload");
+    }
   }
 
   readTag(): { field: number; wire: number } {
-    const tag = Number(this.readVarint());
+    const value = this.readVarint();
+    if (value > 0xffffffffn) throw new Error("Invalid protobuf tag");
+    const tag = Number(value);
+    if ((tag >>> 3) === 0 || ![0, 1, 2, 5].includes(tag & 7)) throw new Error("Invalid protobuf tag");
     return { field: tag >>> 3, wire: tag & 0x07 };
   }
 
   readString(): string {
-    const len = Number(this.readVarint());
-    const start = this.pos;
-    this.pos += len;
-    return new TextDecoder().decode(this.bytes.subarray(start, start + len));
+    return new TextDecoder("utf-8", { fatal: true }).decode(this.readBytes());
   }
 
   readBytes(): Uint8Array {
     const len = Number(this.readVarint());
+    this.requireBytes(len);
     const start = this.pos;
     this.pos += len;
     return this.bytes.subarray(start, start + len);
   }
 
   readDouble(): number {
+    this.requireBytes(8);
     const val = this.view.getFloat64(this.pos, true);
     this.pos += 8;
     return val;
@@ -155,14 +165,17 @@ export class ProtoDecoder {
         this.readVarint();
         break;
       case 1:
+        this.requireBytes(8);
         this.pos += 8;
         break;
       case 2: {
         const length = Number(this.readVarint());
+        this.requireBytes(length);
         this.pos += length;
         break;
       }
       case 5:
+        this.requireBytes(4);
         this.pos += 4;
         break;
       default:

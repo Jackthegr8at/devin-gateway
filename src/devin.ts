@@ -361,6 +361,7 @@ export async function* streamChat(params: ChatParams): AsyncGenerator<ChatStream
 
     while (pending.length >= 5) {
       const flag = pending[0];
+      if (flag & ~3) throw new Error("Invalid Connect frame flags");
       const len = pending.readUInt32BE(1);
       if (len > MAX_FRAME_PAYLOAD) {
         clearTimeout(idleTimer);
@@ -374,11 +375,10 @@ export async function* streamChat(params: ChatParams): AsyncGenerator<ChatStream
       pending = pending.subarray(5 + len);
 
       if (flag & CONNECT_END_STREAM_FLAG) {
-        const trailerBytes = flag & CONNECT_COMPRESSED_FLAG ? gunzipSync(payload) : payload;
+        const trailerBytes = flag & CONNECT_COMPRESSED_FLAG ? gunzipSync(payload, { maxOutputLength: MAX_FRAME_PAYLOAD }) : payload;
         const trailer = trailerBytes.toString("utf8").trim();
         if (trailer) {
           // Check for Connect error trailer
-          try {
             const parsed = JSON.parse(trailer);
             if (parsed?.error?.code) {
               const errMsg = `Devin stream error ${parsed.error.code}: ${parsed.error.message ?? ""}`;
@@ -403,14 +403,11 @@ export async function* streamChat(params: ChatParams): AsyncGenerator<ChatStream
               yield { type: "done", stopReason: lastStopReason, usage: lastUsage };
               return;
             }
-          } catch {
-            // Non-JSON trailer — ignore
-          }
         }
         continue;
       }
 
-      const raw = flag & CONNECT_COMPRESSED_FLAG ? gunzipSync(payload) : payload;
+      const raw = flag & CONNECT_COMPRESSED_FLAG ? gunzipSync(payload, { maxOutputLength: MAX_FRAME_PAYLOAD }) : payload;
       const msg = decodeGetChatMessageResponse(raw);
 
       if (msg.deltaText) {
@@ -437,6 +434,8 @@ export async function* streamChat(params: ChatParams): AsyncGenerator<ChatStream
 
     if (done) break;
   }
+
+  if (pending.length !== 0) throw new Error("Truncated Connect frame");
 
   clearTimeout(idleTimer);
   yield { type: "done", stopReason: lastStopReason, usage: lastUsage };

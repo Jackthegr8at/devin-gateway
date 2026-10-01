@@ -351,6 +351,19 @@ const baseChatParams = (baseUrl: string) => ({
 });
 
 describe("streamChat", () => {
+  test("rejects malformed Connect frames rather than reporting successful completion", async () => {
+    for (const bytes of [
+      Buffer.from([0, 0]),
+      Buffer.from([0, 0, 0, 0, 2, 1]),
+      connectFrame(4, []),
+      connectFrame(2, new TextEncoder().encode("not-json")),
+      connectFrame(0, [0x1a, 5, 1]),
+    ]) {
+      const server = mockUpstream([bytes]);
+      try { await expect(collectStream(baseChatParams(server.url.origin))).rejects.toThrow(); }
+      finally { await server.stop(true); }
+    }
+  });
   test("early consumer exit cancels the upstream reader and releases its lock", async () => {
     const originalFetch = globalThis.fetch;
     let cancelled = false;
