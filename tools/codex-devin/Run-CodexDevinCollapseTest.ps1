@@ -102,12 +102,13 @@ function Invoke-CodexDevinRemoteSshCommand {
     $ssh = Get-Command 'ssh.exe' -ErrorAction Stop
     if ($Action -ceq 'Login') {
         Write-Host "Starting interactive Devin login on devhub over SSH ($SshTarget). The OAuth URL and prompt will appear below."
-        & $ssh.Source @sshArguments 2>&1 | Out-Host
     } else {
         Write-Host "Recreating only the devin-gateway Compose service on devhub over SSH ($SshTarget)."
-        & $ssh.Source @sshArguments 2>&1 | Out-Host
     }
-    return ($LASTEXITCODE -eq 0)
+    # Launch outside PowerShell's success/error pipelines. Besides preserving
+    # interactive stdin for SSH login, this ensures captured child output
+    # cannot be mistaken for a truthy login result by the auth guard.
+    return (Invoke-CodexDevinAttachedProcess -FilePath $ssh.Source -Arguments $sshArguments)
 }
 
 function Get-CodexDevinCollapseModelIds($Response) {

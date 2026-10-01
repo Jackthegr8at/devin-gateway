@@ -15,7 +15,7 @@ $serverPath = Join-Path $gatewayRoot 'src\server.ts'
 $bunPath = Join-Path $env:USERPROFILE '.bun\bin\bun.exe'
 $gatewayPort = 38643
 $callbackPort = 59653
-$reviewedSourceSha256 = '4F5EB92923873AA9AE26E28109B4B795668D634945AFE8A54AA66EF7EE74A6E6'
+$reviewedSourceSha256 = '67A9DC4892B0A3D69F271670E0E9A13DDA143D8BBA7450740B083D0FC7D55D82'
 
 function Write-SafeStartupStatus([string]$Code) {
     if ([string]::IsNullOrWhiteSpace($StartupStatusPath)) { return }

@@ -128,8 +128,18 @@ Assert-CollapseGuard 'SSH options preserve agent/default identity behavior when 
 $missingIdentityRejected = $false
 try { $null = Get-CodexDevinRemoteSshOptions -Action Login -IdentityFile (Join-Path ([IO.Path]::GetTempPath()) ([guid]::NewGuid().ToString('N'))) } catch { $missingIdentityRejected = $true }
 Assert-CollapseGuard 'SSH identity file must exist before remote auth begins' $missingIdentityRejected $true
-Assert-CollapseGuard 'interactive SSH command uses non-interactive sudo for the existing paste login service' ((New-CodexDevinRemoteComposeCommand -Action Login -RemoteGatewayDirectory '/srv/example/services/devin-gateway') -ceq "cd '/srv/example/services/devin-gateway' && sudo -n docker compose run --rm devin-login") $true
+Assert-CollapseGuard 'interactive SSH command explicitly forwards stdin without allocating a nested Compose TTY' ((New-CodexDevinRemoteComposeCommand -Action Login -RemoteGatewayDirectory '/srv/example/services/devin-gateway') -ceq "cd '/srv/example/services/devin-gateway' && sudo -n docker compose run --rm --interactive --no-TTY devin-login") $true
 Assert-CollapseGuard 'restart SSH command uses non-interactive sudo and recreates only the gateway service' ((New-CodexDevinRemoteComposeCommand -Action Restart -RemoteGatewayDirectory '/srv/example/services/devin-gateway') -ceq "cd '/srv/example/services/devin-gateway' && sudo -n docker compose up -d --force-recreate devin-gateway") $true
+$quotedWindowsArgument = ConvertTo-CodexDevinWindowsCommandLineArgument -Argument 'C:\Example Data\ssh.exe'
+Assert-CollapseGuard 'Windows process arguments with spaces are quoted as one argument' ($quotedWindowsArgument -ceq '"C:\Example Data\ssh.exe"') $true
+$script:mockProcessArguments = $null
+$successfulMockProcess = { param($filePath, $argumentLine) $script:mockProcessArguments = $argumentLine; [pscustomobject]@{ ExitCode = 0 } }
+$successfulProcessOutput = @(Invoke-CodexDevinAttachedProcess -FilePath 'ssh.exe' -Arguments @('-t', 'gateway-user@192.0.2.1', "cd '/srv/example space' && docker compose run devin-login") -ProcessStarter $successfulMockProcess)
+Assert-CollapseGuard 'attached process reports success as one boolean without leaking child output into the result' ($successfulProcessOutput.Count -eq 1 -and $successfulProcessOutput[0] -is [bool] -and $successfulProcessOutput[0]) $true
+Assert-CollapseGuard 'attached process keeps the SSH remote command as one correctly quoted argument' ($script:mockProcessArguments -match '"cd ''/srv/example space'' && docker compose run devin-login"$') $true
+$failedMockProcess = { param($filePath, $argumentLine) [pscustomobject]@{ ExitCode = 255 } }
+$failedProcessOutput = @(Invoke-CodexDevinAttachedProcess -FilePath 'ssh.exe' -Arguments @('-t', 'gateway-user@192.0.2.1', 'false') -ProcessStarter $failedMockProcess)
+Assert-CollapseGuard 'attached process failure remains a false boolean' ($failedProcessOutput.Count -eq 1 -and $failedProcessOutput[0] -is [bool] -and -not $failedProcessOutput[0]) $true
 Assert-CollapseGuard 'remote path quoting preserves spaces' ((ConvertTo-CodexDevinRemoteShellPath -Path '/srv/example space/gateway') -ceq "'/srv/example space/gateway'") $true
 Assert-CollapseGuard 'remote path quoting safely escapes embedded quotes' ((ConvertTo-CodexDevinRemoteShellPath -Path "/srv/example/o'connor") -ceq "'/srv/example/o'`"'`"'connor'") $true
 

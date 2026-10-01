@@ -22,7 +22,7 @@
 import { exec } from "node:child_process";
 import { createServer, type Server } from "node:http";
 import { createInterface } from "node:readline";
-import { startLoginFlow, completeLoginWithUrl, exchangeToken } from "../login.js";
+import { startLoginFlow, completeLoginWithUrl, exchangeToken, TOKEN_EXCHANGE_TIMEOUT_MS } from "../login.js";
 import { readToken, writeToken, TOKEN_FILE } from "../config.js";
 
 const CALLBACK_PORT = 59653;
@@ -76,6 +76,7 @@ export async function runLogin(argv: string[]): Promise<void> {
     }
 
     try {
+      console.log(`  Callback received. Contacting Devin to exchange the code (${TOKEN_EXCHANGE_TIMEOUT_MS / 1000}s timeout)...`);
       const token = await completeLoginWithUrl(session, input.trim());
       await finishLogin(token, printOnly, hideToken);
     } catch (err) {

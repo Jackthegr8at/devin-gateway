@@ -10,6 +10,7 @@
 const DEVIN_WEBAPP_URL = "https://app.devin.ai";
 const DEVIN_API_URL = "https://api.devin.ai";
 const TOKEN_PATH = "/auth/cli/token";
+export const TOKEN_EXCHANGE_TIMEOUT_MS = 30_000;
 
 export interface LoginSession {
   state: string;
@@ -62,16 +63,25 @@ export async function completeLoginWithUrl(
 }
 
 export async function exchangeToken(code: string, verifier: string): Promise<string> {
-  const res = await fetch(`${DEVIN_API_URL}${TOKEN_PATH}`, {
-    method: "POST",
-    headers: { "Accept": "application/json", "Content-Type": "application/json" },
-    body: JSON.stringify({ code, code_verifier: verifier }),
-  });
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`Token exchange failed: ${res.status} ${text}`);
+  const signal = AbortSignal.timeout(TOKEN_EXCHANGE_TIMEOUT_MS);
+  try {
+    const res = await fetch(`${DEVIN_API_URL}${TOKEN_PATH}`, {
+      method: "POST",
+      headers: { "Accept": "application/json", "Content-Type": "application/json" },
+      body: JSON.stringify({ code, code_verifier: verifier }),
+      signal,
+    });
+    if (!res.ok) {
+      const text = await res.text();
+      throw new Error(`Token exchange failed: ${res.status} ${text}`);
+    }
+    const data = (await res.json()) as { token?: string };
+    if (!data.token) throw new Error("Token exchange returned empty token");
+    return data.token;
+  } catch (error) {
+    if (signal.aborted || (error instanceof Error && error.name === "TimeoutError")) {
+      throw new Error("Devin token exchange timed out after 30 seconds. Check outbound HTTPS access from the gateway container.");
+    }
+    throw error;
   }
-  const data = (await res.json()) as { token?: string };
-  if (!data.token) throw new Error("Token exchange returned empty token");
-  return data.token;
 }

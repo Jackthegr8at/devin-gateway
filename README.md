@@ -106,6 +106,8 @@ This fork is deployed by building the checked-out Git branch on the Linux host. 
 
 The gateway listens on port `3000` inside the container and publishes host port `38643` only on the private address set in `.env`. Prefer the host's WireGuard interface address when Codex connects over WireGuard. Otherwise use a private LAN interface and restrict TCP `38643` in the host firewall to trusted client addresses. Do not create a router port-forward or expose this service to the public Internet.
 
+The gateway and `devin-login` containers also require outbound HTTPS to Devin. A restrictive `DOCKER-USER` policy can block this traffic while `/health` still returns `ok`. If paste login stalls after submitting the callback URL, check HTTPS connectivity from the Docker network, not only from the host. The login CLI reports when it receives the callback and bounds the token exchange to 30 seconds; it does not retry the exchange automatically.
+
 #### First deployment on the host
 
 ```bash

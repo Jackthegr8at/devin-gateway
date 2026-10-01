@@ -92,11 +92,30 @@ describe("exchangeToken", () => {
 
       expect(captured.url).toBe(TOKEN_ENDPOINT);
       expect(captured.init?.method).toBe("POST");
+      expect(captured.init?.signal).toBeInstanceOf(AbortSignal);
+      expect(captured.init?.signal?.aborted).toBe(false);
       const headers = new Headers(captured.init?.headers);
       expect(headers.get("content-type")).toBe("application/json");
       expect(captured.init?.body).toBe(
         JSON.stringify({ code: "code123", code_verifier: "verifier456" }),
       );
+    } finally {
+      globalThis.fetch = real;
+    }
+  });
+
+  test("reports a bounded timeout without retrying or exposing network error details", async () => {
+    const real = globalThis.fetch;
+    let attempts = 0;
+    try {
+      globalThis.fetch = async () => {
+        attempts++;
+        throw new DOMException("synthetic private network details", "TimeoutError");
+      };
+      await expect(exchangeToken("synthetic-code", "synthetic-verifier")).rejects.toThrow(
+        "Devin token exchange timed out after 30 seconds. Check outbound HTTPS access from the gateway container.",
+      );
+      expect(attempts).toBe(1);
     } finally {
       globalThis.fetch = real;
     }

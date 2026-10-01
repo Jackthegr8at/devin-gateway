@@ -115,6 +115,64 @@ function Get-CodexDevinRemoteSshOptions {
     return $options
 }
 
+function ConvertTo-CodexDevinWindowsCommandLineArgument {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Argument)
+
+    # Start-Process accepts one Windows command-line string. Quote each
+    # argument using the CommandLineToArgvW backslash/quote rules so the SSH
+    # remote command remains one argument even when it contains spaces/quotes.
+    $builder = New-Object System.Text.StringBuilder
+    [void]$builder.Append([char]34)
+    $backslashCount = 0
+    foreach ($character in $Argument.ToCharArray()) {
+        if ([int]$character -eq 92) {
+            $backslashCount++
+            continue
+        }
+
+        if ([int]$character -eq 34) {
+            if ($backslashCount -gt 0) {
+                [void]$builder.Append([char]92, (2 * $backslashCount) + 1)
+            } else {
+                [void]$builder.Append([char]92)
+            }
+            [void]$builder.Append([char]34)
+        } else {
+            if ($backslashCount -gt 0) { [void]$builder.Append([char]92, $backslashCount) }
+            [void]$builder.Append($character)
+        }
+        $backslashCount = 0
+    }
+
+    if ($backslashCount -gt 0) { [void]$builder.Append([char]92, 2 * $backslashCount) }
+    [void]$builder.Append([char]34)
+    return $builder.ToString()
+}
+
+function Invoke-CodexDevinAttachedProcess {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$FilePath,
+        [Parameter(Mandatory)][string[]]$Arguments,
+        [scriptblock]$ProcessStarter
+    )
+
+    $argumentLine = (@($Arguments | ForEach-Object { ConvertTo-CodexDevinWindowsCommandLineArgument -Argument $_ }) -join ' ')
+    if ($null -ne $ProcessStarter) {
+        $process = & $ProcessStarter $FilePath $argumentLine
+    } else {
+        # No redirected stdio: SSH inherits this console's input/output, while
+        # Start-Process keeps child output out of this function's success stream.
+        $process = Start-Process -FilePath $FilePath -ArgumentList $argumentLine -NoNewWindow -Wait -PassThru -ErrorAction Stop
+    }
+
+    if ($null -eq $process -or $null -eq $process.PSObject.Properties['ExitCode']) {
+        throw 'The attached process did not return an exit code.'
+    }
+    return [bool]([int]$process.ExitCode -eq 0)
+}
+
 function ConvertTo-CodexDevinRemoteShellPath {
     [CmdletBinding()]
     param([Parameter(Mandatory)][string]$Path)
@@ -136,7 +194,7 @@ function New-CodexDevinRemoteComposeCommand {
     )
 
     $quotedDirectory = ConvertTo-CodexDevinRemoteShellPath -Path $RemoteGatewayDirectory
-    if ($Action -ceq 'Login') { return "cd $quotedDirectory && sudo -n docker compose run --rm devin-login" }
+    if ($Action -ceq 'Login') { return "cd $quotedDirectory && sudo -n docker compose run --rm --interactive --no-TTY devin-login" }
     return "cd $quotedDirectory && sudo -n docker compose up -d --force-recreate devin-gateway"
 }
 
@@ -374,4 +432,4 @@ function Get-CodexDevinGatewayStartupFailureMessage {
     }
 }
 
-Export-ModuleMember -Function Get-CodexDevinCollapsePortListeners, Test-CodexDevinGatewayPortAvailable, Resolve-CodexDevinGatewayTarget, Test-CodexDevinRemoteGatewayHealth, Get-CodexDevinFallbackTokenState, Test-CodexDevinSshTarget, Get-CodexDevinRemoteSshOptions, ConvertTo-CodexDevinRemoteShellPath, New-CodexDevinRemoteComposeCommand, Invoke-CodexDevinRemoteAuthentication, Invoke-CodexDevinGatewayPreflight, Test-CodexDevinLoopbackPortFree, Resolve-CodexDevinGatewayRoot, Get-CodexDevinGatewayFingerprint, Test-CodexDevinGatewayFingerprint, Test-CodexDevinCollapseGatewayReady, Test-CodexDevinCollapseRestoreSafe, Get-CodexDevinCollapseDesktopWaitAction, Get-CodexDevinGatewayStartupFailureMessage
+Export-ModuleMember -Function Get-CodexDevinCollapsePortListeners, Test-CodexDevinGatewayPortAvailable, Resolve-CodexDevinGatewayTarget, Test-CodexDevinRemoteGatewayHealth, Get-CodexDevinFallbackTokenState, Test-CodexDevinSshTarget, Get-CodexDevinRemoteSshOptions, ConvertTo-CodexDevinWindowsCommandLineArgument, Invoke-CodexDevinAttachedProcess, ConvertTo-CodexDevinRemoteShellPath, New-CodexDevinRemoteComposeCommand, Invoke-CodexDevinRemoteAuthentication, Invoke-CodexDevinGatewayPreflight, Test-CodexDevinLoopbackPortFree, Resolve-CodexDevinGatewayRoot, Get-CodexDevinGatewayFingerprint, Test-CodexDevinGatewayFingerprint, Test-CodexDevinCollapseGatewayReady, Test-CodexDevinCollapseRestoreSafe, Get-CodexDevinCollapseDesktopWaitAction, Get-CodexDevinGatewayStartupFailureMessage
