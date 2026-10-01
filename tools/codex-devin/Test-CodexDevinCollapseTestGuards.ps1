@@ -122,6 +122,12 @@ try {
 Assert-CollapseGuard 'fallback_token=not_set after restart fails closed' $tokenNotSetStopped $true
 
 Assert-CollapseGuard 'SSH target rejects option injection' (-not (Test-CodexDevinSshTarget -SshTarget '-oProxyCommand=bad')) $true
+Assert-CollapseGuard 'interactive login SSH options include the supplied identity file and allocate a TTY' ((@(Get-CodexDevinRemoteSshOptions -Action Login -IdentityFile $PSCommandPath) -join '|') -ceq "-i|$PSCommandPath|-o|IdentitiesOnly=yes|-t") $true
+Assert-CollapseGuard 'gateway restart SSH options include the supplied identity file without allocating a TTY' ((@(Get-CodexDevinRemoteSshOptions -Action Restart -IdentityFile $PSCommandPath) -join '|') -ceq "-i|$PSCommandPath|-o|IdentitiesOnly=yes|-T") $true
+Assert-CollapseGuard 'SSH options preserve agent/default identity behavior when no file is supplied' ((@(Get-CodexDevinRemoteSshOptions -Action Login) -join '|') -ceq '-t') $true
+$missingIdentityRejected = $false
+try { $null = Get-CodexDevinRemoteSshOptions -Action Login -IdentityFile (Join-Path ([IO.Path]::GetTempPath()) ([guid]::NewGuid().ToString('N'))) } catch { $missingIdentityRejected = $true }
+Assert-CollapseGuard 'SSH identity file must exist before remote auth begins' $missingIdentityRejected $true
 Assert-CollapseGuard 'interactive SSH command runs the existing paste login service' ((New-CodexDevinRemoteComposeCommand -Action Login -RemoteGatewayDirectory '/srv/example/services/devin-gateway') -ceq "cd '/srv/example/services/devin-gateway' && docker compose run --rm devin-login") $true
 Assert-CollapseGuard 'restart SSH command recreates only the gateway service' ((New-CodexDevinRemoteComposeCommand -Action Restart -RemoteGatewayDirectory '/srv/example/services/devin-gateway') -ceq "cd '/srv/example/services/devin-gateway' && docker compose up -d --force-recreate devin-gateway") $true
 Assert-CollapseGuard 'remote path quoting preserves spaces' ((ConvertTo-CodexDevinRemoteShellPath -Path '/srv/example space/gateway') -ceq "'/srv/example space/gateway'") $true

@@ -97,6 +97,24 @@ function Test-CodexDevinSshTarget {
     return ($SshTarget -cmatch '^(?:[A-Za-z0-9._-]+@)?[A-Za-z0-9][A-Za-z0-9.-]*$')
 }
 
+function Get-CodexDevinRemoteSshOptions {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][ValidateSet('Login', 'Restart')][string]$Action,
+        [AllowNull()][AllowEmptyString()][string]$IdentityFile
+    )
+
+    $options = @()
+    if (-not [string]::IsNullOrWhiteSpace($IdentityFile)) {
+        if (-not (Test-Path -LiteralPath $IdentityFile -PathType Leaf)) {
+            throw 'RemoteSshIdentityFile must point to an existing SSH identity file.'
+        }
+        $options += @('-i', $IdentityFile, '-o', 'IdentitiesOnly=yes')
+    }
+    if ($Action -ceq 'Login') { $options += '-t' } else { $options += '-T' }
+    return $options
+}
+
 function ConvertTo-CodexDevinRemoteShellPath {
     [CmdletBinding()]
     param([Parameter(Mandatory)][string]$Path)
@@ -356,4 +374,4 @@ function Get-CodexDevinGatewayStartupFailureMessage {
     }
 }
 
-Export-ModuleMember -Function Get-CodexDevinCollapsePortListeners, Test-CodexDevinGatewayPortAvailable, Resolve-CodexDevinGatewayTarget, Test-CodexDevinRemoteGatewayHealth, Get-CodexDevinFallbackTokenState, Test-CodexDevinSshTarget, ConvertTo-CodexDevinRemoteShellPath, New-CodexDevinRemoteComposeCommand, Invoke-CodexDevinRemoteAuthentication, Invoke-CodexDevinGatewayPreflight, Test-CodexDevinLoopbackPortFree, Resolve-CodexDevinGatewayRoot, Get-CodexDevinGatewayFingerprint, Test-CodexDevinGatewayFingerprint, Test-CodexDevinCollapseGatewayReady, Test-CodexDevinCollapseRestoreSafe, Get-CodexDevinCollapseDesktopWaitAction, Get-CodexDevinGatewayStartupFailureMessage
+Export-ModuleMember -Function Get-CodexDevinCollapsePortListeners, Test-CodexDevinGatewayPortAvailable, Resolve-CodexDevinGatewayTarget, Test-CodexDevinRemoteGatewayHealth, Get-CodexDevinFallbackTokenState, Test-CodexDevinSshTarget, Get-CodexDevinRemoteSshOptions, ConvertTo-CodexDevinRemoteShellPath, New-CodexDevinRemoteComposeCommand, Invoke-CodexDevinRemoteAuthentication, Invoke-CodexDevinGatewayPreflight, Test-CodexDevinLoopbackPortFree, Resolve-CodexDevinGatewayRoot, Get-CodexDevinGatewayFingerprint, Test-CodexDevinGatewayFingerprint, Test-CodexDevinCollapseGatewayReady, Test-CodexDevinCollapseRestoreSafe, Get-CodexDevinCollapseDesktopWaitAction, Get-CodexDevinGatewayStartupFailureMessage

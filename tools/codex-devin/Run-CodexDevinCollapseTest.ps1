@@ -3,7 +3,8 @@ param(
     [switch]$WorkerTest,
     [string]$GatewayUrl = 'http://127.0.0.1:38643',
     [string]$RemoteSshTarget,
-    [string]$RemoteGatewayDirectory
+    [string]$RemoteGatewayDirectory,
+    [string]$RemoteSshIdentityFile
 )
 
 $ErrorActionPreference = 'Stop'
@@ -87,6 +88,7 @@ function Invoke-CodexDevinRemoteSshCommand {
     param(
         [Parameter(Mandatory)][string]$SshTarget,
         [Parameter(Mandatory)][string]$RemoteGatewayDirectory,
+        [string]$IdentityFile,
         [Parameter(Mandatory)][ValidateSet('Login', 'Restart')][string]$Action
     )
 
@@ -94,14 +96,16 @@ function Invoke-CodexDevinRemoteSshCommand {
         throw 'RemoteSshTarget must be a safe SSH host or user@host value.'
     }
     $remoteCommand = New-CodexDevinRemoteComposeCommand -Action $Action -RemoteGatewayDirectory $RemoteGatewayDirectory
+    $sshArguments = @(Get-CodexDevinRemoteSshOptions -Action $Action -IdentityFile $IdentityFile)
+    $sshArguments += @($SshTarget, $remoteCommand)
 
     $ssh = Get-Command 'ssh.exe' -ErrorAction Stop
     if ($Action -ceq 'Login') {
         Write-Host "Starting interactive Devin login on devhub over SSH ($SshTarget). The OAuth URL and prompt will appear below."
-        & $ssh.Source -t $SshTarget $remoteCommand 2>&1 | Out-Host
+        & $ssh.Source @sshArguments 2>&1 | Out-Host
     } else {
         Write-Host "Recreating only the devin-gateway Compose service on devhub over SSH ($SshTarget)."
-        & $ssh.Source -T $SshTarget $remoteCommand 2>&1 | Out-Host
+        & $ssh.Source @sshArguments 2>&1 | Out-Host
     }
     return ($LASTEXITCODE -eq 0)
 }
@@ -337,8 +341,8 @@ try {
             $remoteAuthentication = Invoke-CodexDevinRemoteAuthentication `
                 -InitialHealth $gatewaySelection.RemoteHealth `
                 -HealthProbe { Get-CodexDevinCollapseJson -Uri $gatewayTarget.HealthUri } `
-                -InteractiveLogin { param($sshTarget, $directory) Invoke-CodexDevinRemoteSshCommand -SshTarget $sshTarget -RemoteGatewayDirectory $directory -Action Login } `
-                -RestartGateway { param($sshTarget, $directory) Invoke-CodexDevinRemoteSshCommand -SshTarget $sshTarget -RemoteGatewayDirectory $directory -Action Restart } `
+                -InteractiveLogin { param($sshTarget, $directory) Invoke-CodexDevinRemoteSshCommand -SshTarget $sshTarget -RemoteGatewayDirectory $directory -IdentityFile $RemoteSshIdentityFile -Action Login } `
+                -RestartGateway { param($sshTarget, $directory) Invoke-CodexDevinRemoteSshCommand -SshTarget $sshTarget -RemoteGatewayDirectory $directory -IdentityFile $RemoteSshIdentityFile -Action Restart } `
                 -SshTarget $RemoteSshTarget `
                 -RemoteGatewayDirectory $RemoteGatewayDirectory
             if ($remoteAuthentication.LoginPerformed) {
