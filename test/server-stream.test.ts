@@ -579,6 +579,29 @@ describe("upstream rate limit mapping", () => {
 });
 
 describe("streamOpenAIResponses full event sequence", () => {
+  test("reasoning, text and tool calls retain distinct output indexes", async () => {
+    const upstream = startUpstream({ chatBody: () => framesBody([
+      dataFrame({ thinking: "thinking" }),
+      dataFrame({ text: "answer" }),
+      dataFrame({ toolCalls: [{ id: "index-call", name: "exec_command", argumentsJson: '{"cmd":"hostname"}' }] }),
+    ]) });
+    const { url, cleanup } = await startGateway(upstream.url.origin, "x");
+    try {
+      const res = await fetch(`${url}/v1/responses`, {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model: "glm-5-3-flash-low", stream: true, input: "test",
+          tools: [{ type: "function", name: "exec_command", parameters: { type: "object" } }] }),
+      });
+      const events = parseSse(await res.text()).map(e => JSON.parse(e.data));
+      const added = events.filter(e => e.type === "response.output_item.added");
+      expect(added.map(e => e.output_index)).toEqual([0, 1, 2]);
+      const completed = events.find(e => e.type === "response.completed").response.output;
+      for (const event of events.filter(e => e.output_index !== undefined)) {
+        expect(event.item?.id ?? event.item_id).toBe(completed[event.output_index].id);
+      }
+      expect(completed.map((item: { type: string }) => item.type)).toEqual(["reasoning", "message", "function_call"]);
+    } finally { await cleanup(); await upstream.stop(); }
+  });
   test("emits created → output_item.added → content_part.added → text deltas → done → completed", async () => {
     const upstream = startUpstream({
       chatBody: () => framesBody([dataFrame({ text: "hel" }), dataFrame({ text: "lo" })]),

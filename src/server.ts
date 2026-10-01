@@ -827,6 +827,7 @@ function streamOpenAIResponses(
             item: { type: "message", id: messageId, status: "completed", role: "assistant", content: [{ type: "output_text", text: fullText }] },
           });
           outputItems.push({ type: "message", id: messageId, status: "completed", role: "assistant", content: [{ type: "output_text", text: fullText }] });
+          outputIndex++;
         }
 
         for (const call of toolCalls.values()) {
