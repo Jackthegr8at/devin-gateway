@@ -44,6 +44,63 @@ bun run start
 
 The gateway listens on `http://localhost:3000` by default. It holds no token state — each request must carry credentials via `Authorization: Bearer <token>` (OpenAI clients) or `x-api-key: <token>` (Anthropic clients). Set `DEVIN_API_KEY` only if you want a fallback for requests that omit both headers.
 
+### Codex Desktop (Responses API)
+
+The gateway's `/v1/responses` endpoint supports the Codex tool loop for `exec_command` and the five `multi_agent_v1` functions. The gateway only translates these function calls; it never executes them. Codex remains responsible for running local commands and returning `function_call_output` items with the matching call ID.
+
+Run the gateway on a loopback-only port for a same-computer Desktop setup:
+
+```powershell
+$env:HOST = "127.0.0.1"
+$env:PORT = "38643"
+bun run start
+```
+
+Codex's custom-provider, Responses transport, and static model-catalog settings are configured in the user's Codex config. The following is a compatibility example; replace the catalog path with a catalog created for the exact Codex runtime in use:
+
+```toml
+model = "glm-5-3-flash-low"
+model_provider = "devin_gateway"
+model_reasoning_effort = "low"
+model_catalog_json = "C:/path/to/devin-model-catalog.json"
+multi_agent_version = "v1"
+
+[model_providers.devin_gateway]
+name = "Devin Gateway"
+base_url = "http://127.0.0.1:38643/v1"
+wire_api = "responses"
+requires_openai_auth = false
+env_key = "DEVIN_API_KEY"
+request_max_retries = 0
+stream_max_retries = 0
+```
+
+Make `DEVIN_API_KEY` available to the Codex Desktop process through your normal environment/secret-management workflow. The gateway accepts that credential per request; its optional server-side `DEVIN_API_KEY` fallback is separate. The upstream `bun run login` helper stores a token in `~/.devin-gateway/token`. The gateway runtime does not import credentials from the POC. For guarded manual Desktop tests, the separate helper under `tools/codex-devin` uses lower-level OAuth primitives and passes its credential to the gateway in memory without writing token files.
+
+`model_catalog_json` is local Codex picker metadata, not a Devin entitlement check or a live model catalog. The tested Desktop setup used a static catalog containing the exact Devin model IDs and reasoning metadata. A custom catalog may replace Codex's built-in catalog for that configuration, so include every model needed in that Codex environment. See the [Codex config reference](https://developers.openai.com/codex/config-reference/) for provider and catalog settings.
+
+For the tested native worker setup, declare the role only in the Codex configuration where `devin_gateway` is active:
+
+```toml
+[agents.swe_worker]
+description = "Complete a scoped repository task and report back concisely."
+config_file = "agents/swe_worker.toml"
+```
+
+`agents/swe_worker.toml`:
+
+```toml
+model = "swe-2-medium"
+model_reasoning_effort = "medium"
+developer_instructions = "Explore the assigned repository and complete only the scoped subtask. For implementation work, make focused changes and run relevant tests. Do not change permissions, sandbox settings, or unrelated files. Report changes, checks, and blockers concisely to the parent."
+```
+
+The worker intentionally omits `model_provider`, so it inherits the parent's provider. Do not leave this role active under an unrelated provider configuration. Codex's [`agents.<name>.config_file`](https://developers.openai.com/codex/config-reference/) is relative to the config file that declares the role.
+
+The optional `DEVIN_CODEX_DESKTOP_COLLAPSE_SYSTEM=1` gateway setting enables the tested system-prompt compatibility transformation only for `glm-5-3-flash-low` and `swe-2-medium`. It moves the exact composed system/developer text into the latest user turn without truncating or rewriting it; it does not change history or tool declarations. Leave it unset unless using that compatibility path.
+
+Safe Responses diagnostics are disabled by default. To opt in, set `DEVIN_RESPONSES_SAFE_DIAGNOSTICS=1`; one allowlisted JSON record per Responses request is appended to the ignored `logs/responses-safe-diagnostic.jsonl`. Records contain hashes/byte lengths and limited model, tool, status, error-category, and call-ID metadata—not raw prompt text, tool arguments, schemas, descriptions, credentials, or headers. Hashes can still reveal matches for guessable text, so treat the log as diagnostic data and do not publish it. An alternate output path can be set with `DEVIN_RESPONSES_SAFE_DIAGNOSTICS_PATH`.
+
 ### Docker
 
 The published image supports `linux/amd64` and `linux/arm64`, and is available from both [GHCR](https://github.com/CaiJingLong/devin-gateway/pkgs/container/devin-gateway) (`ghcr.io/caijinglong/devin-gateway`) and [Docker Hub](https://hub.docker.com/r/kikt69/devin-gateway) (`kikt69/devin-gateway`). Sign in on the host with `bun run login` before starting it.
