@@ -647,7 +647,7 @@ describe("POST /v1/chat/completions (non-streaming)", () => {
       });
       expect(res.status).toBe(502);
       const body = await res.json();
-      expect(body.error.message).toContain("boom");
+      expect(body.error.message).not.toContain("boom");
     } finally {
       await cleanup();
       await upstream.stop();
@@ -1388,7 +1388,7 @@ describe("502 error mapping", () => {
       });
       expect(res.status).toBe(502);
       const body = await res.json();
-      expect(body.error.message).toContain("fail");
+      expect(body.error.message).toContain("redacted");
     } finally {
       await cleanup();
       await upstream.stop();
@@ -1415,7 +1415,7 @@ describe("502 error mapping", () => {
       });
       expect(res.status).toBe(502);
       const body = await res.json();
-      expect(body.error.message).toContain("fail");
+      expect(body.error.message).toContain("redacted");
     } finally {
       await cleanup();
       await upstream.stop();

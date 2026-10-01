@@ -418,7 +418,7 @@ describe("streamOpenAIChat error event", () => {
         .find((o) => o?.error);
       expect(errChunk).toBeDefined();
       expect(errChunk.error.type).toBe("api_error");
-      expect(errChunk.error.message).toContain("boom");
+      expect(errChunk.error.message).not.toContain("boom");
     } finally {
       await cleanup();
       await upstream.stop();
@@ -462,7 +462,7 @@ describe("upstream rate limit mapping", () => {
       expect(errChunk).toBeDefined();
       expect(errChunk.error.type).toBe("rate_limit_error");
       expect(errChunk.error.code).toBe("rate_limit_exceeded");
-      expect(errChunk.error.message).toContain("rate limit");
+      expect(errChunk.error.message).toMatch(/rate limit/i);
     } finally {
       await cleanup();
       await upstream.stop();
@@ -545,7 +545,7 @@ describe("upstream rate limit mapping", () => {
       expect(res.status).toBe(429);
       const body = await res.json();
       expect(body.error.type).toBe("rate_limit_error");
-      expect(body.error.message).toContain("rate limit");
+      expect(body.error.message).toMatch(/rate limit/i);
     } finally {
       await cleanup();
       await upstream.stop();
@@ -734,7 +734,7 @@ describe("streamOpenAIResponses error event", () => {
       const events = parseSse(await res.text());
       const failed = events.find((e) => e.event === "response.failed");
       expect(failed).toBeDefined();
-      expect(JSON.parse(failed!.data).error.message).toContain("boom");
+      expect(JSON.parse(failed!.data).error.message).not.toContain("boom");
     } finally {
       await cleanup();
       await upstream.stop();

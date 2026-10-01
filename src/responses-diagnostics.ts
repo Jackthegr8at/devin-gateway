@@ -14,7 +14,7 @@ const CONNECT_CODES = new Set([
 ]);
 const UPSTREAM_EVENT_TYPES = new Set(["text", "thinking", "toolcall", "usage", "done", "error"]);
 
-function safeConnectCode(value: unknown): string {
+export function safeConnectCode(value: unknown): string {
   const candidate = typeof value === "string" ? value.toLowerCase() : "";
   return CONNECT_CODES.has(candidate) ? candidate : "unknown";
 }
@@ -147,7 +147,7 @@ function safeTraceId(value: unknown, secrets: Set<string>): string | undefined {
 }
 
 /** Persist only fixed category labels, never arbitrary upstream error prose. */
-function normalizedErrorMessage(value: unknown): string {
+export function normalizedErrorMessage(value: unknown): string {
   const message = String(value ?? "");
   if (/mcp\s+configuration\s+issue/i.test(message)) return "MCP configuration issue";
   if (/content\s+policy/i.test(message)) return "Content policy denial";

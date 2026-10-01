@@ -121,7 +121,7 @@ describe("exchangeToken", () => {
     }
   });
 
-  test("throws on non-ok response including status and body text", async () => {
+  test("non-ok response retains status without exposing its body", async () => {
     const real = globalThis.fetch;
     try {
       globalThis.fetch = recordingFetch(null, () =>
@@ -129,7 +129,9 @@ describe("exchangeToken", () => {
       );
 
       await expect(exchangeToken("c", "v")).rejects.toThrow(/400/);
-      await expect(exchangeToken("c", "v")).rejects.toThrow(/bad request body/);
+      try { await exchangeToken("c", "v"); } catch (error) {
+        expect((error as Error).message).not.toContain("bad request body");
+      }
     } finally {
       globalThis.fetch = real;
     }

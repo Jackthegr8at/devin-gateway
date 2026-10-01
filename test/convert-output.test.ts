@@ -450,7 +450,7 @@ describe("OpenAI chat.completion.chunk (streaming) — output format", () => {
       const events = parseSse(await res.text()).filter((e) => e.data !== "[DONE]");
       const errChunk = events.map((e) => JSON.parse(e.data)).find((c) => c.error);
       expect(errChunk.error.type).toBe("api_error");
-      expect(errChunk.error.message).toContain("boom");
+      expect(errChunk.error.message).toContain("redacted");
     } finally {
       await cleanup();
       await upstream.stop();
@@ -641,7 +641,7 @@ describe("OpenAI /v1/responses stream=true — output format", () => {
       const events = parseSse(await res.text());
       const failed = events.find((e) => e.event === "response.failed");
       expect(failed).toBeDefined();
-      expect(JSON.parse(failed!.data).error.message).toContain("boom");
+      expect(JSON.parse(failed!.data).error.message).toContain("redacted");
     } finally {
       await cleanup();
       await upstream.stop();
@@ -959,7 +959,7 @@ describe("Anthropic /v1/messages stream=true — output format", () => {
       const errEvent = events.find((e) => e.event === "error");
       expect(errEvent).toBeDefined();
       expect(JSON.parse(errEvent!.data).error.type).toBe("api_error");
-      expect(JSON.parse(errEvent!.data).error.message).toContain("boom");
+      expect(JSON.parse(errEvent!.data).error.message).toContain("redacted");
     } finally {
       await cleanup();
       await upstream.stop();

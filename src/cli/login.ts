@@ -24,6 +24,7 @@ import { createServer, type Server } from "node:http";
 import { createInterface } from "node:readline";
 import { startLoginFlow, completeLoginWithUrl, exchangeToken, TOKEN_EXCHANGE_TIMEOUT_MS } from "../login.js";
 import { readToken, writeToken, TOKEN_FILE } from "../config.js";
+import { normalizedErrorMessage } from "../responses-diagnostics.js";
 
 const CALLBACK_PORT = 59653;
 const CALLBACK_PATH = "/callback";
@@ -202,7 +203,7 @@ function startCallbackServer(session: {
     };
 
     if (error) {
-      const desc = url.searchParams.get("error_description") ?? error;
+      const desc = normalizedErrorMessage(url.searchParams.get("error_description") ?? error);
       fail(new Error(`Authorization failed: ${desc}`));
       sendHtml(`❌ Login failed: ${desc}`);
       return;

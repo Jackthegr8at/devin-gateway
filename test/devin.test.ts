@@ -165,6 +165,21 @@ function extractApiKeyFromAuthRequest(body: Uint8Array): string {
 // ─── getUserJwt ──────────────────────────────────────────────────────────────
 
 describe("getUserJwt", () => {
+  test("upstream HTTP error bodies never escape through errors or logs", async () => {
+    const originalFetch = globalThis.fetch;
+    const originalError = console.error;
+    const logs: string[] = [];
+    const secret = "SYNTHETIC_PRIVATE_ERROR_VALUE";
+    console.error = (...args: unknown[]) => { logs.push(args.map(String).join(" ")); };
+    globalThis.fetch = (async () => new Response(`Bearer ${secret}`, { status: 401 })) as typeof fetch;
+    try {
+      await expect(getUserJwt("synthetic", "http://localhost")).rejects.toThrow("401");
+      expect(logs.join("\n")).not.toContain(secret);
+      try { await discoverModels("synthetic", "http://localhost"); } catch (error) { expect(String(error)).not.toContain(secret); }
+      try { await collectStream(baseChatParams("http://localhost")); } catch (error) { expect(String(error)).not.toContain(secret); }
+      expect(logs.join("\n")).not.toContain(secret);
+    } finally { globalThis.fetch = originalFetch; console.error = originalError; }
+  });
   test("success returns userJwt and baseUrl with trailing slash stripped", async () => {
     const response = Uint8Array.from(
       encodeGetUserJwtResponseBytes({
@@ -233,7 +248,7 @@ describe("getUserJwt", () => {
     });
     try {
       await expect(getUserJwt("raw-token", server.url.origin)).rejects.toThrow(
-        /Devin auth 401.*bad key/,
+        /Devin auth 401.*redacted/,
       );
     } finally {
       await server.stop();
@@ -512,7 +527,7 @@ describe("streamChat", () => {
       // consistent termination signal (stopReason + accumulated usage).
       expect(events.map((e) => e.type)).toEqual(["text", "error", "done"]);
       expect(events[1].error).toContain("internal");
-      expect(events[1].error).toContain("boom");
+      expect(events[1].error).not.toContain("boom");
       expect(events[2].type).toBe("done");
     } finally {
       await server.stop();
@@ -565,7 +580,7 @@ describe("streamChat", () => {
     const server = mockUpstream([], { status: 500, statusText: "Internal Server Error", body: "oops" });
     try {
       await expect(collectStream(baseChatParams(server.url.origin))).rejects.toThrow(
-        /Devin API 500.*oops/,
+        /Devin API 500.*redacted/,
       );
     } finally {
       await server.stop();
@@ -822,7 +837,7 @@ describe("discoverModels", () => {
     });
     try {
       await expect(discoverModels("raw-token", server.url.origin)).rejects.toThrow(
-        /Devin model discovery 503.*down/,
+        /Devin model discovery 503.*redacted/,
       );
     } finally {
       await server.stop();

@@ -12,7 +12,7 @@
 import { gzipSync, gunzipSync } from "node:zlib";
 import { log } from "./log.js";
 import { currentTrace } from "./error-trace.js";
-import { currentResponsesDiagnostic } from "./responses-diagnostics.js";
+import { currentResponsesDiagnostic, normalizedErrorMessage, safeConnectCode } from "./responses-diagnostics.js";
 import {
   type ChatMessagePrompt,
   type ChatToolCall,
@@ -59,6 +59,10 @@ function traceError(message: string, extra?: unknown): void {
 
 function traceDebug(message: string): void {
   if (!currentResponsesDiagnostic()) log.debug(message);
+}
+
+function upstreamFailure(error: unknown): Error {
+  return new Error(`Devin upstream request failed: ${normalizedErrorMessage((error as Error)?.message)}`);
 }
 
 function safeTraceIdsFromHeaders(headers: Headers): unknown[] {
@@ -116,20 +120,20 @@ export async function getUserJwt(
     },
     body,
     signal,
-  });
+  }).catch((error: unknown) => { throw upstreamFailure(error); });
   const payload = new Uint8Array(await res.arrayBuffer());
   currentResponsesDiagnostic()?.recordUpstreamResponse(res.status, false, safeTraceIdsFromHeaders(res.headers), "auth");
   if (!res.ok) {
-    const detail = new TextDecoder().decode(payload);
+    const detail = normalizedErrorMessage(new TextDecoder().decode(payload));
     currentResponsesDiagnostic()?.recordUpstreamError({
       terminalStatus: "auth_http_error",
       code: res.status === 401 || res.status === 403 ? "unauthenticated" : undefined,
       message: detail,
       traceIds: safeTraceIdsFromHeaders(res.headers),
     });
-    traceError(`[auth] upstream returned ${res.status} ${res.statusText}: ${detail}`);
-    traceEvent("auth", `upstream returned ${res.status} ${res.statusText}`, { detail });
-    throw new Error(`Devin auth ${res.status} ${res.statusText}: ${detail}`);
+    traceError(`[auth] upstream returned ${res.status}: ${detail}`);
+    traceEvent("auth", `upstream returned ${res.status}`, { detail });
+    throw new Error(`Devin auth ${res.status}: ${detail}`);
   }
   let decoded;
   try {
@@ -296,9 +300,10 @@ export async function* streamChat(params: ChatParams): AsyncGenerator<ChatStream
       throw new Error(`Devin stream timed out: no response within ${UPSTREAM_IDLE_MS / 1000}s`);
     }
     currentResponsesDiagnostic()?.recordUpstreamError({ terminalStatus: "chat_fetch_error", message: (err as Error).message ?? err });
-    traceError("[chat] fetch failed:", err);
-    traceEvent("chat", "fetch failed", { error: String((err as Error).message ?? err) });
-    throw err;
+    const safeError = upstreamFailure(err);
+    traceError("[chat] fetch failed:", safeError);
+    traceEvent("chat", "fetch failed", { error: safeError.message });
+    throw safeError;
   }
   currentResponsesDiagnostic()?.recordUpstreamResponse(
     response.status,
@@ -310,16 +315,16 @@ export async function* streamChat(params: ChatParams): AsyncGenerator<ChatStream
   let cleanupReader: (() => Promise<void>) | undefined;
   try {
   if (!response.ok) {
-    const text = await response.text();
+    const text = normalizedErrorMessage(await response.text());
     currentResponsesDiagnostic()?.recordUpstreamError({
       terminalStatus: "chat_http_error",
       code: response.status === 401 || response.status === 403 ? "unauthenticated" : undefined,
       message: text,
       traceIds: safeTraceIdsFromHeaders(response.headers),
     });
-    traceError(`[chat] upstream returned ${response.status} ${response.statusText}: ${text}`);
-    traceEvent("chat", `upstream returned ${response.status} ${response.statusText}`, { response: text });
-    throw new Error(`Devin API ${response.status} ${response.statusText}: ${text}`);
+    traceError(`[chat] upstream returned ${response.status}: ${text}`);
+    traceEvent("chat", `upstream returned ${response.status}`, { response: text });
+    throw new Error(`Devin API ${response.status}: ${text}`);
   }
   if (!response.body) {
     currentResponsesDiagnostic()?.recordUpstreamError({ terminalStatus: "chat_empty_body", message: "empty response body" });
@@ -350,9 +355,10 @@ export async function* streamChat(params: ChatParams): AsyncGenerator<ChatStream
         throw new Error(`Devin stream timed out: no upstream data for ${UPSTREAM_IDLE_MS / 1000}s`);
       }
       currentResponsesDiagnostic()?.recordUpstreamError({ terminalStatus: "chat_stream_read_error", message: (err as Error).message ?? err });
-      traceError("[chat] stream read failed:", err);
-      traceEvent("chat", "stream read failed", { error: String((err as Error).message ?? err) });
-      throw err;
+      const safeError = upstreamFailure(err);
+      traceError("[chat] stream read failed:", safeError);
+      traceEvent("chat", "stream read failed", { error: safeError.message });
+      throw safeError;
     }
     if (!done) armIdleTimer();
     if (value && value.length > 0) {
@@ -381,18 +387,19 @@ export async function* streamChat(params: ChatParams): AsyncGenerator<ChatStream
           // Check for Connect error trailer
             const parsed = JSON.parse(trailer);
             if (parsed?.error?.code) {
-              const errMsg = `Devin stream error ${parsed.error.code}: ${parsed.error.message ?? ""}`;
+              const code = safeConnectCode(parsed.error.code);
+              const errMsg = `Devin stream error ${code}: ${normalizedErrorMessage(parsed.error.message)}`;
               currentResponsesDiagnostic()?.recordConnectError({
                 code: parsed.error.code,
                 message: parsed.error.message,
                 traceIds: [...safeTraceIdsFromHeaders(response.headers), ...safeTraceIdsFromConnectError(parsed)],
               });
               traceError(`[chat] upstream end-stream error: ${errMsg}`);
-              traceEvent("chat", `upstream end-stream error: ${errMsg}`, { code: parsed.error.code });
+              traceEvent("chat", `upstream end-stream error: ${errMsg}`, { code });
               yield {
                 type: "error",
                 error: errMsg,
-                code: parsed.error.code,
+                code,
               };
               // Yield a terminal `done` so downstream consumers receive the
               // accumulated stopReason and a consistent termination signal.
@@ -487,12 +494,12 @@ export async function discoverModels(
     },
     body: enc.finish(),
     signal: discoverySignal,
-  });
+  }).catch((error: unknown) => { throw upstreamFailure(error); });
   if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    log.error(`[discover] upstream returned ${res.status} ${res.statusText}: ${text}`);
-    currentTrace()?.add("discover", `upstream returned ${res.status} ${res.statusText}`, { response: text });
-    throw new Error(`Devin model discovery ${res.status} ${res.statusText}: ${text}`);
+    const text = normalizedErrorMessage(await res.text().catch(() => ""));
+    log.error(`[discover] upstream returned ${res.status}: ${text}`);
+    currentTrace()?.add("discover", `upstream returned ${res.status}`, { response: text });
+    throw new Error(`Devin model discovery ${res.status}: ${text}`);
   }
   const data = new Uint8Array(await res.arrayBuffer());
   // Decode GetCliModelConfigsResponse and its repeated ClientModelConfig field.

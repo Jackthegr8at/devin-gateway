@@ -343,7 +343,7 @@ describe("chat() aggregation", () => {
           messages: [...BASE_MESSAGES],
           baseUrl: upstream.server.url.origin,
         }),
-      ).rejects.toThrow(/Devin stream error internal: upstream boom/);
+      ).rejects.toThrow(/Devin stream error internal: Upstream error message redacted/);
     } finally {
       await upstream.server.stop();
     }
