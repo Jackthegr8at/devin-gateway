@@ -6,6 +6,9 @@ import {
   toDevinPrompts,
   openaiToolsToDevin,
   anthropicToolsToDevin,
+  responsesInputToOpenAIMessages,
+  responsesToolsetToDevin,
+  ResponsesInputError,
   stopReasonToOpenAI,
   stopReasonToAnthropic,
   type OpenAIMessage,
@@ -15,6 +18,89 @@ import {
   type InternalMessage,
 } from "../src/convert.ts";
 import { ChatMessageSource, StopReason } from "../src/proto.ts";
+
+describe("Codex Responses input conversion", () => {
+  const schema = {
+    type: "object",
+    properties: { cmd: { type: "string", description: "command text" } },
+    required: ["cmd"],
+    additionalProperties: false,
+  };
+
+  test("normalizes only exec_command description and preserves its schema", () => {
+    const result = responsesToolsetToDevin([
+      { type: "function", name: "exec_command", description: "Codex's full local command instructions", parameters: schema, strict: true },
+      { type: "function", name: "get_hostname", description: "test-only helper", parameters: { type: "object" } },
+      { type: "function", name: "unrelated", description: "not forwarded", parameters: { type: "object" } },
+    ]);
+
+    expect(result.tools).toEqual([{
+      name: "exec_command",
+      description: "Run a local command.",
+      jsonSchemaString: JSON.stringify(schema),
+      strict: true,
+    }]);
+    expect(result.identities.get("exec_command")).toEqual({ name: "exec_command" });
+    expect(result.identities.has("get_hostname")).toBe(false);
+  });
+
+  test("forwards exactly the five multi_agent_v1 functions and restores their identities", () => {
+    const names = ["spawn_agent", "send_input", "wait_agent", "resume_agent", "close_agent"];
+    const result = responsesToolsetToDevin([{
+      type: "namespace",
+      name: "multi_agent_v1",
+      tools: names.map((name) => ({ type: "function", name, description: `${name} description`, parameters: schema })),
+    }]);
+
+    expect(result.tools.map((tool) => tool.name)).toEqual(names.map((name) => `multi_agent_v1__${name}`));
+    expect(result.tools.every((tool) => tool.jsonSchemaString === JSON.stringify(schema))).toBe(true);
+    for (const name of names) {
+      expect(result.identities.get(`multi_agent_v1__${name}`)).toEqual({ namespace: "multi_agent_v1", name });
+    }
+  });
+
+  test("drops unsupported namespaces and ignores unsupported tool declarations", () => {
+    const result = responsesToolsetToDevin([
+      { type: "namespace", name: "other_namespace", tools: [{ type: "function", name: "spawn_agent", parameters: schema }] },
+      { type: "function", name: "exec_command", parameters: schema },
+    ]);
+    expect(result.tools).toHaveLength(1);
+  });
+
+  test("decodes function calls, namespace identity, results, reasoning, and messages in order", () => {
+    const messages = responsesInputToOpenAIMessages([
+      { type: "reasoning", summary: [{ type: "summary_text", text: "Prior reasoning" }] },
+      { type: "function_call", id: "fc_item", call_id: "devin-call-id", namespace: "multi_agent_v1", name: "spawn_agent", arguments: '{"agent_type":"swe_worker"}' },
+      { type: "function_call_output", call_id: "devin-call-id", output: "child complete" },
+      { role: "user", content: [{ type: "input_text", text: "Continue" }] },
+    ]);
+
+    expect(messages).toEqual([
+      { role: "assistant", content: "", reasoning_content: "Prior reasoning" },
+      {
+        role: "assistant", content: "", tool_calls: [{
+          id: "devin-call-id", type: "function",
+          function: { name: "multi_agent_v1__spawn_agent", arguments: '{"agent_type":"swe_worker"}' },
+        }],
+      },
+      { role: "tool", tool_call_id: "devin-call-id", content: "child complete" },
+      { role: "user", content: "Continue" },
+    ]);
+    expect(openaiToInternal(messages)[0].thinking).toBe("Prior reasoning");
+  });
+
+  test("rejects invalid function-call history and malformed tool declarations", () => {
+    expect(() => responsesInputToOpenAIMessages([
+      { type: "function_call", call_id: "c1", name: "exec_command", arguments: "[]" },
+    ])).toThrow(ResponsesInputError);
+    expect(() => responsesInputToOpenAIMessages([
+      { type: "function_call", call_id: "c1", name: "multi_agent_v1__spawn_agent", arguments: "{}" },
+    ])).toThrow(ResponsesInputError);
+    expect(() => responsesToolsetToDevin([
+      { type: "function", name: "exec_command", parameters: "not-an-object" },
+    ])).toThrow(ResponsesInputError);
+  });
+});
 
 // ─── openaiToInternal ────────────────────────────────────────────────────────
 

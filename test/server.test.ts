@@ -1,4 +1,7 @@
 import { expect, test, describe } from "bun:test";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { gunzipSync } from "node:zlib";
 
 import { startServer } from "../src/server.ts";
@@ -161,6 +164,64 @@ function decodeChatRequestToolChoice(body: Uint8Array): { optionName?: string; t
   return undefined;
 }
 
+function decodeChatRequest(body: Uint8Array): {
+  prompt: string;
+  modelUid: string;
+  prompts: Array<{ source?: number; prompt?: string; toolCallId?: string; toolCalls: Array<{ id: string; name: string; argumentsJson: string }> }>;
+  tools: Array<{ name: string; description: string; schema: string; strict: boolean }>;
+} {
+  const flag = body[0];
+  const len = ((body[1] << 24) | (body[2] << 16) | (body[3] << 8) | body[4]) >>> 0;
+  const payload = body.subarray(5, 5 + len);
+  const raw = flag & 0x01 ? gunzipSync(payload) : payload;
+  const d = new ProtoDecoder(raw);
+  const result = { prompt: "", modelUid: "", prompts: [], tools: [] } as ReturnType<typeof decodeChatRequest>;
+  while (!d.done) {
+    const { field, wire } = d.readTag();
+    if (field === 2 && wire === 2) result.prompt = d.readString();
+    else if (field === 3 && wire === 2) {
+      result.prompts.push(d.readMessage((sub) => {
+        const item: ReturnType<typeof decodeChatRequest>["prompts"][number] = { toolCalls: [] };
+        while (!sub.done) {
+          const { field: f, wire: w } = sub.readTag();
+          if (f === 2 && w === 0) item.source = Number(sub.readVarint());
+          else if (f === 3 && w === 2) item.prompt = sub.readString();
+          else if (f === 6 && w === 2) {
+            item.toolCalls.push(sub.readMessage((call) => {
+              const value = { id: "", name: "", argumentsJson: "" };
+              while (!call.done) {
+                const { field: cf, wire: cw } = call.readTag();
+                if (cf === 1 && cw === 2) value.id = call.readString();
+                else if (cf === 2 && cw === 2) value.name = call.readString();
+                else if (cf === 3 && cw === 2) value.argumentsJson = call.readString();
+                else call.skip(cw);
+              }
+              return value;
+            }));
+          } else if (f === 7 && w === 2) item.toolCallId = sub.readString();
+          else sub.skip(w);
+        }
+        return item;
+      }));
+    } else if (field === 10 && wire === 2) {
+      result.tools.push(d.readMessage((sub) => {
+        const tool = { name: "", description: "", schema: "", strict: false };
+        while (!sub.done) {
+          const { field: f, wire: w } = sub.readTag();
+          if (f === 1 && w === 2) tool.name = sub.readString();
+          else if (f === 2 && w === 2) tool.description = sub.readString();
+          else if (f === 3 && w === 2) tool.schema = sub.readString();
+          else if (f === 12 && w === 0) tool.strict = sub.readVarint() !== 0n;
+          else sub.skip(w);
+        }
+        return tool;
+      }));
+    } else if (field === 21 && wire === 2) result.modelUid = d.readString();
+    else d.skip(wire);
+  }
+  return result;
+}
+
 // ─── Upstream mock (fake Devin API) ──────────────────────────────────────────
 
 interface UpstreamOptions {
@@ -281,7 +342,11 @@ describe("/health", () => {
       const res = await fetch(`${url}/health`);
       expect(res.status).toBe(200);
       const body = await res.json();
-      expect(body).toEqual({ status: "ok", fallback_token: "not_set" });
+      expect(body).toEqual({
+        status: "ok",
+        fallback_token: "not_set",
+        collapse_system_enabled: process.env.DEVIN_CODEX_DESKTOP_COLLAPSE_SYSTEM === "1",
+      });
     } finally {
       await cleanup();
       await upstream.stop();
@@ -295,10 +360,34 @@ describe("/health", () => {
       const res = await fetch(`${url}/health`);
       expect(res.status).toBe(200);
       const body = await res.json();
-      expect(body).toEqual({ status: "ok", fallback_token: "configured" });
+      expect(body).toEqual({
+        status: "ok",
+        fallback_token: "configured",
+        collapse_system_enabled: process.env.DEVIN_CODEX_DESKTOP_COLLAPSE_SYSTEM === "1",
+      });
     } finally {
       await cleanup();
       await upstream.stop();
+    }
+  });
+  test("reports collapse enabled only when the explicit environment flag is set", async () => {
+    const originalFlag = process.env.DEVIN_CODEX_DESKTOP_COLLAPSE_SYSTEM;
+    process.env.DEVIN_CODEX_DESKTOP_COLLAPSE_SYSTEM = "1";
+    const upstream = startUpstream();
+    const { url, cleanup } = await startGateway(upstream.url.origin, "");
+    try {
+      const res = await fetch(`${url}/health`);
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({
+        status: "ok",
+        fallback_token: "not_set",
+        collapse_system_enabled: true,
+      });
+    } finally {
+      await cleanup();
+      await upstream.stop();
+      if (originalFlag === undefined) delete process.env.DEVIN_CODEX_DESKTOP_COLLAPSE_SYSTEM;
+      else process.env.DEVIN_CODEX_DESKTOP_COLLAPSE_SYSTEM = originalFlag;
     }
   });
 });
@@ -639,6 +728,96 @@ describe("POST /v1/chat/completions stream=true", () => {
 // ─── POST /v1/responses ──────────────────────────────────────────────────────
 
 describe("POST /v1/responses (non-streaming)", () => {
+  test("safe diagnostics write only allowlisted metadata and suppress legacy error traces", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "devin-responses-server-diagnostic-"));
+    const diagnosticPath = join(directory, "responses-safe-diagnostic.jsonl");
+    const errorTracePath = join(directory, "errors");
+    const environment = [
+      "DEVIN_RESPONSES_SAFE_DIAGNOSTICS",
+      "DEVIN_RESPONSES_SAFE_DIAGNOSTICS_PATH",
+      "ERROR_TRACE_DIR",
+    ] as const;
+    const previousEnvironment = new Map(environment.map((key) => [key, process.env[key]]));
+    const prompt = "SYNTHETIC_USER_PROMPT_NOT_FOR_LOGGING_6d2";
+    const instruction = "SYNTHETIC_SYSTEM_INSTRUCTION_NOT_FOR_LOGGING_2a9";
+    const token = "SYNTHETIC_AUTH_TOKEN_NOT_FOR_LOGGING_a82";
+    const cookie = "SYNTHETIC_COOKIE_NOT_FOR_LOGGING_c14";
+    const description = "SYNTHETIC_TOOL_DESCRIPTION_NOT_FOR_LOGGING_913";
+    const schemaMarker = "SYNTHETIC_SCHEMA_NOT_FOR_LOGGING_2dd";
+    const trailerMessage = `MCP configuration issue ${prompt} ${token} ${cookie}`;
+    process.env.DEVIN_RESPONSES_SAFE_DIAGNOSTICS = "1";
+    process.env.DEVIN_RESPONSES_SAFE_DIAGNOSTICS_PATH = diagnosticPath;
+    process.env.ERROR_TRACE_DIR = errorTracePath;
+    const upstream = startUpstream({
+      chatBody: () => framesBody([], { error: { code: "permission_denied", message: trailerMessage } }),
+    });
+    const { url, cleanup } = await startGateway(upstream.url.origin, "");
+    const previousConsoleError = console.error;
+    const consoleLines: string[] = [];
+    console.error = (...args: unknown[]) => { consoleLines.push(args.map(String).join(" ")); };
+    try {
+      const request = async (stream: boolean): Promise<Response> => fetch(`${url}/v1/responses`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: `Bearer ${token}`,
+          cookie,
+        },
+        body: JSON.stringify({
+          model: "glm-5-3-flash-low",
+          instructions: instruction,
+          input: [{ role: "user", content: prompt }],
+          stream,
+          tools: [{
+            type: "function",
+            name: "exec_command",
+            description,
+            parameters: { type: "object", properties: { marker: { type: "string", description: schemaMarker } } },
+          }],
+        }),
+      });
+      const nonStreamingResponse = await request(false);
+      expect(nonStreamingResponse.status).toBe(502);
+      const streamingResponse = await request(true);
+      expect(streamingResponse.status).toBe(200);
+      expect(await streamingResponse.text()).toContain("event: response.failed");
+
+      const serialized = readFileSync(diagnosticPath, "utf8");
+      for (const secret of [prompt, instruction, token, cookie, description, schemaMarker, trailerMessage]) {
+        expect(serialized).not.toContain(secret);
+        expect(consoleLines.join("\n")).not.toContain(secret);
+      }
+      expect(existsSync(errorTracePath)).toBe(false);
+      const records = serialized.trim().split(/\r?\n/).map((line) => JSON.parse(line));
+      expect(records).toHaveLength(2);
+      expect(records.map((record) => record.response_failed_source)).toEqual([
+        "gateway_responses_nonstream_catch",
+        "gateway_responses_stream_catch",
+      ]);
+      for (const record of records) {
+        expect(record).toMatchObject({
+          model_id: "glm-5-3-flash-low",
+          connect_error_code: "permission_denied",
+          connect_error_message: "MCP configuration issue",
+          failure_classification: "devin_policy_denial",
+        });
+        expect(record.instruction_byte_length).toBe(Buffer.byteLength(instruction, "utf8"));
+        expect(record.user_input_byte_length).toBe(Buffer.byteLength(prompt, "utf8"));
+        expect(record.forwarded_tool_fingerprints[0].description_sha256).toMatch(/^[a-f0-9]{64}$/);
+        expect(record.forwarded_tool_fingerprints[0].schema_sha256).toMatch(/^[a-f0-9]{64}$/);
+      }
+    } finally {
+      console.error = previousConsoleError;
+      await cleanup();
+      await upstream.stop();
+      for (const [key, value] of previousEnvironment) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
   test("accepts string input and returns completed response with output_text", async () => {
     const upstream = startUpstream();
     const { url, cleanup } = await startGateway(upstream.url.origin, "k");
@@ -707,6 +886,227 @@ describe("POST /v1/responses (non-streaming)", () => {
       await upstream.stop();
     }
   });
+
+  test("returns a Devin tool call with its real call ID and safe Responses output item", async () => {
+    let captured: Uint8Array | undefined;
+    const upstream = startUpstream({
+      captureChatRequest: (body) => { captured = body; },
+      chatBody: () => framesBody([dataFrame({
+        toolCalls: [{ id: "devin-call-001", name: "exec_command", argumentsJson: '{"cmd":"hostname"}' }],
+        stopReason: 10,
+      })]),
+    });
+    const { url, cleanup } = await startGateway(upstream.url.origin, "k");
+    const schema = { type: "object", properties: { cmd: { type: "string" } }, required: ["cmd"], additionalProperties: false };
+    try {
+      const res = await fetch(`${url}/v1/responses`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "glm-5-3-flash-low",
+          input: "Find the hostname.",
+          tools: [{ type: "function", name: "exec_command", description: "Codex command policy text", parameters: schema, strict: true }],
+          parallel_tool_calls: true,
+        }),
+      });
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.output).toHaveLength(1);
+      expect(body.output[0]).toMatchObject({
+        type: "function_call",
+        call_id: "devin-call-001",
+        name: "exec_command",
+        arguments: '{"cmd":"hostname"}',
+      });
+      expect(captured).toBeDefined();
+      const request = decodeChatRequest(captured!);
+      expect(request.modelUid).toBe("glm-5-3-flash-low");
+      expect(request.tools).toEqual([{
+        name: "exec_command",
+        description: "Run a local command.",
+        schema: JSON.stringify(schema),
+        strict: true,
+      }]);
+    } finally {
+      await cleanup();
+      await upstream.stop();
+    }
+  });
+
+  test("continues function_call history with the same ID and local result", async () => {
+    let captured: Uint8Array | undefined;
+    const upstream = startUpstream({ captureChatRequest: (body) => { captured = body; } });
+    const { url, cleanup } = await startGateway(upstream.url.origin, "k");
+    try {
+      const res = await fetch(`${url}/v1/responses`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "swe-2-medium",
+          input: [
+            { type: "function_call", id: "fc-item-1", call_id: "devin-call-002", name: "exec_command", arguments: '{"cmd":"hostname"}' },
+            { type: "function_call_output", call_id: "devin-call-002", output: "test-host" },
+            { role: "user", content: "Report the result." },
+          ],
+          tools: [{ type: "function", name: "exec_command", parameters: { type: "object" } }],
+        }),
+      });
+      expect(res.status).toBe(200);
+      expect(captured).toBeDefined();
+      const request = decodeChatRequest(captured!);
+      expect(request.modelUid).toBe("swe-2-medium");
+      expect(request.prompts).toEqual([
+        {
+          source: 2,
+          toolCalls: [{ id: "devin-call-002", name: "exec_command", argumentsJson: '{"cmd":"hostname"}' }],
+        },
+        { source: 4, prompt: "test-host", toolCallId: "devin-call-002", toolCalls: [] },
+        { source: 1, prompt: "Report the result.", toolCalls: [] },
+      ]);
+    } finally {
+      await cleanup();
+      await upstream.stop();
+    }
+  });
+
+  test("restores namespace for each of the five native multi_agent_v1 functions", async () => {
+    const names = ["spawn_agent", "send_input", "wait_agent", "resume_agent", "close_agent"];
+    let nextCall = 0;
+    const upstream = startUpstream({
+      chatBody: () => framesBody([dataFrame({
+        toolCalls: [{ id: `agent-call-${nextCall}`, name: `multi_agent_v1__${names[nextCall++]}`, argumentsJson: "{}" }],
+        stopReason: 10,
+      })]),
+    });
+    const { url, cleanup } = await startGateway(upstream.url.origin, "k");
+    try {
+      for (const name of names) {
+        const res = await fetch(`${url}/v1/responses`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            model: "glm-5-3-flash-low",
+            input: "Run one operation.",
+            tools: [{
+              type: "namespace", name: "multi_agent_v1",
+              tools: names.map((toolName) => ({ type: "function", name: toolName, parameters: { type: "object" } })),
+            }],
+          }),
+        });
+        expect(res.status).toBe(200);
+        const body = await res.json();
+        expect(body.output[0]).toMatchObject({
+          type: "function_call",
+          namespace: "multi_agent_v1",
+          name,
+          arguments: "{}",
+        });
+      }
+      expect(nextCall).toBe(5);
+    } finally {
+      await cleanup();
+      await upstream.stop();
+    }
+  });
+
+  test("returns an explicit error instead of accepting multiple Devin tool calls", async () => {
+    const upstream = startUpstream({
+      chatBody: () => framesBody([dataFrame({
+        toolCalls: [
+          { id: "call-a", name: "exec_command", argumentsJson: "{}" },
+          { id: "call-b", name: "exec_command", argumentsJson: "{}" },
+        ],
+        stopReason: 10,
+      })]),
+    });
+    const { url, cleanup } = await startGateway(upstream.url.origin, "k");
+    try {
+      const res = await fetch(`${url}/v1/responses`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "glm-5-3-flash-low", input: "Do one thing.",
+          tools: [{ type: "function", name: "exec_command", parameters: { type: "object" } }],
+        }),
+      });
+      expect(res.status).toBe(502);
+      expect(await res.json()).toMatchObject({
+        error: { message: "Devin returned multiple function calls; this gateway supports one call per model response.", type: "api_error" },
+      });
+    } finally {
+      await cleanup();
+      await upstream.stop();
+    }
+  });
+
+  test("reconstructs cumulative argument snapshots and later fragments across Devin frames", async () => {
+    const upstream = startUpstream({
+      chatBody: () => framesBody([
+        dataFrame({ toolCalls: [{ id: "snapshot-call", name: "exec_command", argumentsJson: '{"cmd":' }] }),
+        dataFrame({ toolCalls: [{ id: "snapshot-call", name: "exec_command", argumentsJson: '{"cmd":"hostname"' }] }),
+        dataFrame({ toolCalls: [{ id: "", name: "", argumentsJson: "}" }], stopReason: 10 }),
+      ]),
+    });
+    const { url, cleanup } = await startGateway(upstream.url.origin, "k");
+    try {
+      const res = await fetch(`${url}/v1/responses`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "glm-5-3-flash-low", input: "Run hostname.",
+          tools: [{ type: "function", name: "exec_command", parameters: { type: "object" } }],
+        }),
+      });
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.output).toHaveLength(1);
+      expect(body.output[0].call_id).toBe("snapshot-call");
+      expect(body.output[0].arguments).toBe('{"cmd":"hostname"}');
+    } finally {
+      await cleanup();
+      await upstream.stop();
+    }
+  });
+
+  test("system collapse is opt-in in the endpoint and allowlisted only for GLM and SWE-2 Medium", async () => {
+    const originalFlag = process.env.DEVIN_CODEX_DESKTOP_COLLAPSE_SYSTEM;
+    process.env.DEVIN_CODEX_DESKTOP_COLLAPSE_SYSTEM = "1";
+    const captured: Uint8Array[] = [];
+    const upstream = startUpstream({ captureChatRequest: (body) => captured.push(body) });
+    const { url, cleanup } = await startGateway(upstream.url.origin, "k");
+    try {
+      for (const model of ["glm-5-3-flash-low", "swe-2-medium", "unrelated-model"]) {
+        const res = await fetch(`${url}/v1/responses`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            model,
+            instructions: "Top-level Codex catalog",
+            input: [
+              { role: "developer", content: "Desktop developer block" },
+              { role: "user", content: "User task" },
+            ],
+          }),
+        });
+        expect(res.status).toBe(200);
+      }
+      expect(captured).toHaveLength(3);
+      const [glm, swe, unrelated] = captured.map(decodeChatRequest);
+      const exactSystem = "Top-level Codex catalog\n\nDesktop developer block";
+      expect(glm.prompt).toBe("");
+      expect(glm.prompts).toEqual([{ source: 1, prompt: `<system>\n${exactSystem}\n</system>\n\nUser task`, toolCalls: [] }]);
+      expect(swe.prompt).toBe("");
+      expect(swe.prompts[0].prompt).toBe(`<system>\n${exactSystem}\n</system>\n\nUser task`);
+      expect(unrelated.prompt).toBe(exactSystem);
+      expect(unrelated.prompts[0].prompt).toBe("User task");
+    } finally {
+      await cleanup();
+      await upstream.stop();
+      if (originalFlag === undefined) delete process.env.DEVIN_CODEX_DESKTOP_COLLAPSE_SYSTEM;
+      else process.env.DEVIN_CODEX_DESKTOP_COLLAPSE_SYSTEM = originalFlag;
+    }
+  });
+
 });
 
 // ─── POST /v1/messages (Anthropic, non-streaming) ────────────────────────────

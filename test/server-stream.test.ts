@@ -628,6 +628,52 @@ describe("streamOpenAIResponses full event sequence", () => {
       await upstream.stop();
     }
   });
+
+  test("emits a completed function-call item with the original Devin call ID", async () => {
+    const upstream = startUpstream({
+      chatBody: () => framesBody([
+        dataFrame({
+          toolCalls: [{ id: "devin-stream-call", name: "exec_command", argumentsJson: '{"cmd":"hostname"}' }],
+          stopReason: 10,
+          usage: { inputTokens: 4, outputTokens: 2 },
+        }),
+      ]),
+    });
+    const { url, cleanup } = await startGateway(upstream.url.origin, "x");
+    try {
+      const res = await fetch(`${url}/v1/responses`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "glm-5-3-flash-low", stream: true, input: "Run hostname.",
+          tools: [{ type: "function", name: "exec_command", parameters: { type: "object" } }],
+        }),
+      });
+      expect(res.status).toBe(200);
+      const events = parseSse(await res.text());
+      expect(events.map((event) => event.event)).toEqual([
+        "response.created",
+        "response.output_item.added",
+        "response.function_call_arguments.delta",
+        "response.function_call_arguments.done",
+        "response.output_item.done",
+        "response.completed",
+      ]);
+      const done = JSON.parse(events.find((event) => event.event === "response.output_item.done")!.data);
+      expect(done.item).toMatchObject({
+        type: "function_call",
+        call_id: "devin-stream-call",
+        name: "exec_command",
+        arguments: '{"cmd":"hostname"}',
+      });
+      const completed = JSON.parse(events.find((event) => event.event === "response.completed")!.data);
+      expect(completed.response.output[0].call_id).toBe("devin-stream-call");
+      expect(completed.response.usage).toMatchObject({ input_tokens: 4, output_tokens: 2, total_tokens: 6 });
+    } finally {
+      await cleanup();
+      await upstream.stop();
+    }
+  });
 });
 
 describe("streamOpenAIResponses error event", () => {
