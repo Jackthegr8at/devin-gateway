@@ -19,6 +19,9 @@ import { listModels, type ModelInfo } from "./models.js";
 import {
   openaiToInternal,
   openaiToolsToDevin,
+  responsesInputToOpenAIMessages,
+  responsesToolsetToDevin,
+  ResponsesInputError,
   anthropicToInternal,
   anthropicToolsToDevin,
   toDevinPrompts,
@@ -32,6 +35,17 @@ import {
 import { StopReason, type ChatMessagePrompt, type ChatToolChoice, type ChatToolDefinition } from "./proto.js";
 import { log, truncate } from "./log.js";
 import { ErrorTrace, runTrace, runTraceAsync, currentTrace } from "./error-trace.js";
+import {
+  CODEX_DESKTOP_SYSTEM_COLLAPSE_ENV,
+  collapseSystemPromptIntoLatestUserMessage,
+  isCodexDesktopSystemCollapseRequest,
+} from "./responses-system-collapse.js";
+import {
+  currentResponsesDiagnostic,
+  ResponsesSafeDiagnostic,
+  responsesSafeDiagnosticsEnabled,
+  runWithResponsesDiagnostic,
+} from "./responses-diagnostics.js";
 
 // ─── Config (populated by startServer) ──────────────────────────────────────
 
@@ -383,46 +397,219 @@ function extractSystemPrompt(messages: OpenAIMessage[]): string {
 
 interface OpenAIResponsesRequest {
   model: string;
-  input: string | { role: string; content?: string | unknown[] }[];
+  input: unknown;
   stream?: boolean;
   temperature?: number;
   max_output_tokens?: number;
   top_p?: number;
-  tools?: OpenAITool[];
+  tools?: unknown;
+  tool_choice?: unknown;
+  parallel_tool_calls?: boolean;
   reasoning?: { effort?: string };
   instructions?: string;
 }
 
+/** Hash only user-authored text leaves; never persist the text itself. */
+function responsesUserText(messages: OpenAIMessage[]): string {
+  const userMessages = messages.filter((message) => message.role === "user");
+  return userMessages.map((message) => {
+    if (typeof message.content === "string") return message.content;
+    if (!Array.isArray(message.content)) return "";
+    return message.content
+      .filter((part) => part.type === "input_text" || part.type === "text")
+      .map((part) => part.text ?? "")
+      .join("\n");
+  }).join("\n");
+}
+
+function recordResponsesHistoryCalls(diagnostic: ResponsesSafeDiagnostic, messages: OpenAIMessage[]): void {
+  for (const message of messages) {
+    if (message.tool_calls) {
+      for (const call of message.tool_calls) diagnostic.recordToolCall(call.function.name, call.id);
+    }
+    if (message.tool_call_id) diagnostic.recordToolCall(message.name ?? "unknown_tool", message.tool_call_id);
+  }
+}
+
+interface ResponsesToolCall {
+  id: string;
+  name: string;
+  arguments: string;
+}
+
+interface ResponsesToolCallAccumulator {
+  calls: Map<string, ResponsesToolCall>;
+  activeCallId?: string;
+  sawUnidentifiedDelta: boolean;
+}
+
+function collectResponsesToolCall(
+  state: ResponsesToolCallAccumulator,
+  call: { id: string; name: string; argumentsJson: string },
+): void {
+  // Follow-up Devin deltas may omit the ID. Correlate them to the most recent
+  // real ID; ignore unkeyed deltas until an ID arrives, as OMP does.
+  const id = call.id.trim() ? call.id : state.activeCallId;
+  if (!id) {
+    state.sawUnidentifiedDelta = true;
+    return;
+  }
+
+  const existing = state.calls.get(id);
+  if (existing) {
+    if (call.name.trim()) existing.name = call.name;
+    // Devin can send either a cumulative snapshot or the next argument fragment.
+    if (call.argumentsJson) {
+      existing.arguments = call.argumentsJson.startsWith(existing.arguments)
+        ? call.argumentsJson
+        : existing.arguments + call.argumentsJson;
+    }
+    state.activeCallId = id;
+    return;
+  }
+  if (state.calls.size > 0) {
+    throw new Error("Devin returned multiple function calls; this gateway supports one call per model response.");
+  }
+  state.calls.set(id, { id, name: call.name, arguments: call.argumentsJson });
+  state.activeCallId = id;
+}
+
+function finishResponsesToolCalls(
+  state: ResponsesToolCallAccumulator,
+  declaredTools: ReadonlyMap<string, { name: string; namespace?: string }>,
+): Map<string, ResponsesToolCall> {
+  if (state.calls.size === 0 && state.sawUnidentifiedDelta) {
+    throw new Error("Devin returned function-call deltas but never supplied a call ID.");
+  }
+  for (const call of state.calls.values()) {
+    if (!call.name.trim()) throw new Error("Devin returned a function call without a name.");
+    if (!declaredTools.has(call.name)) throw new Error(`Devin returned undeclared function '${call.name}'.`);
+  }
+  return state.calls;
+}
+
+function responsesFunctionCallItem(
+  call: ResponsesToolCall,
+  declaredTools: ReadonlyMap<string, { name: string; namespace?: string }>,
+): Record<string, unknown> {
+  const args = call.arguments || "{}";
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(args);
+  } catch {
+    throw new Error(`Devin returned invalid JSON arguments for function '${call.name}'.`);
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    throw new Error(`Devin returned non-object JSON arguments for function '${call.name}'.`);
+  }
+  const identity = declaredTools.get(call.name);
+  if (!identity) throw new Error(`Devin returned undeclared function '${call.name}'.`);
+  return {
+    type: "function_call",
+    id: `fc_${crypto.randomUUID().replace(/-/g, "").slice(0, 24)}`,
+    status: "completed",
+    call_id: call.id,
+    ...(identity.namespace ? { namespace: identity.namespace } : undefined),
+    name: identity.name,
+    arguments: args,
+  };
+}
+
+function mapResponsesToolChoice(
+  choice: unknown,
+  declaredTools: ReadonlyMap<string, { name: string; namespace?: string }>,
+): ChatToolChoice | undefined {
+  if (choice === undefined) return undefined;
+  if (typeof choice === "string") {
+    if (choice === "required") return { optionName: "any" };
+    if (choice === "auto" || choice === "none") return { optionName: choice };
+  } else if (typeof choice === "object" && choice !== null && !Array.isArray(choice)) {
+    const value = choice as Record<string, unknown>;
+    if (value.type === "function" && typeof value.name === "string" && value.name.trim()) {
+      if (value.namespace !== undefined && typeof value.namespace !== "string") {
+        throw new ResponsesInputError("Responses function tool_choice namespace must be a string.");
+      }
+      const namespace = value.namespace as string | undefined;
+      const match = [...declaredTools.entries()].find(([, identity]) =>
+        identity.name === value.name && identity.namespace === namespace,
+      );
+      if (match) return { toolName: match[0] };
+    }
+  }
+  throw new ResponsesInputError("Unsupported Responses tool_choice; use auto, none, required, or one declared function name.");
+}
+
 async function handleResponses(req: Request, reqId: string, trace: ErrorTrace): Promise<Response> {
   const body = (await req.json()) as OpenAIResponsesRequest;
+  const diagnostic = currentResponsesDiagnostic();
   const token = extractToken(req);
   if (!token) return errorResponse(req, 401, "No Devin API key. Set DEVIN_API_KEY or pass Authorization: Bearer <token> / x-api-key: <token>.", "authentication_error");
 
-  // Convert `input` to OpenAI messages format
   let messages: OpenAIMessage[];
-  if (typeof body.input === "string") {
-    messages = [{ role: "user", content: body.input }];
-  } else if (Array.isArray(body.input)) {
-    messages = body.input.map((m) => ({
-      role: m.role,
-      content: typeof m.content === "string" ? m.content : Array.isArray(m.content)
-        ? (m.content as { type: string; text?: string }[]).map((p) => ({ type: p.type, text: p.text }))
-        : undefined,
-    }));
-  } else {
-    messages = [];
+  let tools: ChatToolDefinition[];
+  let declaredTools: Map<string, { name: string; namespace?: string }>;
+  let toolChoice: ChatToolChoice | undefined;
+  try {
+    if (body.instructions !== undefined && typeof body.instructions !== "string") {
+      throw new ResponsesInputError("Responses instructions must be a string.");
+    }
+    if (body.parallel_tool_calls !== undefined && typeof body.parallel_tool_calls !== "boolean") {
+      throw new ResponsesInputError("Responses parallel_tool_calls must be a boolean.");
+    }
+    messages = responsesInputToOpenAIMessages(body.input);
+    const toolset = responsesToolsetToDevin(body.tools);
+    tools = toolset.tools;
+    declaredTools = toolset.identities;
+    toolChoice = mapResponsesToolChoice(body.tool_choice, declaredTools);
+  } catch (err) {
+    if (!(err instanceof ResponsesInputError)) throw err;
+    return errorResponse(req, 400, err.message, "invalid_request_error");
   }
 
-  if (body.instructions) {
-    messages = [{ role: "developer", content: body.instructions }, ...messages];
-  }
+  const hasInputSystemDeveloperContext = messages.some(
+    (message) => message.role === "system" || message.role === "developer",
+  );
+  if (body.instructions) messages = [{ role: "developer", content: body.instructions }, ...messages];
 
   const modelUid = body.model;
-  const internal = openaiToInternal(messages);
+  const conversationMessages = messages.filter(
+    (message) => message.role !== "system" && message.role !== "developer",
+  );
+  const internal = openaiToInternal(conversationMessages);
   const cascadeId = crypto.randomUUID();
-  const prompts = toDevinPrompts(internal, cascadeId);
-  const systemPrompt = extractSystemPrompt(messages);
-  const tools = openaiToolsToDevin(body.tools);
+  const originalPrompts = toDevinPrompts(internal, cascadeId);
+  const originalSystemPrompt = extractSystemPrompt(messages);
+  const collapseRequested = isCodexDesktopSystemCollapseRequest({
+    featureFlag: process.env[CODEX_DESKTOP_SYSTEM_COLLAPSE_ENV],
+    modelId: body.model,
+    topLevelInstructions: body.instructions,
+    hasInputSystemDeveloperContext,
+  });
+  const collapse = collapseRequested
+    ? collapseSystemPromptIntoLatestUserMessage(originalSystemPrompt, originalPrompts)
+    : { applied: false, systemPrompt: originalSystemPrompt, prompts: originalPrompts };
+  const prompts = collapse.prompts;
+  const systemPrompt = collapse.systemPrompt;
+  diagnostic?.setRequestSummary({
+    modelId: body.model,
+    instructions: originalSystemPrompt,
+    userInput: responsesUserText(messages),
+    tools: tools.map((tool) => {
+      const identity = declaredTools.get(tool.name);
+      return {
+        name: tool.name,
+        namespace: identity?.namespace,
+        originalName: identity?.name ?? tool.name,
+        description: tool.description,
+        jsonSchemaString: tool.jsonSchemaString,
+        strict: tool.strict,
+      };
+    }),
+    collapseSystemEnabled: collapse.applied,
+    collapsedUserPayload: collapse.collapsedUserPayload,
+    sensitiveValues: [token],
+  });
+  if (diagnostic) recordResponsesHistoryCalls(diagnostic, messages);
   const responseId = `resp_${crypto.randomUUID().replace(/-/g, "").slice(0, 24)}`;
   const created = Math.floor(Date.now() / 1000);
 
@@ -430,25 +617,46 @@ async function handleResponses(req: Request, reqId: string, trace: ErrorTrace): 
     return streamOpenAIResponses(req, {
       reqId, trace, token, modelUid, systemPrompt, prompts, tools,
       maxTokens: body.max_output_tokens, temperature: body.temperature, topP: body.top_p,
-      cascadeId, modelId: body.model, responseId, created,
+      cascadeId, modelId: body.model, responseId, created, toolChoice, declaredTools,
+      diagnostic,
     });
   }
 
   try {
     let text = "";
-    let stopReason = 0;
+    const toolCallState: ResponsesToolCallAccumulator = { calls: new Map(), sawUnidentifiedDelta: false };
     let usage: { inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheWriteTokens: number } | null = null;
 
     for await (const ev of streamChat({
       apiKey: token, modelUid, systemPrompt, messages: prompts, tools,
       maxTokens: body.max_output_tokens, temperature: body.temperature, topP: body.top_p,
-      cascadeId, baseUrl: DEVIN_BASE_URL || undefined,
+      cascadeId, baseUrl: DEVIN_BASE_URL || undefined, toolChoice, signal: req.signal,
     })) {
+      diagnostic?.recordUpstreamEvent(ev.type);
       if (ev.type === "text") text += ev.deltaText;
-      else if (ev.type === "done") stopReason = ev.stopReason ?? 0;
+      else if (ev.type === "toolcall" && ev.toolCalls) {
+        for (const call of ev.toolCalls) {
+          diagnostic?.recordToolCall(call.name, call.id);
+          collectResponsesToolCall(toolCallState, call);
+        }
+      }
       else if (ev.type === "usage" && ev.usage) usage = ev.usage;
       else if (ev.type === "error") throw Object.assign(new Error(ev.error), { code: ev.code });
     }
+    diagnostic?.recordUpstreamComplete();
+
+    const toolCalls = finishResponsesToolCalls(toolCallState, declaredTools);
+    const output: Record<string, unknown>[] = [];
+    if (text || toolCalls.size === 0) {
+      output.push({
+        type: "message",
+        id: `msg_${crypto.randomUUID().replace(/-/g, "").slice(0, 24)}`,
+        status: "completed",
+        role: "assistant",
+        content: [{ type: "output_text", text }],
+      });
+    }
+    for (const call of toolCalls.values()) output.push(responsesFunctionCallItem(call, declaredTools));
 
     return jsonResponse(req, {
       id: responseId,
@@ -456,13 +664,7 @@ async function handleResponses(req: Request, reqId: string, trace: ErrorTrace): 
       created_at: created,
       model: body.model,
       status: "completed",
-      output: [{
-        type: "message",
-        id: `msg_${crypto.randomUUID().replace(/-/g, "").slice(0, 24)}`,
-        status: "completed",
-        role: "assistant",
-        content: [{ type: "output_text", text }],
-      }],
+      output,
       usage: usage ? {
         input_tokens: usage.inputTokens,
         output_tokens: usage.outputTokens,
@@ -472,9 +674,20 @@ async function handleResponses(req: Request, reqId: string, trace: ErrorTrace): 
     });
   } catch (err) {
     const msg = String((err as Error).message ?? err);
-    const cls = classifyUpstreamError(msg, (err as Error & { code?: string }).code);
-    log.error(`[responses ${reqId}] non-stream failed:`, err);
-    trace.flush(err, cls.status);
+    const upstreamCode = (err as Error & { code?: string }).code;
+    const cls = classifyUpstreamError(msg, upstreamCode);
+    if (diagnostic) {
+      diagnostic.recordFailure({
+        source: "gateway_responses_nonstream_catch",
+        classification: diagnostic.failureClassification
+          ?? (err instanceof ResponsesInputError ? "gateway_conversion_error" : upstreamCode ? "devin_connect_error" : "gateway_internal_error"),
+        message: msg,
+        terminalStatus: diagnostic.upstreamTerminalStatus ?? "gateway_error",
+      });
+    } else {
+      log.error(`[responses ${reqId}] non-stream failed:`, err);
+      trace.flush(err, cls.status);
+    }
     return errorResponse(req, cls.status, msg, cls.type);
   }
 }
@@ -486,16 +699,22 @@ function streamOpenAIResponses(
     prompts: ChatMessagePrompt[]; tools: ChatToolDefinition[];
     maxTokens?: number; temperature?: number; topP?: number;
     cascadeId: string; modelId: string; responseId: string; created: number;
+    toolChoice?: ChatToolChoice; declaredTools: Map<string, { name: string; namespace?: string }>;
+    diagnostic?: ResponsesSafeDiagnostic;
   },
 ): Response {
-  const { reqId, trace, token, modelUid, systemPrompt, prompts, tools, maxTokens, temperature, topP, cascadeId, modelId, responseId, created } = params;
+  const { reqId, trace, token, modelUid, systemPrompt, prompts, tools, maxTokens, temperature, topP, cascadeId, modelId, responseId, created, toolChoice, declaredTools, diagnostic } = params;
+  const upstreamAbort = new AbortController();
+  const requestSignal = AbortSignal.any([req.signal, upstreamAbort.signal]);
+  let consumerCancelled = false;
+  diagnostic?.deferFinalization();
 
   const stream = new ReadableStream({
     async start(controller) {
-      await runTraceAsync(trace, async () => {
+      const run = async (): Promise<void> => runTraceAsync(trace, async () => {
       const encoder = new TextEncoder();
       const send = (event: string, obj: unknown) =>
-        controller.enqueue(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(obj)}\n\n`));
+        !consumerCancelled && controller.enqueue(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(obj)}\n\n`));
       const slog = (msg: string) => log.debug(`[stream/responses ${reqId}] ${msg}`);
       let upstreamChunks = 0;
 
@@ -512,6 +731,7 @@ function streamOpenAIResponses(
         let fullText = "";
         let outputIndex = 0;
         const outputItems: unknown[] = [];
+        const toolCallState: ResponsesToolCallAccumulator = { calls: new Map(), sawUnidentifiedDelta: false };
         let usage: { inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheWriteTokens: number } | null | undefined;
 
         const startMessage = () => {
@@ -531,8 +751,10 @@ function streamOpenAIResponses(
         for await (const ev of streamChat({
           apiKey: token, modelUid, systemPrompt, messages: prompts, tools,
           maxTokens, temperature, topP, cascadeId, baseUrl: DEVIN_BASE_URL || undefined,
+          toolChoice, signal: requestSignal,
         })) {
           upstreamChunks++;
+          diagnostic?.recordUpstreamEvent(ev.type);
           if (ev.type === "thinking" && ev.deltaThinking) {
             // Forward reasoning as a summary_text part so thinking models keep
             // the SSE stream alive (Bun closes idle streams after idleTimeout).
@@ -571,14 +793,18 @@ function streamOpenAIResponses(
             });
           } else if (ev.type === "usage") {
             usage = ev.usage;
+          } else if (ev.type === "toolcall" && ev.toolCalls) {
+            for (const call of ev.toolCalls) {
+              diagnostic?.recordToolCall(call.name, call.id);
+              collectResponsesToolCall(toolCallState, call);
+            }
           } else if (ev.type === "error") {
-            const cls = classifyUpstreamError(ev.error, ev.code);
-            slog(`upstream error: ${ev.error}`);
-            send("response.failed", { type: "response.failed", error: { message: ev.error, type: cls.type, code: cls.code } });
-            trace.flush(new Error(ev.error), cls.status);
+            throw Object.assign(new Error(ev.error), { code: ev.code });
           }
         }
+        diagnostic?.recordUpstreamComplete();
         slog(`done — upstream chunks: ${upstreamChunks}`);
+        const toolCalls = finishResponsesToolCalls(toolCallState, declaredTools);
 
         if (reasoningStarted) {
           send("response.output_item.done", {
@@ -604,6 +830,34 @@ function streamOpenAIResponses(
           outputItems.push({ type: "message", id: messageId, status: "completed", role: "assistant", content: [{ type: "output_text", text: fullText }] });
         }
 
+        for (const call of toolCalls.values()) {
+          const completedItem = responsesFunctionCallItem(call, declaredTools);
+          const outputIndexForCall = outputIndex++;
+          send("response.output_item.added", {
+            type: "response.output_item.added",
+            output_index: outputIndexForCall,
+            item: { ...completedItem, status: "in_progress", arguments: "" },
+          });
+          send("response.function_call_arguments.delta", {
+            type: "response.function_call_arguments.delta",
+            item_id: completedItem.id,
+            output_index: outputIndexForCall,
+            delta: completedItem.arguments,
+          });
+          send("response.function_call_arguments.done", {
+            type: "response.function_call_arguments.done",
+            item_id: completedItem.id,
+            output_index: outputIndexForCall,
+            arguments: completedItem.arguments,
+          });
+          send("response.output_item.done", {
+            type: "response.output_item.done",
+            output_index: outputIndexForCall,
+            item: completedItem,
+          });
+          outputItems.push(completedItem);
+        }
+
         send("response.completed", {
           type: "response.completed",
           response: {
@@ -616,16 +870,38 @@ function streamOpenAIResponses(
             } : undefined,
           },
         });
+        diagnostic?.recordSuccessfulCompletion();
       } catch (err) {
         const msg = String((err as Error).message ?? err);
-        const cls = classifyUpstreamError(msg);
-        log.error(`[stream/responses ${reqId}] exception after upstream=${upstreamChunks}:`, err);
+        const upstreamCode = (err as Error & { code?: string }).code;
+        const cls = classifyUpstreamError(msg, upstreamCode);
+        diagnostic?.recordFailure({
+          source: "gateway_responses_stream_catch",
+          classification: diagnostic.failureClassification
+            ?? (err instanceof ResponsesInputError ? "gateway_conversion_error" : upstreamCode ? "devin_connect_error" : "devin_stream_error"),
+          message: msg,
+          terminalStatus: diagnostic.upstreamTerminalStatus ?? "stream_error",
+        });
+        if (!diagnostic) log.error(`[stream/responses ${reqId}] exception after upstream=${upstreamChunks}:`, err);
         send("response.failed", { type: "response.failed", error: { message: msg, type: cls.type, code: cls.code } });
-        trace.flush(err, cls.status);
+        if (!diagnostic) trace.flush(err, cls.status);
       } finally {
-        controller.close();
+        if (diagnostic) diagnostic.finalize();
+        if (!consumerCancelled) controller.close();
       }
-      }); // runTraceAsync
+      });
+      if (diagnostic) await runWithResponsesDiagnostic(diagnostic, run);
+      else await run();
+    },
+    cancel(reason) {
+      consumerCancelled = true;
+      upstreamAbort.abort(reason);
+      diagnostic?.recordFailure({
+        source: "gateway_responses_client_cancel",
+        classification: "devin_stream_error",
+        terminalStatus: "cancelled",
+      });
+      diagnostic?.finalize();
     },
   });
 
@@ -970,6 +1246,10 @@ export async function startServer(options: ServerOptions = {}): Promise<ServerHa
       const path = url.pathname;
       const startedAt = Date.now();
       const id = crypto.randomUUID().slice(0, 8);
+      const useSafeResponsesDiagnostic = path === "/v1/responses"
+        && method === "POST"
+        && responsesSafeDiagnosticsEnabled();
+      const diagnostic = useSafeResponsesDiagnostic ? new ResponsesSafeDiagnostic(id, startedAt) : undefined;
 
       // CORS preflight
       if (method === "OPTIONS") {
@@ -978,11 +1258,20 @@ export async function startServer(options: ServerOptions = {}): Promise<ServerHa
 
       // Error trace: collects request context silently, flushed only on failure.
       const trace = new ErrorTrace(id, method, path);
-      trace.setToken(extractToken(req));
-      const headers: Record<string, string> = {};
-      req.headers.forEach((v, k) => { headers[k] = v; });
-      trace.setRequestHeaders(headers);
-      if (method === "POST") {
+      if (diagnostic) {
+        diagnostic.addSensitiveValues([
+          extractToken(req),
+          req.headers.get("authorization"),
+          req.headers.get("x-api-key"),
+          req.headers.get("cookie"),
+        ]);
+      } else {
+        trace.setToken(extractToken(req));
+        const headers: Record<string, string> = {};
+        req.headers.forEach((v, k) => { headers[k] = v; });
+        trace.setRequestHeaders(headers);
+      }
+      if (method === "POST" && !diagnostic) {
         try {
           const bodyText = await req.clone().text();
           trace.setRequestBody(bodyText);
@@ -997,9 +1286,13 @@ export async function startServer(options: ServerOptions = {}): Promise<ServerHa
       try {
         // Run handlers inside the trace ALS context so devin.ts can record
         // upstream events via currentTrace().
-        res = await runTraceAsync(trace, async () => {
+        const dispatch = () => runTraceAsync(trace, async () => {
           if (path === "/health" && method === "GET") {
-            return jsonResponse(req, { status: "ok", fallback_token: DEFAULT_DEVIN_KEY ? "configured" : "not_set" });
+            return jsonResponse(req, {
+              status: "ok",
+              fallback_token: DEFAULT_DEVIN_KEY ? "configured" : "not_set",
+              collapse_system_enabled: process.env.DEVIN_CODEX_DESKTOP_COLLAPSE_SYSTEM === "1",
+            });
           } else if (path === "/v1/models" && method === "GET") {
             return await handleModels(req, id, trace);
           } else if (path === "/v1/chat/completions" && method === "POST") {
@@ -1012,9 +1305,22 @@ export async function startServer(options: ServerOptions = {}): Promise<ServerHa
             return errorResponse(req, 404, `Not found: ${method} ${path}`);
           }
         });
+        res = diagnostic
+          ? await runWithResponsesDiagnostic(diagnostic, dispatch)
+          : await dispatch();
       } catch (err) {
         handlerError = err;
-        log.error(`handler error [${id}] ${method} ${path}:`, err);
+        if (diagnostic) {
+          diagnostic.recordFailure({
+            source: "gateway_responses_handler_catch",
+            classification: "gateway_internal_error",
+            message: err,
+            terminalStatus: "handler_error",
+          });
+          log.error(`handler error [${id}] ${method} ${path} (details redacted)`);
+        } else {
+          log.error(`handler error [${id}] ${method} ${path}:`, err);
+        }
         res = errorResponse(req, 500, String((err as Error).message ?? err));
       }
 
@@ -1027,7 +1333,18 @@ export async function startServer(options: ServerOptions = {}): Promise<ServerHa
       // Flush error trace on any non-2xx response (4xx auth errors, 5xx
       // upstream/handler failures). Stream errors are flushed inside the
       // stream handlers themselves; this covers non-streaming + handler throws.
-      if (status >= 400) {
+      if (diagnostic) {
+        if (status >= 400 && !diagnostic.hasFailure) {
+          diagnostic.recordFailure({
+            source: "gateway_responses_http_error",
+            classification: status === 400 ? "gateway_conversion_error" : "gateway_internal_error",
+            terminalStatus: `http_${status}`,
+          });
+        } else if (status < 400 && !diagnostic.isDeferred) {
+          diagnostic.recordSuccessfulCompletion();
+        }
+        diagnostic.finalizeIfNotDeferred();
+      } else if (status >= 400) {
         const err = handlerError ?? traceFlushError(res, status);
         const file = trace.flush(err, status);
         if (file) log.info(`error trace [${id}] → ${file}`);
