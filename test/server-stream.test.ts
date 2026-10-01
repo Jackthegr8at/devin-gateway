@@ -1,6 +1,7 @@
 import { expect, test, describe } from "bun:test";
 
 import { startServer } from "../src/server.ts";
+import OpenAI from "openai";
 
 const HOST = "127.0.0.1";
 const DEVIN_AUTH_PATH = "/exa.auth_pb.AuthService/GetUserJwt";
@@ -579,6 +580,21 @@ describe("upstream rate limit mapping", () => {
 });
 
 describe("streamOpenAIResponses full event sequence", () => {
+  test("official OpenAI SDK consumes a loopback Responses tool stream offline", async () => {
+    const upstream = startUpstream({ chatBody: () => framesBody([dataFrame({ toolCalls: [
+      { id: "sdk-call", name: "exec_command", argumentsJson: '{"cmd":"hostname"}' },
+    ] })]) });
+    const { url, cleanup } = await startGateway(upstream.url.origin, "x");
+    try {
+      const client = new OpenAI({ apiKey: "synthetic", baseURL: `${url}/v1`, maxRetries: 0 });
+      const stream = await client.responses.create({ model: "glm-5-3-flash-low", input: "test", stream: true,
+        tools: [{ type: "function", name: "exec_command", parameters: { type: "object" }, strict: false }] });
+      const events = [];
+      for await (const event of stream) events.push(event);
+      const final = events.find(event => event.type === "response.completed");
+      expect(final?.response.output[0]).toMatchObject({ type: "function_call", call_id: "sdk-call", name: "exec_command" });
+    } finally { await cleanup(); await upstream.stop(); }
+  });
   test("reasoning, text and tool calls retain distinct output indexes", async () => {
     const upstream = startUpstream({ chatBody: () => framesBody([
       dataFrame({ thinking: "thinking" }),
