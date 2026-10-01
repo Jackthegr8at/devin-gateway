@@ -1,8 +1,14 @@
 # Clean-fork Devin Desktop worker test
 
-This guarded, one-run workflow uses the gateway source in `<repository>`. It never starts Codex Desktop or submits a model request; you perform both manually.
+This guarded, one-run workflow uses the gateway source in the current repository checkout. It never starts Codex Desktop or submits a model request; you perform both manually.
 
 ## Run the manual test
+
+Run the examples from the repository root. The Codex home defaults to
+`Join-Path $env:USERPROFILE '.codex'`; an explicitly set `CODEX_HOME` must be an
+absolute existing directory, not a filesystem root. Profile/home reparse points
+are rejected. The example remote address is documentation-only; replace it,
+the SSH user, repository directory and identity file with your own settings.
 
 After fully closing Codex Desktop, open a standalone PowerShell window and run:
 
