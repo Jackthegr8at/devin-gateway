@@ -3,8 +3,9 @@ import { constants } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, relative, resolve, isAbsolute, sep } from "node:path";
 import { randomUUID } from "node:crypto";
+import { readFile } from "node:fs/promises";
 import { CONFIG_DIR } from "../config.js";
-import { initialModelSelection, MAX_SELECTION_BYTES, ModelSelectionError, selectionETag, validateModelSelection, type ModelSelection } from "./model-selection.js";
+import { initialModelSelection, migrateModelSelection, MAX_SELECTION_BYTES, ModelSelectionError, selectionETag, validateModelSelection, type ModelSelection } from "./model-selection.js";
 
 export function defaultSettingsDirectory(): string {
   return process.env.DEVIN_GATEWAY_SETTINGS_DIR ?? join(homedir(), ".devin-gateway-settings");
@@ -40,7 +41,24 @@ export class ModelSelectionStore {
       await mkdir(this.directory, { recursive: true, mode: 0o700 });
       if (process.platform !== "win32") await chmod(this.directory, 0o700);
       return await this.locked(async () => {
-        try { return await this.read(); }
+        try {
+          const { parsed, bytes } = await this.readStored();
+          const selection = migrateModelSelection(parsed);
+          if ((parsed as { schemaVersion?: unknown }).schemaVersion === 1) {
+            const backup = join(this.directory, "model-selection.v1.json");
+            await noSymlinks(backup);
+            try {
+              const file = await open(backup, "wx", 0o600);
+              try { await file.writeFile(bytes); await file.sync(); } finally { await file.close(); }
+            } catch (error) {
+              if ((error as NodeJS.ErrnoException).code !== "EEXIST" || !(await readFile(backup)).equals(bytes)) throw unavailable();
+              const stat = await lstat(backup);
+              if (!stat.isFile() || (process.platform !== "win32" && (stat.mode & 0o077) !== 0)) throw unavailable();
+            }
+            await this.replace(selection);
+          }
+          return selection;
+        }
         catch (error) {
           if (!missing(error)) throw error;
           const initial = initialModelSelection();
@@ -51,15 +69,20 @@ export class ModelSelectionStore {
     } catch { throw unavailable(); }
   }
   async read(): Promise<ModelSelection> {
+    const { parsed } = await this.readStored();
+    try { return validateModelSelection(parsed); } catch { throw unavailable(); }
+  }
+  private async readStored(): Promise<{ parsed: unknown; bytes: Buffer }> {
     await noSymlinks(this.file);
     const flags = constants.O_RDONLY | (process.platform === "win32" ? 0 : constants.O_NOFOLLOW);
     const file = await open(this.file, flags);
     try {
       const stat = await file.stat();
       if (!stat.isFile() || stat.size > MAX_SELECTION_BYTES || (process.platform !== "win32" && (stat.mode & 0o077) !== 0)) throw unavailable();
+      const bytes = await file.readFile();
       let parsed: unknown;
-      try { parsed = JSON.parse(await file.readFile("utf8")); } catch { throw unavailable(); }
-      try { return validateModelSelection(parsed); } catch { throw unavailable(); }
+      try { parsed = JSON.parse(bytes.toString("utf8")); } catch { throw unavailable(); }
+      return { parsed, bytes };
     } finally { await file.close(); }
   }
   async update(value: unknown, expectedETag: string): Promise<ModelSelection> {

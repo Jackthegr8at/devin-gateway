@@ -8,7 +8,7 @@ import { formatModelDisplayName } from "../web/model-picker/model-display.ts";
 
 export function fixtureModel(id: string, displayName = id, available = true): AdminModel {
   const profile = getCodexModelProfile(id) ?? null;
-  return { id, displayName, available, enabled: !!profile, contextWindow: available ? 200_000 : null,
+  return { id, displayName, available, enabled: !!profile, ...(id === "swe-2-medium" ? { family: { id: "swe-2", displayName: "SWE-2", effort: "medium", provenance: "reviewed_fallback", upstreamDefaultEffort: null } } : {}), contextWindow: available ? 200_000 : null,
     maxOutputTokens: available ? 64_000 : null, supportsImages: available ? false : null, upstreamThinking: available ? true : null,
     metadataProvenance: available ? { id: "upstream" } : null,
     codex: { status: profile ? "validated" : "unvalidated", profile, exportEligible: available && !!profile } };
@@ -39,6 +39,11 @@ describe("Cody-adapted display helpers", () => {
 });
 describe("single immutable selection draft", () => {
   const models = fixtureModels();
+  test("opaque concrete IDs are searchable/filterable through authoritative family labels", () => {
+    const opaque = { ...fixtureModel("opaque-wire-id", "Catalog member"), family: { id: "swe-2", displayName: "SWE-2", effort: "high", provenance: "upstream_family_metadata", upstreamDefaultEffort: "high" } };
+    expect(matchingModels([opaque], initialModelSelection(), { query: "SWE-2", categories: new Set(["SWE"]), enabledOnly: false })).toEqual([opaque]);
+    expect(matchingModels([opaque], initialModelSelection(), { query: "high", categories: new Set(), enabledOnly: false })).toEqual([opaque]);
+  });
   test("case-insensitive ID/name search and category multi-filter union", () => {
     const draft = createDraft(initialModelSelection(), models);
     expect(matchingModels(models, draft, { query: "ALPHA 101", enabledOnly: false, categories: new Set() }).map((model) => model.id)).toEqual(["other-fixture-101"]);
@@ -71,15 +76,15 @@ describe("single immutable selection draft", () => {
   });
   test("disabling an assigned model retains exact role and blocks save until reassigned/re-enabled", () => {
     const draft = bulkSelection(initialModelSelection(), ["swe-2-medium"], false);
-    expect(draft.roles.swe_worker).toBe("swe-2-medium");
+    expect(draft.roles.swe_worker).toEqual({ modelId: "swe-2", effort: "medium" });
     expect(draftErrors(draft, models).join(" ")).toContain("swe_worker");
-    expect(draftErrors({ ...draft, roles: { ...draft.roles, swe_worker: "glm-5-3-flash-low" } }, models)).toEqual([]);
+    expect(draftErrors({ ...draft, roles: { ...draft.roles, swe_worker: { modelId: "glm-5-3-flash-low", effort: "low" } } }, models)).toEqual([]);
     expect(draftErrors(bulkSelection(draft, ["swe-2-medium"], true), models)).toEqual([]);
   });
   test("unvalidated and unavailable models can remain enabled, but never substitute a role", () => {
     const draft = bulkSelection(initialModelSelection(), [models[2].id, "saved-removed"], true);
     expect(draftErrors(draft, models)).toEqual([]);
-    expect(draftErrors({ ...draft, roles: { ...draft.roles, default: "saved-removed" } }, models).length).toBe(1);
+    expect(draftErrors({ ...draft, roles: { ...draft.roles, default: { modelId: "saved-removed", effort: "low" } } }, models).length).toBe(1);
   });
   test("future inclusion requires explicit all-model selection and disable exits future mode", () => {
     let draft = createDraft(initialModelSelection(), models);

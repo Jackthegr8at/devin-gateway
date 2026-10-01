@@ -21,7 +21,7 @@ async function temporaryStore(run: (store: ModelSelectionStore, root: string) =>
   finally { await rm(root, { recursive: true, force: true }); }
 }
 
-describe("reviewed profiles and strict version-1 selection", () => {
+describe("reviewed profiles and strict version-2 selection", () => {
   test("only exact GLM Low and SWE-2 Medium IDs have fixed singleton efforts", () => {
     for (const [id, effort] of [["glm-5-3-flash-low", "low"], ["swe-2-medium", "medium"]]) {
       const profile = getCodexModelProfile(id)!;
@@ -34,7 +34,7 @@ describe("reviewed profiles and strict version-1 selection", () => {
   });
   test("initial migration matches validated roles without provider/permission fields", () => {
     expect(validateModelSelection(initialModelSelection())).toEqual(initialModelSelection());
-    expect(initialModelSelection().roles).toEqual({ default: "glm-5-3-flash-low", swe_worker: "swe-2-medium" });
+    expect(initialModelSelection().roles).toEqual({ default: { modelId: "glm-5-3-flash-low", effort: "low" }, swe_worker: { modelId: "swe-2", effort: "medium" } });
     expect(initialModelSelection().includeFutureModels).toBe(false);
   });
   test("unknown exact IDs may be enabled without gaining a role/profile", () => {
@@ -43,7 +43,7 @@ describe("reviewed profiles and strict version-1 selection", () => {
     expect(validateModelSelection(state).enabledModels).toEqual(state.enabledModels);
   });
   test("rejects invalid versions/revisions/fields/duplicates/IDs/roles and arbitrary payloads", () => {
-    const invalid: unknown[] = [null, [], {}, { ...initialModelSelection(), schemaVersion: 2 },
+    const invalid: unknown[] = [null, [], {}, { ...initialModelSelection(), schemaVersion: 3 },
       { ...initialModelSelection(), revision: 0 }, { ...initialModelSelection(), revision: 1.5 },
       { ...initialModelSelection(), includeFutureModels: "false" }, { ...initialModelSelection(), script: "synthetic" },
       { ...initialModelSelection(), enabledModels: ["swe-2-medium", "swe-2-medium"] },
@@ -64,7 +64,7 @@ describe("reviewed profiles and strict version-1 selection", () => {
 describe("private atomic selection storage", () => {
   test("initializes once; recreation reloads exact saved settings and revised roles", async () => temporaryStore(async (store) => {
     const initial = await store.initialize();
-    const next = { ...initial, enabledModels: [...initial.enabledModels, "future-model"], roles: { default: "swe-2-medium", swe_worker: "glm-5-3-flash-low" } };
+    const next = { ...initial, enabledModels: [...initial.enabledModels, "future-model"], roles: { default: { modelId: "swe-2", effort: "medium" }, swe_worker: { modelId: "glm-5-3-flash-low", effort: "low" } } };
     const saved = await store.update(next, selectionETag(initial));
     expect(saved.revision).toBe(2);
     expect(await new ModelSelectionStore(store.directory).initialize()).toEqual(saved);
@@ -136,7 +136,7 @@ describe("discovery representation and Codex manifest", () => {
     const rows = adminModels([discovered("glm-5-3-flash-low")], state);
     expect(rows.find((row) => row.id === "swe-2-medium")?.available).toBe(false);
     expect(() => codexSelectionManifest(state, rows)).toThrow("no model was substituted");
-    expect(state.roles.swe_worker).toBe("swe-2-medium");
+    expect(state.roles.swe_worker).toEqual({ modelId: "swe-2", effort: "medium" });
   });
   test("unknown thinking models gain no efforts; explicit profiles pass through unchanged", () => {
     const state = initialModelSelection(); state.enabledModels.push("unknown-high");
@@ -144,10 +144,10 @@ describe("discovery representation and Codex manifest", () => {
     expect(rows.at(-1)?.codex).toEqual({ status: "unvalidated", profile: null, exportEligible: false });
     const manifest = codexSelectionManifest(state, rows);
     expect(manifest.models.map((model) => [model.id, model.defaultReasoningEffort, model.supportedReasoningEfforts.map((r) => r.effort)])).toEqual([
-      ["glm-5-3-flash-low", "low", ["low"]], ["swe-2-medium", "medium", ["medium"]],
+      ["glm-5-3-flash-low", "low", ["low"]], ["swe-2", "medium", ["medium"]],
     ]);
     expect(manifest.excludedModels).toEqual([{ id: "unknown-high", reason: "unvalidated_profile" }]);
-    expect(manifest.roles).toEqual({ default: { modelId: "glm-5-3-flash-low", reasoningEffort: "low" }, swe_worker: { modelId: "swe-2-medium", reasoningEffort: "medium" } });
+    expect(manifest.roles).toEqual({ default: { modelId: "glm-5-3-flash-low", reasoningEffort: "low", concreteModelId: "glm-5-3-flash-low" }, swe_worker: { modelId: "swe-2", reasoningEffort: "medium", concreteModelId: "swe-2-medium" } });
   });
   test("fallback limits and missing upstream thinking remain distinguishable", () => {
     const model = discovered("swe-2-medium");
@@ -161,7 +161,7 @@ describe("discovery representation and Codex manifest", () => {
     const state = initialModelSelection(); state.includeFutureModels = true;
     const rows = adminModels([...state.enabledModels, "future-new-low"].map(discovered), state);
     expect(rows.at(-1)?.enabled).toBe(true); expect(rows.at(-1)?.codex.profile).toBeNull();
-    expect(codexSelectionManifest(state, rows).roles.swe_worker.modelId).toBe("swe-2-medium");
+    expect(codexSelectionManifest(state, rows).roles.swe_worker.modelId).toBe("swe-2");
   });
   test("export reconstructs allowlisted fields rather than forwarding unknown discovery content", () => {
     const data = initialModelSelection().enabledModels.map(discovered);

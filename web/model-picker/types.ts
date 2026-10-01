@@ -1,12 +1,14 @@
-/** Browser DTOs for the Phase 1 JSON contract; no server modules enter the browser graph. */
+/** Browser DTOs for the Phase 2.5 JSON contract; no server modules enter the browser graph. */
 export interface ModelSelection {
-  schemaVersion: 1;
+  schemaVersion: 2;
   revision: number;
   enabledModels: string[];
-  roles: { default: string; swe_worker: string };
+  roles: { default: ModelRole; swe_worker: ModelRole };
   includeFutureModels: boolean;
 }
+export interface ModelRole { modelId: string; effort: string }
 export interface AdminModel {
+  family?: { id: string; displayName: string; effort: string; provenance: string; upstreamDefaultEffort: string | null };
   id: string;
   displayName: string;
   available: boolean;

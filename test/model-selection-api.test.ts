@@ -73,13 +73,13 @@ describe("admin discovery facts without changing legacy discovery", () => {
 });
 
 describe("isolated management routes and read-only Codex export", () => {
-  test("initial migration exposes schema v1 and ETag; PUT revises atomically", async () => fixture(async ({ admin }) => {
+  test("initial migration exposes schema v2 and ETag; PUT revises atomically", async () => fixture(async ({ admin }) => {
     const response = await fetch(`${admin}/admin/api/model-selection`);
     const state = await response.json(); const etag = response.headers.get("etag")!;
-    expect(state).toEqual(initialModelSelection()); expect(etag).toBe('"model-selection-v1-1"');
+    expect(state).toEqual(initialModelSelection()); expect(etag).toBe('"model-selection-v2-1"');
     const next = { ...state, enabledModels: [...state.enabledModels, "unknown-enabled"] };
     const saved = await fetch(`${admin}/admin/api/model-selection`, { method: "PUT", headers: putHeaders(etag), body: JSON.stringify(next) });
-    expect(saved.status).toBe(200); expect(saved.headers.get("etag")).toBe('"model-selection-v1-2"');
+    expect(saved.status).toBe(200); expect(saved.headers.get("etag")).toBe('"model-selection-v2-2"');
     expect((await saved.json()).revision).toBe(2);
     const stale = await fetch(`${admin}/admin/api/model-selection`, { method: "PUT", headers: putHeaders(etag), body: JSON.stringify(next) });
     expect(stale.status).toBe(412);
@@ -88,8 +88,8 @@ describe("isolated management routes and read-only Codex export", () => {
     const response = await fetch(`${gateway}/gateway/api/codex-selection`);
     expect(response.status).toBe(200); expect(response.headers.get("access-control-allow-origin")).toBeNull();
     const body = await response.json();
-    expect(body.models.map((m: any) => [m.id, m.defaultReasoningEffort])).toEqual([["glm-5-3-flash-low", "low"], ["swe-2-medium", "medium"]]);
-    expect(body.roles.swe_worker).toEqual({ modelId: "swe-2-medium", reasoningEffort: "medium" });
+    expect(body.models.map((m: any) => [m.id, m.defaultReasoningEffort])).toEqual([["glm-5-3-flash-low", "low"], ["swe-2", "medium"]]);
+    expect(body.roles.swe_worker).toEqual({ modelId: "swe-2", reasoningEffort: "medium", concreteModelId: "swe-2-medium" });
     expect(JSON.stringify(body)).not.toContain("synthetic-selection-token");
     for (const key of ["instructions", "scripts", "sandbox", "approval", "authorization", "cookie", "token"]) expect(Object.keys(body)).not.toContain(key);
     expect((await fetch(`${gateway}/gateway/api/codex-selection`, { method: "PUT", body: "synthetic" })).status).toBe(405);
@@ -104,12 +104,12 @@ describe("isolated management routes and read-only Codex export", () => {
   test("future inclusion requires all current models and never validates an unknown role", async () => fixture(async ({ admin, setModels }) => {
     setModels([...initialModelSelection().enabledModels, "future-unknown"]);
     const state = initialModelSelection();
-    const partial = await fetch(`${admin}/admin/api/model-selection`, { method: "PUT", headers: putHeaders('"model-selection-v1-1"'), body: JSON.stringify({ ...state, includeFutureModels: true }) });
+    const partial = await fetch(`${admin}/admin/api/model-selection`, { method: "PUT", headers: putHeaders('"model-selection-v2-1"'), body: JSON.stringify({ ...state, includeFutureModels: true }) });
     expect(partial.status).toBe(400);
     const all = { ...state, enabledModels: [...state.enabledModels, "future-unknown"], includeFutureModels: true };
-    expect((await fetch(`${admin}/admin/api/model-selection`, { method: "PUT", headers: putHeaders('"model-selection-v1-1"'), body: JSON.stringify(all) })).status).toBe(200);
+    expect((await fetch(`${admin}/admin/api/model-selection`, { method: "PUT", headers: putHeaders('"model-selection-v2-1"'), body: JSON.stringify(all) })).status).toBe(200);
     const invalidRole = { ...all, revision: 2, roles: { ...all.roles, swe_worker: "future-unknown" } };
-    expect((await fetch(`${admin}/admin/api/model-selection`, { method: "PUT", headers: putHeaders('"model-selection-v1-2"'), body: JSON.stringify(invalidRole) })).status).toBe(400);
+    expect((await fetch(`${admin}/admin/api/model-selection`, { method: "PUT", headers: putHeaders('"model-selection-v2-2"'), body: JSON.stringify(invalidRole) })).status).toBe(400);
   }));
   test("management API never inherits inference CORS or appears on inference listener", async () => fixture(async ({ gateway, admin }) => {
     const denied = await fetch(`${gateway}/admin/api/model-selection`, { headers: { origin: "https://example.com" } });
@@ -126,8 +126,8 @@ describe("isolated management routes and read-only Codex export", () => {
     expect((await fetch(url, { method: "PUT", body })).status).toBe(415);
     expect((await fetch(url, { method: "PUT", headers: { "content-type": "application/json" }, body })).status).toBe(403);
     expect((await fetch(url, { method: "PUT", headers: { "content-type": "application/json", "x-devin-management": "1" }, body })).status).toBe(428);
-    expect((await fetch(url, { method: "PUT", headers: putHeaders('"model-selection-v1-1"'), body: "{invalid" })).status).toBe(400);
-    expect((await fetch(url, { method: "PUT", headers: putHeaders('"model-selection-v1-1"'), body: "x".repeat(256 * 1024 + 1) })).status).toBe(400);
+    expect((await fetch(url, { method: "PUT", headers: putHeaders('"model-selection-v2-1"'), body: "{invalid" })).status).toBe(400);
+    expect((await fetch(url, { method: "PUT", headers: putHeaders('"model-selection-v2-1"'), body: "x".repeat(256 * 1024 + 1) })).status).toBe(400);
   }));
   test("corrupt storage and discovery failures are sanitized and never seed/fallback", async () => fixture(async ({ gateway, admin, directory, setFailure }) => {
     setFailure();
@@ -165,18 +165,19 @@ describe("isolated management routes and read-only Codex export", () => {
   });
   test("gateway recreation reloads the saved settings directory without OAuth or reseeding", async () => {
     const root = await mkdtemp(join(tmpdir(), "gateway-selection-recreation-"));
-    const options = { host: "127.0.0.1", token: "synthetic-recreation-token", modelSelection: { directory: join(root, "settings"), adminPort: 0 } };
+    const upstream = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response(payload(initialModelSelection().enabledModels)) });
+    const options = { host: "127.0.0.1", token: "synthetic-recreation-token", baseUrl: upstream.url.origin, modelSelection: { directory: join(root, "settings"), adminPort: 0 } };
     let gateway = await offlineGateway(options);
     try {
       const url = `http://127.0.0.1:${gateway.adminPort}/admin/api/model-selection`;
       const next = { ...initialModelSelection(), enabledModels: [...initialModelSelection().enabledModels, "saved-unknown"] };
-      expect((await fetch(url, { method: "PUT", headers: putHeaders('"model-selection-v1-1"'), body: JSON.stringify(next) })).status).toBe(200);
+      expect((await fetch(url, { method: "PUT", headers: putHeaders('"model-selection-v2-1"'), body: JSON.stringify(next) })).status).toBe(200);
       const before = await readFile(join(root, "settings/model-selection.json"), "utf8");
       await gateway.stop();
       gateway = await offlineGateway(options);
       const saved = await (await fetch(`http://127.0.0.1:${gateway.adminPort}/admin/api/model-selection`)).json();
       expect(saved.revision).toBe(2); expect(saved.enabledModels).toContain("saved-unknown");
       expect(await readFile(join(root, "settings/model-selection.json"), "utf8")).toBe(before);
-    } finally { await gateway.stop(); await rm(root, { recursive: true, force: true }); }
+    } finally { await gateway.stop(); await upstream.stop(true); await rm(root, { recursive: true, force: true }); }
   });
 });

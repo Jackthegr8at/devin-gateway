@@ -1,19 +1,31 @@
 import { ROLES, roleEligible, type AdminModel, type ModelSelection } from "./state.js";
-export function RoleAssignments({ models, draft, disabled, onChange }: { models: AdminModel[]; draft: ModelSelection; disabled: boolean; onChange(role: typeof ROLES[number], id: string): void }) {
+import type { ModelRole } from "./types.js";
+export function RoleAssignments({ models, draft, disabled, onChange }: { models: AdminModel[]; draft: ModelSelection; disabled: boolean; onChange(role: typeof ROLES[number], assignment: ModelRole): void }) {
   const options = models.filter((model) => roleEligible(model, draft));
+  const logicalId = (model: AdminModel) => Object.values(draft.roles).some((role) => role.modelId === model.id) ? model.id : model.family?.id ?? model.id;
+  const effort = (model: AdminModel) => model.family?.effort ?? model.codex.profile!.defaultReasoningEffort;
   return <section className="roles" aria-labelledby="roles-title">
     <div className="section-heading"><h2 id="roles-title">Model roles</h2><span>Enabled, reviewed models only</span></div>
     <div className="role-grid">{ROLES.map((role) => {
       const label = role === "default" ? "Default / parent" : "swe_worker";
-      const selected = models.find((model) => model.id === draft.roles[role]);
-      const invalid = !selected || !roleEligible(selected, draft);
-      return <label key={role} className="role-field"><span>{label}</span>
-        <select aria-label={`${label} model`} aria-invalid={invalid} aria-describedby="role-help" value={draft.roles[role]} disabled={disabled} onChange={(event) => onChange(role, event.target.value)}>
-          {invalid ? <option value={draft.roles[role]}>{draft.roles[role]} — re-enable or reassign</option> : null}
-          {options.map((model) => <option value={model.id} key={model.id}>{model.displayName} · {model.codex.profile?.defaultReasoningEffort}</option>)}
-        </select>
-      </label>;
+      const assignment = draft.roles[role];
+      const eligible = options.filter((model) => logicalId(model) === assignment.modelId);
+      const selected = eligible.find((model) => effort(model) === assignment.effort);
+      const ids = [...new Set(options.map(logicalId))];
+      return <div key={role} className="role-field"><label><span>{label}</span>
+        <select aria-label={`${label} model`} aria-invalid={!selected} aria-describedby="role-help" value={assignment.modelId} disabled={disabled} onChange={(event) => {
+          const model = options.find((model) => logicalId(model) === event.target.value)!;
+          onChange(role, { modelId: logicalId(model), effort: effort(model) });
+        }}>
+          {!ids.includes(assignment.modelId) ? <option value={assignment.modelId}>{assignment.modelId} — re-enable or reassign</option> : null}
+          {ids.map((id) => { const model = options.find((model) => logicalId(model) === id)!; return <option value={id} key={id}>{model.family?.displayName ?? model.displayName}</option>; })}
+        </select></label>
+        <label><span>{label} thinking</span><select aria-label={`${label} thinking`} aria-invalid={!selected} value={assignment.effort} disabled={disabled || !eligible.length} onChange={(event) => onChange(role, { ...assignment, effort: event.target.value })}>
+          {!selected ? <option value={assignment.effort}>{assignment.effort} — unavailable</option> : null}
+          {eligible.map((model) => <option key={model.id} value={effort(model)}>{effort(model)}</option>)}
+        </select></label>
+      </div>;
     })}</div>
-    <p id="role-help" className="help">Role models keep their reviewed fixed reasoning effort. Categories are display labels, not capabilities. Both roles are required by the current gateway contract.</p>
+    <p id="role-help" className="help">Only enabled, available, reviewed efforts can receive roles. Upstream defaults do not replace your saved effort.</p>
   </section>;
 }

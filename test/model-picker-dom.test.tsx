@@ -24,7 +24,7 @@ afterAll(async () => {
 });
 function model(id: string, displayName = id, available = true): AdminModel {
   const profile = getCodexModelProfile(id) ?? null;
-  return { id, displayName, available, enabled: !!profile, contextWindow: 200_000, maxOutputTokens: 64_000, supportsImages: false,
+  return { id, displayName, available, enabled: !!profile, ...(id === "swe-2-medium" ? { family: { id: "swe-2", displayName: "SWE-2", effort: "medium", provenance: "reviewed_fallback", upstreamDefaultEffort: null } } : {}), contextWindow: 200_000, maxOutputTokens: 64_000, supportsImages: false,
     upstreamThinking: true, metadataProvenance: { id: "upstream" }, codex: { status: profile ? "validated" : "unvalidated", profile, exportEligible: !!profile && available } };
 }
 function mockApi(conflict = false) {
@@ -34,12 +34,12 @@ function mockApi(conflict = false) {
   let selection = initialModelSelection(); let loads = 0;
   const saves: { draft: ModelSelection; etag: string }[] = [];
   const api: PickerApi = {
-    async load() { loads++; return { models, selection: structuredClone(selection), etag: `"model-selection-v1-${selection.revision}"` }; },
+    async load() { loads++; return { models, selection: structuredClone(selection), etag: `"model-selection-v2-${selection.revision}"` }; },
     async save(draft, etag) {
       saves.push({ draft: structuredClone(draft), etag });
       if (conflict) { selection = { ...initialModelSelection(), revision: 2 }; throw new PickerApiError(412, "Another client changed the selection. Your draft was not saved."); }
       selection = { ...structuredClone(draft), revision: draft.revision + 1 };
-      return { selection, etag: `"model-selection-v1-${selection.revision}"` };
+      return { selection, etag: `"model-selection-v2-${selection.revision}"` };
     },
   };
   return { api, saves, loads: () => loads };
@@ -64,6 +64,27 @@ function rows() { return [...document.querySelectorAll(".model-row")]; }
 async function checkModel(id: string) { await click(document.querySelector(`.model-row[data-model-id="${id}"] input`) as HTMLElement); }
 
 describe("rendered Cody-style model picker", () => {
+  test("family variants group once; only enabled reviewed Medium appears in worker effort choices", async () => {
+    const base = mockApi();
+    const load = base.api.load;
+    base.api.load = async () => {
+      const snapshot = await load();
+      snapshot.models.splice(2, 0, { ...model("swe-2-high", "SWE-2 High"), family: { id: "swe-2", displayName: "SWE-2", effort: "high", provenance: "upstream_family_metadata", upstreamDefaultEffort: "high" } },
+        { ...model("swe-2-max", "SWE-2 Max", false), family: { id: "swe-2", displayName: "SWE-2", effort: "max", provenance: "reviewed_fallback", upstreamDefaultEffort: "high" } });
+      snapshot.selection.enabledModels.push("swe-2-high", "swe-2-max");
+      return snapshot;
+    };
+    await mount(base.api);
+    expect(document.querySelectorAll('.model-family[aria-label="SWE-2 variants"]')).toHaveLength(1);
+    expect(document.querySelector('.model-row[data-model-id="swe-2-high"]')?.textContent).toContain("Metadata not validated");
+    expect(document.querySelector('.model-row[data-model-id="swe-2-max"]')?.textContent).toContain("Unavailable");
+    const effort = document.querySelector('select[aria-label="swe_worker thinking"]') as HTMLSelectElement;
+    expect([...effort.options].map((option) => option.value)).toEqual(["medium"]);
+    expect(effort.value).toBe("medium");
+    await checkModel("swe-2-medium");
+    expect(button("Save selection").disabled).toBe(true);
+    expect(effort.value).toBe("medium"); // No substitution to discovered upstream High.
+  });
   test("500+ models render only 60 rows with labelled native controls and pagination", async () => {
     await mount(mockApi().api);
     expect(rows()).toHaveLength(60); expect(document.querySelector("h1")?.textContent).toBe("Devin models");
@@ -95,8 +116,8 @@ describe("rendered Cody-style model picker", () => {
   });
   test("Save sends one coherent selection and its original ETag", async () => {
     const mock = mockApi(); await mount(mock.api); await checkModel("other-fixture-2"); await click(button("Save selection"));
-    expect(mock.saves).toHaveLength(1); expect(mock.saves[0].etag).toBe('"model-selection-v1-1"');
-    expect(mock.saves[0].draft.roles.swe_worker).toBe("swe-2-medium"); expect(document.querySelector('[role="status"]')?.textContent).toContain("Revision 2");
+    expect(mock.saves).toHaveLength(1); expect(mock.saves[0].etag).toBe('"model-selection-v2-1"');
+    expect(mock.saves[0].draft.roles.swe_worker).toEqual({ modelId: "swe-2", effort: "medium" }); expect(document.querySelector('[role="status"]')?.textContent).toContain("Revision 2");
     expect(button("Save selection").disabled).toBe(true);
   });
   test("Cancel discards roles, selections, future choice and filters without any PUT", async () => {
@@ -106,7 +127,7 @@ describe("rendered Cody-style model picker", () => {
     await act(() => { role.value = "glm-5-3-flash-low"; role.dispatchEvent(new dom.window.Event("change", { bubbles: true })); });
     await search("ALPHA"); await click(button("Cancel"));
     expect(mock.saves).toHaveLength(0); expect((document.querySelector(".future-control input") as HTMLInputElement).checked).toBe(false);
-    expect(role.value).toBe("swe-2-medium"); expect((document.querySelector('input[type="search"]') as HTMLInputElement).value).toBe("");
+    expect(role.value).toBe("swe-2"); expect((document.querySelector('input[type="search"]') as HTMLInputElement).value).toBe("");
     expect((document.querySelector('.model-row[data-model-id="other-fixture-2"] input') as HTMLInputElement).checked).toBe(false);
   });
   test("412 keeps the draft, blocks overwrite and offers explicit latest-state reload", async () => {
@@ -120,14 +141,14 @@ describe("rendered Cody-style model picker", () => {
   });
   test("disabling assigned model cannot silently change role or save", async () => {
     const mock = mockApi(); await mount(mock.api); await checkModel("swe-2-medium");
-    expect((document.querySelector('select[aria-label="swe_worker model"]') as HTMLSelectElement).value).toBe("swe-2-medium");
+    expect((document.querySelector('select[aria-label="swe_worker model"]') as HTMLSelectElement).value).toBe("swe-2");
     expect(document.querySelector(".validation")?.textContent).toContain("re-enable"); expect(button("Save selection").disabled).toBe(true);
     await checkModel("swe-2-medium"); expect(document.querySelector(".validation")).toBeNull(); expect(mock.saves).toHaveLength(0);
   });
   test("unvalidated models remain visible/enablable; unavailable rows are explicit and not role options", async () => {
     const mock = mockApi(); await mount(mock.api); await checkModel("other-fixture-2");
     expect(document.querySelector('.model-row[data-model-id="other-fixture-2"]')?.textContent).toContain("Metadata not validated");
-    expect([...document.querySelectorAll('select[aria-label="swe_worker model"] option')].map((option) => option.getAttribute("value"))).toEqual(["glm-5-3-flash-low", "swe-2-medium"]);
+    expect([...document.querySelectorAll('select[aria-label="swe_worker model"] option')].map((option) => option.getAttribute("value"))).toEqual(["glm-5-3-flash-low", "swe-2"]);
     await search("saved-removed"); expect(rows()[0].textContent).toContain("Unavailable"); await checkModel("saved-removed");
     expect(button("Save selection").disabled).toBe(false);
   });

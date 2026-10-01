@@ -98,9 +98,9 @@ The worker intentionally omits `model_provider`, so it inherits the parent's pro
 
 The optional `DEVIN_CODEX_DESKTOP_COLLAPSE_SYSTEM=1` gateway setting enables the tested system-prompt compatibility transformation only for `glm-5-3-flash-low` and `swe-2-medium`. It moves the exact composed system/developer text into the latest user turn without truncating or rewriting it; it does not change history or tool declarations. Leave it unset unless using that compatibility path.
 
-### Model selection foundation (backend only)
+### Model selection foundation
 
-`DEVIN_MODEL_SELECTION_ENABLED=1` enables version-1 selection storage and the read-only `GET /gateway/api/codex-selection` manifest. It is disabled by default for standalone/library users; the private Docker Compose gateway enables it. There is no browser UI and the existing Windows activation scripts still use their validated static catalog. `/v1/models`, inference credentials, CORS, tool translation, and the collapse allowlist are unchanged.
+`DEVIN_MODEL_SELECTION_ENABLED=1` enables version-2 selection storage and the read-only `GET /gateway/api/codex-selection` manifest. It is disabled by default for standalone/library users; the private Docker Compose gateway enables it. The management picker configures the gateway only; existing Windows activation scripts still use their validated static catalog. `/v1/models`, inference credentials, CORS, tool translation, and the collapse allowlist are unchanged.
 
 Settings live in `$DEVIN_GATEWAY_SETTINGS_DIR/model-selection.json` (default `~/.devin-gateway-settings/model-selection.json`). Compose mounts the separate `devin-gateway-settings` named volume at `/home/gateway/.devin-gateway-settings`; `devin-login` continues to mount only `devin-gateway-auth`. Never combine those directories or delete either named volume during recreation.
 
@@ -108,10 +108,13 @@ First initialization seeds only:
 
 ```json
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "revision": 1,
   "enabledModels": ["glm-5-3-flash-low", "swe-2-medium"],
-  "roles": {"default": "glm-5-3-flash-low", "swe_worker": "swe-2-medium"},
+  "roles": {
+    "default": {"modelId": "glm-5-3-flash-low", "effort": "low"},
+    "swe_worker": {"modelId": "swe-2", "effort": "medium"}
+  },
   "includeFutureModels": false
 }
 ```
@@ -124,8 +127,8 @@ Management endpoints are served only when `DEVIN_ADMIN_PORT` is explicitly set a
 
 | Method/path | Response |
 |---|---|
-| `GET /admin/api/models` | `{source:"remote", selectionRevision, models:[...]}` with exact ID/name, availability, nullable upstream metadata, provenance and reviewed compatibility |
-| `GET /admin/api/model-selection` | Version-1 selection plus an `ETag` header |
+| `GET /admin/api/models` | `{source:"remote", selectionRevision, models:[...], families:[...]}` with concrete IDs, family/effort grouping, availability, provenance and reviewed compatibility |
+| `GET /admin/api/model-selection` | Version-2 selection plus an `ETag` header |
 | `PUT /admin/api/model-selection` | Validated saved selection and new ETag |
 | `GET /gateway/api/codex-selection` (inference listener) | Allowlisted selection revision/profile version, eligible models, explicit role efforts and excluded-model reasons |
 
@@ -147,13 +150,13 @@ bun run build
 
 Linux permission tests run only on POSIX. Phase 1 acceptance additionally checks actual named-volume persistence across gateway recreation without removing the existing auth/settings volumes; a filesystem/gateway restart test alone is not Docker runtime proof.
 
-For an explicitly approved operator acceptance run against the seeded two-model setup, `tools/Validate-ModelSelectionPhase1.ts` verifies discovery, the safe manifest and optimistic concurrency using only configuration/discovery APIs:
+`tools/Validate-ModelSelectionPhase1.ts` is retained as historical version-1 acceptance tooling. Do not run it against schema v2: its assertions intentionally target the old concrete-ID contract. Phase 2.5 offline coverage is:
 
 ```bash
-docker compose exec -T --user gateway devin-gateway bun - < tools/Validate-ModelSelectionPhase1.ts
+bun test test/model-families.test.ts test/model-family-routing.test.ts test/model-selection-api.test.ts
 ```
 
-This helper temporarily enables a clearly synthetic unknown ID, verifies it cannot receive a role, and restores the original two-model selection in `finally`. Successful acceptance advances the revision by two rather than resetting it. It never submits inference or OAuth requests and never reads credentials. Run the separate byte-for-byte recreation check before these intentional settings updates.
+These tests use synthetic loopback upstreams and disposable selection directories, never real credentials or inference.
 
 Safe Responses diagnostics are disabled by default. To opt in, set `DEVIN_RESPONSES_SAFE_DIAGNOSTICS=1`; one allowlisted JSON record per Responses request is appended to the ignored `logs/responses-safe-diagnostic.jsonl`. Records contain hashes/byte lengths and limited model, tool, status, error-category, and call-ID metadata—not raw prompt text, tool arguments, schemas, descriptions, credentials, or headers. Hashes can still reveal matches for guessable text, so treat the log as diagnostic data and do not publish it. An alternate output path can be set with `DEVIN_RESPONSES_SAFE_DIAGNOSTICS_PATH`.
 
@@ -627,6 +630,18 @@ Search matches exact IDs and display names case-insensitively. SWE, Fusion and O
 Checkboxes, role assignments and the future-model policy share one draft. Save sends one complete selection using the loaded ETag, `If-Match`, and `X-Devin-Management: 1`. Cancel or Escape discards the whole draft; Escape first closes an open category filter. A 412 preserves the draft and blocks overwrite until explicit reload. Both Phase 1 roles remain required: disabling an assigned model blocks Save until it is re-enabled or reassigned. Only available, enabled models with reviewed profiles and complete export metadata can receive roles. Unreviewed models can be enabled but cannot receive a Codex role.
 
 The future-model option requires all discovered models to be selected. Disabling any model exits future mode. New discoveries may join the enabled selection but never acquire a role automatically. Missing upstream models remain visible as unavailable; no substitute is selected.
+
+### Logical families and effort routing (Phase 2.5)
+
+Discovery decodes `ClientModelConfig` fields 30/31, including family label, effort entries, Fast/1M dimensions and both upstream default markers. Families derive from this authoritative metadata, not UID suffixes. A reviewed exact-ID fallback groups only the known SWE-2 Medium/High/Max IDs when family metadata is absent. Defaults are reported separately and never change the saved Medium worker role. Off exists only when metadata identifies a genuine non-reasoning member.
+
+The picker groups concrete effort variants under a logical family. Checkboxes still save exact concrete IDs, so partial-family selections remain precise. Role controls separately select the model and an enabled, available, reviewed effort. The Codex manifest exports logical IDs and allowlisted effort-to-concrete `routing` maps; only GLM Low and SWE-2 Medium retain validated profiles. Discovered High/Max siblings remain unvalidated. Fast and 1M lanes never share routes with standard lanes.
+
+For Responses, `model: "swe-2"` plus `reasoning: {"effort":"medium"}` routes to `chatModelUid: "swe-2-medium"`. Missing/unsupported effort is a 400, never an upstream default substitution. Chat Completions uses `reasoning_effort`; Anthropic has no equivalent explicit effort here and rejects recognized logical families rather than guessing from a token budget. Direct concrete IDs keep their wire ID unchanged. Legacy unrecognized direct IDs still pass through; family identities are established by discovery or the reviewed exact-ID registry, never naming guesses. Recognized removed/unavailable families fail closed. Collapse eligibility is checked against the resolved concrete UID; the existing two-ID allowlist is unchanged.
+
+Initialization atomically migrates a valid v1 file to v2 without advancing its revision. It first preserves the original bytes as private `model-selection.v1.json`. A conflicting existing backup, invalid original, or ambiguous family fails closed. The v2 ETag is `"model-selection-v2-<revision>"`, so old v1 clients cannot overwrite migrated settings. To reverse a migration, stop all settings writers, archive any newer v2 selection, and restore the original v1 bytes from that private backup before running the old gateway. Never touch the auth volume.
+
+Phase 3 remains unimplemented. Dynamic catalog/worker generation and a reviewed Windows source-pin refresh require separate approval. No live model access or Linux migration acceptance is implied by offline tests.
 
 **Phase 3 is not implemented:** Windows activation still uses its validated static catalog/worker. Saving here does not change Desktop configuration. Runtime/package changes require a separately reviewed Windows source-fingerprint refresh before using the local launcher; its guard has not been bypassed.
 

@@ -1,12 +1,18 @@
 import { getCodexModelProfile } from "./codex-model-profiles.js";
+import { REVIEWED_FAMILY_ROUTES, type FamilyEffort } from "../model-families.js";
 
 export const MAX_SELECTION_BYTES = 256 * 1024;
 export interface ModelSelection {
-  schemaVersion: 1;
+  schemaVersion: 2;
   revision: number;
   enabledModels: string[];
-  roles: { default: string; swe_worker: string };
+  roles: { default: ModelRole; swe_worker: ModelRole };
   includeFutureModels: boolean;
+}
+export interface ModelRole { modelId: string; effort: FamilyEffort }
+/** Static reviewed role resolution is used only for persisted validation/migration. */
+export function reviewedRoleConcreteId(role: ModelRole): string {
+  return REVIEWED_FAMILY_ROUTES[role.modelId]?.[role.effort] ?? role.modelId;
 }
 export class ModelSelectionError extends Error {
   constructor(public readonly code: "invalid_selection" | "selection_unavailable" | "revision_conflict" | "discovery_unavailable" | "role_unavailable", message: string) { super(message); }
@@ -28,7 +34,7 @@ export function isModelId(value: unknown): value is string {
 export function validateModelSelection(value: unknown): ModelSelection {
   const input = object(value);
   keys(input, ["schemaVersion", "revision", "enabledModels", "roles", "includeFutureModels"]);
-  if (input.schemaVersion !== 1 || !Number.isSafeInteger(input.revision) || (input.revision as number) < 1
+  if (input.schemaVersion !== 2 || !Number.isSafeInteger(input.revision) || (input.revision as number) < 1
     || typeof input.includeFutureModels !== "boolean" || !Array.isArray(input.enabledModels)
     || input.enabledModels.length > 2048 || input.enabledModels.some((id) => !isModelId(id))) invalid();
   const enabledModels = input.enabledModels as string[];
@@ -36,12 +42,16 @@ export function validateModelSelection(value: unknown): ModelSelection {
   const roles = object(input.roles);
   keys(roles, ["default", "swe_worker"]);
   for (const role of ["default", "swe_worker"] as const) {
-    const id = roles[role];
-    if (!isModelId(id) || !enabledModels.includes(id) || !getCodexModelProfile(id)) invalid();
+    const value = object(roles[role]);
+    keys(value, ["modelId", "effort"]);
+    if (!isModelId(value.modelId) || typeof value.effort !== "string") invalid();
+    const id = reviewedRoleConcreteId(value as unknown as ModelRole);
+    const profile = getCodexModelProfile(id);
+    if (!enabledModels.includes(id) || !profile || !profile.supportedReasoningEfforts.some((row) => row.effort === value.effort)) invalid();
   }
   const selection: ModelSelection = {
-    schemaVersion: 1, revision: input.revision as number, enabledModels: [...enabledModels],
-    roles: { default: roles.default as string, swe_worker: roles.swe_worker as string },
+    schemaVersion: 2, revision: input.revision as number, enabledModels: [...enabledModels],
+    roles: { default: { ...roles.default as ModelRole }, swe_worker: { ...roles.swe_worker as ModelRole } },
     includeFutureModels: input.includeFutureModels as boolean,
   };
   if (Buffer.byteLength(JSON.stringify(selection), "utf8") + 1 > MAX_SELECTION_BYTES) invalid();
@@ -49,8 +59,25 @@ export function validateModelSelection(value: unknown): ModelSelection {
 }
 export function initialModelSelection(): ModelSelection {
   return {
-    schemaVersion: 1, revision: 1, enabledModels: ["glm-5-3-flash-low", "swe-2-medium"],
-    roles: { default: "glm-5-3-flash-low", swe_worker: "swe-2-medium" }, includeFutureModels: false,
+    schemaVersion: 2, revision: 1, enabledModels: ["glm-5-3-flash-low", "swe-2-medium"],
+    roles: { default: { modelId: "glm-5-3-flash-low", effort: "low" }, swe_worker: { modelId: "swe-2", effort: "medium" } }, includeFutureModels: false,
   };
 }
-export function selectionETag(selection: ModelSelection): string { return `"model-selection-v1-${selection.revision}"`; }
+export function selectionETag(selection: ModelSelection): string { return `"model-selection-v2-${selection.revision}"`; }
+/** Reject invalid v1 data before translating it; no upstream default is adopted. */
+export function migrateModelSelection(value: unknown): ModelSelection {
+  const input = object(value);
+  if (input.schemaVersion === 2) return validateModelSelection(input);
+  if (input.schemaVersion !== 1) invalid();
+  const roles = object(input.roles);
+  keys(roles, ["default", "swe_worker"]);
+  const migratedRoles = Object.fromEntries((["default", "swe_worker"] as const).map((role) => {
+    const id = roles[role];
+    if (!isModelId(id)) invalid();
+    const profile = getCodexModelProfile(id);
+    if (!profile) invalid();
+    return [role, { modelId: id === "swe-2-medium" ? "swe-2" : id, effort: profile.defaultReasoningEffort }];
+  }));
+  // Preserve validation of all original top-level fields, enabled IDs and role membership.
+  return validateModelSelection({ ...input, schemaVersion: 2, roles: migratedRoles });
+}

@@ -5,7 +5,7 @@ export interface Snapshot { models: AdminModel[]; selection: ModelSelection; eta
 export interface Filters { query: string; categories: ReadonlySet<ModelCategory>; enabledOnly: boolean }
 export const ROLES = ["default", "swe_worker"] as const;
 export function createDraft(selection: ModelSelection, models: readonly AdminModel[]): ModelSelection {
-  return { ...selection, roles: { ...selection.roles }, enabledModels: [...new Set([
+  return { ...selection, roles: { default: { ...selection.roles.default }, swe_worker: { ...selection.roles.swe_worker } }, enabledModels: [...new Set([
     ...selection.enabledModels, ...(selection.includeFutureModels ? models.filter((model) => model.available).map((model) => model.id) : []),
   ])] };
 }
@@ -14,7 +14,8 @@ export function matchingModels(models: readonly AdminModel[], draft: ModelSelect
   const needle = filters.query.trim().toLowerCase();
   return models.filter((model) => (!filters.enabledOnly || enabled.has(model.id))
     && modelMatchesCategories(model, filters.categories)
-    && (!needle || model.id.toLowerCase().includes(needle) || model.displayName.toLowerCase().includes(needle)));
+    && (!needle || model.id.toLowerCase().includes(needle) || model.displayName.toLowerCase().includes(needle)
+      || model.family?.id.toLowerCase().includes(needle) || model.family?.displayName.toLowerCase().includes(needle) || model.family?.effort.toLowerCase().includes(needle)));
 }
 export function allDiscoveredEnabled(draft: ModelSelection, models: readonly AdminModel[]): boolean {
   const discovered = models.filter((model) => model.available);
@@ -33,7 +34,9 @@ export function roleEligible(model: AdminModel, draft: ModelSelection): boolean 
 export function draftErrors(draft: ModelSelection, models: readonly AdminModel[]): string[] {
   const errors: string[] = [];
   for (const role of ROLES) {
-    const model = models.find((entry) => entry.id === draft.roles[role]);
+    const assignment = draft.roles[role];
+    const model = models.find((entry) => (entry.family?.id === assignment.modelId || entry.id === assignment.modelId)
+      && (entry.family?.effort ?? entry.codex.profile?.defaultReasoningEffort) === assignment.effort);
     if (!model || !roleEligible(model, draft)) errors.push(`${role === "default" ? "Default / parent" : role}: re-enable its model or assign an enabled, available reviewed model before saving.`);
   }
   if (draft.includeFutureModels && !allDiscoveredEnabled(draft, models)) errors.push("Enable every discovered model before including future models.");
@@ -41,6 +44,6 @@ export function draftErrors(draft: ModelSelection, models: readonly AdminModel[]
 }
 export function draftsEqual(a: ModelSelection, b: ModelSelection): boolean {
   return a.revision === b.revision && a.includeFutureModels === b.includeFutureModels
-    && ROLES.every((role) => a.roles[role] === b.roles[role])
+    && ROLES.every((role) => a.roles[role].modelId === b.roles[role].modelId && a.roles[role].effort === b.roles[role].effort)
     && a.enabledModels.length === b.enabledModels.length && a.enabledModels.every((id) => b.enabledModels.includes(id));
 }

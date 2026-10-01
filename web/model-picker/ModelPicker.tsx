@@ -49,6 +49,8 @@ export function ModelPicker({ api = defaultApi }: { api?: PickerApi }) {
   const matches = useMemo(() => snapshot && draft ? matchingModels(snapshot.models, draft, { query, categories, enabledOnly }) : [], [snapshot, draft, query, categories, enabledOnly]);
   const page = getModelPageWindow(matches.length, pageIndex);
   const visible = matches.slice(page.start, page.end);
+  const groups = new Map<string, typeof visible>();
+  for (const model of visible) { const key = model.family?.id ?? model.id; groups.set(key, [...groups.get(key) ?? [], model]); }
   const errors = draft && snapshot ? draftErrors(draft, snapshot.models) : [];
   const enabled = new Set(draft?.enabledModels ?? []);
   const discovered = snapshot?.models.filter((model) => model.available) ?? [];
@@ -112,7 +114,10 @@ export function ModelPicker({ api = defaultApi }: { api?: PickerApi }) {
           </div>
           <div className="bulk-actions"><button type="button" disabled={!matches.length} onClick={() => bulk(matches.map((model) => model.id), true)}>Enable {filtered ? `these ${matches.length}` : "all"}</button><button type="button" disabled={!matches.length} onClick={() => bulk(matches.map((model) => model.id), false)}>Disable {filtered ? `these ${matches.length}` : "all"}</button><span>Applies to every match, across all pages.</span></div>
           <div className="model-list" role="group" aria-label="Devin model selection">
-            {visible.length ? visible.map((model) => <ModelRow key={model.id} model={model} enabled={enabled.has(model.id)} disabled={busy} onToggle={(on) => bulk([model.id], on)} />)
+            {visible.length ? [...groups].map(([id, models]) => models[0].family ? <section key={id} className="model-family" aria-label={`${models[0].family.displayName} variants`}>
+              <h3>{models[0].family.displayName}</h3><p className="help">Thinking variants · {models[0].family.provenance === "upstream_family_metadata" ? "Devin family metadata" : "Reviewed fallback"}{models[0].family.upstreamDefaultEffort ? ` · upstream default ${models[0].family.upstreamDefaultEffort}` : ""}</p>
+              {models.map((model) => <ModelRow key={model.id} model={{ ...model, displayName: `${model.family!.effort} · ${model.displayName}` }} enabled={enabled.has(model.id)} disabled={busy} onToggle={(on) => bulk([model.id], on)} />)}
+            </section> : <ModelRow key={id} model={models[0]} enabled={enabled.has(id)} disabled={busy} onToggle={(on) => bulk([id], on)} />)
               : <p className="empty">{enabledOnly ? "No enabled models match these filters. Turn off Enabled only to add models." : "No models match these filters. Try another search or category."}</p>}
           </div>
           <nav className="pagination" aria-label="Devin model pages"><span aria-live="polite">{matches.length ? `Showing ${page.start + 1}–${page.end} of ${matches.length}` : "0 matching models"}</span><div><button type="button" disabled={page.pageIndex === 0} onClick={() => setPageIndex(page.pageIndex - 1)}>Previous</button><span>Page {page.pageIndex + 1} of {page.pageCount}</span><button type="button" disabled={page.pageIndex === page.pageCount - 1} onClick={() => setPageIndex(page.pageIndex + 1)}>Next</button></div></nav>

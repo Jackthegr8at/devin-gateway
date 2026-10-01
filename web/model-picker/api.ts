@@ -5,11 +5,11 @@ export class PickerApiError extends Error {
 export interface PickerApi { load(): Promise<Snapshot>; save(selection: ModelSelection, etag: string): Promise<{ selection: ModelSelection; etag: string }> }
 const selectionPath = "/admin/api/model-selection";
 function parseSelection(value: any): ModelSelection {
-  if (!value || value.schemaVersion !== 1 || !Number.isSafeInteger(value.revision) || value.revision < 1
+  if (!value || value.schemaVersion !== 2 || !Number.isSafeInteger(value.revision) || value.revision < 1
     || !Array.isArray(value.enabledModels) || value.enabledModels.some((id: unknown) => typeof id !== "string")
-    || !value.roles || typeof value.roles.default !== "string" || typeof value.roles.swe_worker !== "string"
+    || !value.roles || ["default", "swe_worker"].some((role) => !value.roles[role] || typeof value.roles[role].modelId !== "string" || typeof value.roles[role].effort !== "string")
     || typeof value.includeFutureModels !== "boolean") throw new PickerApiError(0, "The gateway returned invalid selection data. Reload after checking the gateway.");
-  return { schemaVersion: 1, revision: value.revision, enabledModels: [...value.enabledModels], roles: { default: value.roles.default, swe_worker: value.roles.swe_worker }, includeFutureModels: value.includeFutureModels };
+  return { schemaVersion: 2, revision: value.revision, enabledModels: [...value.enabledModels], roles: { default: { modelId: value.roles.default.modelId, effort: value.roles.default.effort }, swe_worker: { modelId: value.roles.swe_worker.modelId, effort: value.roles.swe_worker.effort } }, includeFutureModels: value.includeFutureModels };
 }
 export function createPickerApi(send: typeof fetch = fetch): PickerApi {
   async function json(path: string, init: RequestInit = {}) {
@@ -25,7 +25,7 @@ export function createPickerApi(send: typeof fetch = fetch): PickerApi {
   function selectionResult(result: { body: unknown; response: Response }) {
     const selection = parseSelection(result.body);
     const etag = result.response.headers.get("etag");
-    if (etag !== `"model-selection-v1-${selection.revision}"`) throw new PickerApiError(0, "The gateway returned an invalid revision ETag. Reload before saving.");
+    if (etag !== `"model-selection-v2-${selection.revision}"`) throw new PickerApiError(0, "The gateway returned an invalid revision ETag. Reload before saving.");
     return { selection, etag };
   }
   return {

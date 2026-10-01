@@ -14,6 +14,8 @@
  */
 
 import { streamChat, discoverModels, discoverModelMetadata, type ChatStreamEvent } from "./devin.js";
+import { projectModelFamilies, resolveFamilyModelId, FamilyRoutingError } from "./model-families.js";
+import { getCodexModelProfile } from "./admin/codex-model-profiles.js";
 import { ModelSelectionStore } from "./admin/model-selection-store.js";
 import { CODEX_SELECTION_PATH, createModelSelectionRoutes, managementRequestAllowed } from "./admin/routes.js";
 import { createAdminStaticHandler } from "./admin/static.js";
@@ -57,6 +59,7 @@ let HOST = "0.0.0.0";
 let DEFAULT_DEVIN_KEY = "";
 /** Base URL override for the Devin API (default: https://server.codeium.com). */
 let DEVIN_BASE_URL = "";
+const knownLogicalFamilyIds = new Set<string>();
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -68,6 +71,18 @@ function extractToken(req: Request): string {
   const apiKey = req.headers.get("x-api-key") ?? "";
   // Per-request credentials override the optional DEVIN_API_KEY fallback.
   return bearer || apiKey || DEFAULT_DEVIN_KEY;
+}
+
+async function resolveRequestModel(modelId: string, effort: unknown, token: string, signal: AbortSignal): Promise<string> {
+  // Existing exact concrete IDs retain their direct wire path.
+  if (getCodexModelProfile(modelId) || listModels().some((model) => model.id === modelId)) return modelId;
+  const discovered = await discoverModelMetadata(token, DEVIN_BASE_URL || undefined, signal, 5000).catch(() => []);
+  if (!discovered.length && knownLogicalFamilyIds.has(modelId)) throw new FamilyRoutingError("Logical model family discovery is unavailable; no route was substituted.");
+  const families = projectModelFamilies(discovered);
+  if (knownLogicalFamilyIds.has(modelId) && !families.some((family) => family.id === modelId)) throw new FamilyRoutingError("Logical model family is unavailable; no route was substituted.");
+  for (const family of families) knownLogicalFamilyIds.add(family.id);
+  // Unknown direct IDs historically pass through. Reviewed logical families never do.
+  return resolveFamilyModelId(modelId, effort, families);
 }
 
 /** Extract an error message from a non-2xx Response for trace flushing. */
@@ -164,7 +179,9 @@ async function handleChatCompletions(req: Request, reqId: string, trace: ErrorTr
   const token = extractToken(req);
   if (!token) return errorResponse(req, 401, "No Devin API key. Set DEVIN_API_KEY or pass Authorization: Bearer <token> / x-api-key: <token>.", "authentication_error");
 
-  const modelUid = body.model;
+  let modelUid: string;
+  try { modelUid = await resolveRequestModel(body.model, body.reasoning_effort, token, req.signal); }
+  catch (error) { return errorResponse(req, 400, error instanceof FamilyRoutingError ? error.message : "Model family discovery is unavailable.", "invalid_request_error"); }
   const internal = openaiToInternal(body.messages);
   const cascadeId = crypto.randomUUID();
   const prompts = toDevinPrompts(internal, cascadeId);
@@ -573,7 +590,9 @@ async function handleResponses(req: Request, reqId: string, trace: ErrorTrace): 
   );
   if (body.instructions) messages = [{ role: "developer", content: body.instructions }, ...messages];
 
-  const modelUid = body.model;
+  let modelUid: string;
+  try { modelUid = await resolveRequestModel(body.model, body.reasoning?.effort, token, req.signal); }
+  catch (error) { return errorResponse(req, 400, error instanceof FamilyRoutingError ? error.message : "Model family discovery is unavailable.", "invalid_request_error"); }
   const conversationMessages = messages.filter(
     (message) => message.role !== "system" && message.role !== "developer",
   );
@@ -583,7 +602,7 @@ async function handleResponses(req: Request, reqId: string, trace: ErrorTrace): 
   const originalSystemPrompt = extractSystemPrompt(messages);
   const collapseRequested = isCodexDesktopSystemCollapseRequest({
     featureFlag: process.env[CODEX_DESKTOP_SYSTEM_COLLAPSE_ENV],
-    modelId: body.model,
+    modelId: modelUid,
     topLevelInstructions: body.instructions,
     hasInputSystemDeveloperContext,
   });
@@ -934,7 +953,9 @@ async function handleAnthropicMessages(req: Request, reqId: string, trace: Error
   const token = extractToken(req);
   if (!token) return errorResponse(req, 401, "No Devin API key. Set DEVIN_API_KEY or pass Authorization: Bearer <token> / x-api-key: <token>.", "authentication_error");
 
-  const modelUid = body.model;
+  let modelUid: string;
+  try { modelUid = await resolveRequestModel(body.model, undefined, token, req.signal); }
+  catch (error) { return errorResponse(req, 400, error instanceof FamilyRoutingError ? error.message : "Model family discovery is unavailable.", "invalid_request_error"); }
   const internal = anthropicToInternal(body.messages);
   const cascadeId = crypto.randomUUID();
   const prompts = toDevinPrompts(internal, cascadeId);
@@ -1238,6 +1259,7 @@ export async function startServer(options: ServerOptions = {}): Promise<ServerHa
   HOST = options.host ?? process.env.HOST ?? "0.0.0.0";
   DEFAULT_DEVIN_KEY = options.token ?? process.env.DEVIN_API_KEY ?? "";
   DEVIN_BASE_URL = options.baseUrl ?? process.env.DEVIN_BASE_URL ?? "";
+  knownLogicalFamilyIds.clear();
 
   const selectionEnabled = options.modelSelection !== undefined || process.env.DEVIN_MODEL_SELECTION_ENABLED === "1";
   const configuredAdminPort = options.modelSelection?.adminPort
@@ -1259,7 +1281,9 @@ export async function startServer(options: ServerOptions = {}): Promise<ServerHa
     discover: async (req) => {
       const token = extractToken(req);
       if (!token) throw new Error("No model discovery credential configured.");
-      return discoverModelMetadata(token, DEVIN_BASE_URL || undefined, req.signal, 5000);
+      const models = await discoverModelMetadata(token, DEVIN_BASE_URL || undefined, req.signal, 5000);
+      for (const family of projectModelFamilies(models)) knownLogicalFamilyIds.add(family.id);
+      return models;
     },
   }) : undefined;
 

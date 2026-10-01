@@ -466,6 +466,8 @@ export interface DiscoveredModel {
 
 /** Additional admin-only facts; legacy discovery and /v1/models retain their shape. */
 export interface DiscoveredModelMetadata extends DiscoveredModel {
+  modelFamilyMetadata?: import("./model-families.js").ModelFamilyMetadata;
+  isDefaultModelInFamily?: boolean;
   upstreamThinking: boolean | null;
   metadataProvenance: {
     id: "upstream";
@@ -605,6 +607,8 @@ function parseClientModelConfig(decoder: ProtoDecoder): DiscoveredModelMetadata 
   let supportsImages = false;
   let imageSupportPresent = false;
   let supportsThinking: boolean | null = null;
+  let modelFamilyMetadata: import("./model-families.js").ModelFamilyMetadata | undefined;
+  let isDefaultModelInFamily = false;
 
   while (!decoder.done) {
     const { field, wire } = decoder.readTag();
@@ -623,6 +627,10 @@ function parseClientModelConfig(decoder: ProtoDecoder): DiscoveredModelMetadata 
       const info = decoder.readMessage(parseModelInfo);
       maxOutputTokens = info.maxOutputTokens;
       supportsThinking = info.supportsThinking;
+    } else if (field === 30 && wire === 2) {
+      modelFamilyMetadata = decoder.readMessage(parseModelFamilyMetadata);
+    } else if (field === 31 && wire === 0) {
+      isDefaultModelInFamily = decoder.readVarint() !== 0n;
     } else {
       decoder.skip(wire);
     }
@@ -644,6 +652,8 @@ function parseClientModelConfig(decoder: ProtoDecoder): DiscoveredModelMetadata 
     reasoning,
     supportsImages,
     upstreamThinking: supportsThinking,
+    ...(modelFamilyMetadata ? { modelFamilyMetadata } : {}),
+    isDefaultModelInFamily,
     metadataProvenance: {
       id: "upstream", displayName: label.trim() ? "upstream" : "id_fallback",
       contextWindow: contextWindowTokens > 0 ? "upstream" : "fallback",
@@ -653,4 +663,36 @@ function parseClientModelConfig(decoder: ProtoDecoder): DiscoveredModelMetadata 
       reasoning: "upstream_indicator_and_label_heuristic",
     },
   };
+}
+
+/** Field numbers verified against OMP's generated Devin schema, not label heuristics. */
+function parseModelFamilyMetadata(decoder: ProtoDecoder): import("./model-families.js").ModelFamilyMetadata {
+  const result: import("./model-families.js").ModelFamilyMetadata = { modelFamilyLabel: "", entries: [], isDefaultModelInFamily: false };
+  while (!decoder.done) {
+    const { field, wire } = decoder.readTag();
+    if (field === 1 && wire === 2) result.modelFamilyLabel = decoder.readString();
+    else if (field === 3 && wire === 0) result.isDefaultModelInFamily = decoder.readVarint() !== 0n;
+    else if (field === 2 && wire === 2) result.entries.push(decoder.readMessage((entry) => {
+      let key = "";
+      let value: { order: number; name: string } | null = null;
+      while (!entry.done) {
+        const tag = entry.readTag();
+        if (tag.field === 1 && tag.wire === 2) key = entry.readString();
+        else if (tag.field === 2 && tag.wire === 2) value = entry.readMessage((leaf) => {
+          let order = 0; let name = "";
+          while (!leaf.done) {
+            const tag = leaf.readTag();
+            if (tag.field === 1 && tag.wire === 0) order = Number(BigInt.asIntN(32, leaf.readVarint()));
+            else if (tag.field === 2 && tag.wire === 2) name = leaf.readString();
+            else leaf.skip(tag.wire);
+          }
+          return { order, name };
+        });
+        else entry.skip(tag.wire);
+      }
+      return { key, value };
+    }));
+    else decoder.skip(wire);
+  }
+  return result;
 }

@@ -1,5 +1,6 @@
 import type { DiscoveredModelMetadata } from "../devin.js";
-import { adminModels, codexSelectionManifest } from "./model-catalog.js";
+import { adminModels, codexSelectionManifest, validateDiscoveredRoles } from "./model-catalog.js";
+import { projectModelFamilies } from "../model-families.js";
 import { MAX_SELECTION_BYTES, ModelSelectionError, selectionETag, validateModelSelection } from "./model-selection.js";
 import type { ModelSelectionStore } from "./model-selection-store.js";
 
@@ -65,7 +66,8 @@ export function createModelSelectionRoutes(options: ModelSelectionRoutesOptions)
       }
       if (req.method === "GET" && path === "/admin/api/models") {
         const selection = await options.store.read();
-        return json({ source: "remote", selectionRevision: selection.revision, models: adminModels(await discover(req), selection) });
+        const discovered = await discover(req);
+        return json({ source: "remote", selectionRevision: selection.revision, models: adminModels(discovered, selection), families: projectModelFamilies(discovered) });
       }
       if (req.method === "PUT" && path === "/admin/api/model-selection") {
         if (req.headers.get("content-type")?.split(";")[0].trim().toLowerCase() !== "application/json") {
@@ -75,8 +77,10 @@ export function createModelSelectionRoutes(options: ModelSelectionRoutesOptions)
         const expected = req.headers.get("if-match");
         if (!expected) return error(428, "revision_required", "If-Match is required for model selection writes.");
         const proposed = validateModelSelection(await selectionBody(req));
+        const available = await discover(req);
+        validateDiscoveredRoles(proposed, available);
         if (proposed.includeFutureModels) {
-          const models = await discover(req);
+          const models = available;
           if (models.some((model) => !proposed.enabledModels.includes(model.id))) {
             return error(400, "invalid_future_selection", "Include future models requires selecting all currently discovered models.");
           }
