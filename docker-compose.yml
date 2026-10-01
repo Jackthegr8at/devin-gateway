@@ -1,34 +1,26 @@
 services:
   devin-gateway:
-    build: .
-    env_file:
-      - path: .env
-        required: false
+    build:
+      context: .
+      dockerfile: Dockerfile
     ports:
-      - "127.0.0.1:${PORT:-3000}:${PORT:-3000}"
+      - "${DEVIN_GATEWAY_BIND_IP:?Set DEVIN_GATEWAY_BIND_IP in .env to a private devhub interface IP}:38643:3000"
     environment:
-      - PORT=${PORT:-3000}
-      - HOST=${HOST:-0.0.0.0}
-      # Optional: fallback token for requests that omit Authorization/x-api-key
-      - DEVIN_API_KEY=${DEVIN_API_KEY:-}
-      # Optional: override Devin API base URL
-      - DEVIN_BASE_URL=${DEVIN_BASE_URL:-}
-      # Log level: debug | info | warn | error (default: info)
-      - LOG_LEVEL=${LOG_LEVEL:-info}
-      # Debug mode: set to true|1|yes to force verbose logs and tee them to
-      # /app/logs/gateway.log (mounted below). Default: off.
-      - DEBUG=${DEBUG:-false}
-      # Optional: override the in-container log file path (default /app/logs/gateway.log).
-      # `:-` treats an empty `LOG_FILE=` in .env as unset, falling back to the default.
-      - LOG_FILE=${LOG_FILE:-/app/logs/gateway.log}
+      PORT: "3000"
+      HOST: "0.0.0.0"
+      DEVIN_CODEX_DESKTOP_COLLAPSE_SYSTEM: "1"
+      DEVIN_RESPONSES_SAFE_DIAGNOSTICS: "${DEVIN_RESPONSES_SAFE_DIAGNOSTICS:-0}"
+      DEVIN_RESPONSES_SAFE_DIAGNOSTICS_PATH: "/app/logs/responses-safe-diagnostic.jsonl"
+      ERROR_TRACE: "false"
+      LOG_LEVEL: "info"
+      DEBUG: "false"
+      LOG_FILE: "/app/logs/gateway.log"
     volumes:
-      # Persist debug-mode logs to the host so they survive container restarts.
       - ./logs:/app/logs
-    restart: always
+    restart: unless-stopped
     healthcheck:
-      # $$ escapes compose interpolation so $PORT is resolved by the container
-      # shell at runtime, matching whatever port the server actually listens on.
-      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:$${PORT:-3000}/health || exit 1"]
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:$${PORT:-3000}/health | grep -q '\"status\":\"ok\".*\"collapse_system_enabled\":true'"]
       interval: 30s
       timeout: 5s
+      start_period: 10s
       retries: 3

@@ -101,59 +101,93 @@ The optional `DEVIN_CODEX_DESKTOP_COLLAPSE_SYSTEM=1` gateway setting enables the
 
 Safe Responses diagnostics are disabled by default. To opt in, set `DEVIN_RESPONSES_SAFE_DIAGNOSTICS=1`; one allowlisted JSON record per Responses request is appended to the ignored `logs/responses-safe-diagnostic.jsonl`. Records contain hashes/byte lengths and limited model, tool, status, error-category, and call-ID metadata—not raw prompt text, tool arguments, schemas, descriptions, credentials, or headers. Hashes can still reveal matches for guessable text, so treat the log as diagnostic data and do not publish it. An alternate output path can be set with `DEVIN_RESPONSES_SAFE_DIAGNOSTICS_PATH`.
 
-### Docker
+### Self-hosted Docker Compose (Codex Desktop)
 
-The published image supports `linux/amd64` and `linux/arm64`, and is available from both [GHCR](https://github.com/CaiJingLong/devin-gateway/pkgs/container/devin-gateway) (`ghcr.io/caijinglong/devin-gateway`) and [Docker Hub](https://hub.docker.com/r/kikt69/devin-gateway) (`kikt69/devin-gateway`). Sign in on the host with `bun run login` before starting it.
+This fork is deployed by building the checked-out Git branch on the Linux host. The Compose service builds from this repository's `Dockerfile`; it does not require a published image or a registry login.
 
-#### `docker run`
+The gateway listens on port `3000` inside the container and publishes host port `38643` only on the private address set in `.env`. Prefer the host's WireGuard interface address when Codex connects over WireGuard. Otherwise use a private LAN interface and restrict TCP `38643` in the host firewall to trusted client addresses. Do not create a router port-forward or expose this service to the public Internet.
 
-```bash
-docker run -d \
-  --name devin-gateway \
-  --restart unless-stopped \
-  -p 127.0.0.1:3000:3000 \
-  ghcr.io/caijinglong/devin-gateway:0.4.2
-```
-
-Clients send their own Devin token per request, so no token volume is needed. Set `DEVIN_API_KEY` only if you want a server-side fallback.
-
-#### Docker Compose
-
-Create `compose.yaml`:
-
-```yaml
-services:
-  devin-gateway:
-    image: ghcr.io/caijinglong/devin-gateway:latest
-    container_name: devin-gateway
-    restart: always
-    ports:
-      - "127.0.0.1:3000:3000"
-    environment:
-      PORT: "3000"
-      HOST: "0.0.0.0"
-```
-
-Start and inspect the service:
+#### First deployment on the host
 
 ```bash
-docker compose pull
+git clone https://github.com/Jackthegr8at/devin-gateway.git
+cd devin-gateway
+git checkout codex-desktop
+cp devhub.env.example .env
+```
+
+Edit `.env` and set `DEVIN_GATEWAY_BIND_IP` to the private LAN or WireGuard address assigned to this host. `.env` is Git-ignored and Docker-ignored; it must contain only this non-secret bind address.
+
+```bash
+docker compose config
+docker compose build
 docker compose up -d
 docker compose ps
-docker compose logs -f
+docker compose logs -f devin-gateway
 ```
 
-Stop and remove the container:
+The container runs the existing Alpine/Bun image entrypoint, which starts Bun as the unprivileged `gateway` user. The Dockerfile healthcheck verifies `/health` returns success; the Compose healthcheck additionally requires `status: ok` and `collapse_system_enabled: true`.
+
+#### Authentication and secret handling
+
+The gateway is stateless: Codex must send a Devin credential on each API request using `Authorization: Bearer …` (or `x-api-key`). This Compose configuration deliberately does not set the server-side `DEVIN_API_KEY` fallback and does not mount a token file. Do not run the persistent `bun run login` flow on the host for this deployment; that CLI flow writes a token file, while the HTTP server does not need a saved login.
+
+Keep the Devin token on the Windows client in Windows Credential Manager or another protected local secret store. Make it available only to the Codex Desktop process through a controlled launcher/secret-injection step and configure the provider's `env_key` to read that variable. Do not put the token in `.env`, Compose YAML, Codex config, Git, or the devhub filesystem. When testing `/v1/models`, use a short-lived PowerShell process whose `DEVIN_API_KEY` was populated from the protected store; the request is authenticated and the live catalog is account-specific. For remote access, route the bearer token only over WireGuard (or another encrypted private channel).
+
+The container writes normal operational logs to stderr, so `docker compose logs -f devin-gateway` works without debug mode. `DEBUG` and `ERROR_TRACE` are explicitly disabled; error traces can otherwise include request bodies. Safe Responses diagnostics are disabled by default. Their configured path is `/app/logs/responses-safe-diagnostic.jsonl`, under the ignored `./logs` bind mount, so they can be explicitly enabled later without changing the image. Do not enable raw debug/error tracing for routine operation.
+
+#### Health and live model verification
+
+On devhub, replace the placeholder with the actual private host address:
 
 ```bash
-docker compose down
+curl -fsS 'http://<private-devhub-ip>:38643/health' | jq -e '.status == "ok" and .collapse_system_enabled == true'
 ```
 
-The repository also includes a development `docker-compose.yml` that builds the image locally:
+For the live Devin catalog, run this from a Windows PowerShell process after securely populating its temporary `$env:DEVIN_API_KEY` from your local secret store. Replace the host placeholder; the token value itself is never part of the command text:
+
+```powershell
+$base = 'http://<private-devhub-ip>:38643'
+$headers = @{ Authorization = "Bearer $env:DEVIN_API_KEY" }
+$ids = (Invoke-RestMethod -Uri "$base/v1/models" -Headers $headers).data.id
+foreach ($required in @('glm-5-3-flash-low', 'swe-2-medium')) {
+    if ($required -notin $ids) { throw "Required Devin model is missing: $required" }
+    "AVAILABLE $required"
+}
+```
+
+`/health` is unauthenticated and reports the collapse flag. `/v1/models` performs live Devin discovery and therefore requires a valid per-request credential.
+
+#### Updating the deployment
 
 ```bash
-docker compose up -d --build
+cd devin-gateway
+git fetch origin
+git checkout codex-desktop
+git pull --ff-only origin codex-desktop
+docker compose build --pull
+docker compose up -d --remove-orphans
+docker compose ps
 ```
+
+Review the fetched commit before rebuilding when you want a deliberate update. `--ff-only` prevents an accidental merge commit; `--pull` refreshes the Docker base image.
+
+#### Rollback
+
+Before each update, record the currently deployed commit. Roll back to that previous deployment commit (which includes the matching Compose configuration) without rewriting a branch:
+
+```bash
+cd devin-gateway
+git rev-parse HEAD
+# Save the printed SHA as PREVIOUS_DEPLOYED_COMMIT before updating.
+# If the update fails, check out that saved SHA:
+git checkout --detach <previous-deployed-commit>
+docker compose build --pull
+docker compose up -d --remove-orphans
+docker compose ps
+```
+
+Return to the branch afterward with `git checkout codex-desktop`. A detached checkout is local and does not move or rewrite any remote branch. The current Desktop-validated application commit is `c89f73c63ce3399ae9bc6b62125fea9ddb891f31`; it predates this local Compose preparation, so use it as a code-validation reference, not as a deployment rollback point unless the corresponding private-bind Compose configuration is retained.
 
 ## Getting a Devin token
 
