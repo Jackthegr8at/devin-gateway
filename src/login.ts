@@ -58,6 +58,9 @@ export async function completeLoginWithUrl(
   const url = new URL(_redirectUrl, "http://localhost");
   const code = url.searchParams.get("code");
   if (!code) throw new Error("No code in redirect URL");
+  if (!session.state || url.searchParams.getAll("state").length !== 1 || url.searchParams.get("state") !== session.state) {
+    throw new Error("Invalid callback: state mismatch");
+  }
 
   return exchangeToken(code, session.verifier);
 }

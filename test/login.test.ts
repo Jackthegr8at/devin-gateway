@@ -157,6 +157,18 @@ describe("exchangeToken", () => {
 });
 
 describe("completeLoginWithUrl", () => {
+  test("missing, mismatched and duplicate state never reach token exchange", async () => {
+    const original = globalThis.fetch;
+    let calls = 0;
+    globalThis.fetch = (() => { calls++; throw new Error("Unexpected exchange"); }) as typeof fetch;
+    try {
+      const session = await startLoginFlow("http://localhost/cb");
+      for (const query of ["code=test", "code=test&state=wrong", `code=test&state=${session.state}&state=${session.state}`]) {
+        await expect(completeLoginWithUrl(session, `/cb?${query}`)).rejects.toThrow("state mismatch");
+      }
+      expect(calls).toBe(0);
+    } finally { globalThis.fetch = original; }
+  });
   test("extracts code from redirect URL and exchanges it", async () => {
     const real = globalThis.fetch;
     try {
@@ -184,7 +196,7 @@ describe("completeLoginWithUrl", () => {
       globalThis.fetch = recordingFetch(captured, jsonRespond({ token: "rel" }));
 
       const session = await startLoginFlow("http://localhost/cb");
-      const token = await completeLoginWithUrl(session, "/cb?code=abc");
+      const token = await completeLoginWithUrl(session, `/cb?code=abc&state=${session.state}`);
       expect(token).toBe("rel");
       expect(captured.init?.body).toBe(
         JSON.stringify({ code: "abc", code_verifier: session.verifier }),
