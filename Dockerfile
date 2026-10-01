@@ -1,6 +1,16 @@
 FROM oven/bun:1-alpine AS base
 WORKDIR /app
 
+# Isolated browser bundle; no dev dependencies or build tools in the final image.
+FROM base AS picker-build
+COPY package.json bun.lock* ./
+RUN bun install --frozen-lockfile --production
+COPY scripts/build-model-picker.ts ./scripts/build-model-picker.ts
+COPY web/model-picker/ ./web/model-picker/
+RUN bun run scripts/build-model-picker.ts
+
+FROM base AS runtime
+
 # su-exec lets the entrypoint fix bind-mount perms then drop to non-root.
 RUN apk add --no-cache su-exec
 
@@ -11,6 +21,7 @@ RUN bun install --frozen-lockfile --production 2>/dev/null || bun install --prod
 # Copy source
 COPY tsconfig.json ./
 COPY src/ ./src/
+COPY --from=picker-build /app/dist/admin-ui/ ./dist/admin-ui/
 
 # Entrypoint (fixes logs/ perms, then drops privileges)
 COPY docker-entrypoint.sh /docker-entrypoint.sh

@@ -16,6 +16,7 @@
 import { streamChat, discoverModels, discoverModelMetadata, type ChatStreamEvent } from "./devin.js";
 import { ModelSelectionStore } from "./admin/model-selection-store.js";
 import { CODEX_SELECTION_PATH, createModelSelectionRoutes, managementRequestAllowed } from "./admin/routes.js";
+import { createAdminStaticHandler } from "./admin/static.js";
 import { listModels, type ModelInfo } from "./models.js";
 import {
   openaiToInternal,
@@ -1392,14 +1393,15 @@ export async function startServer(options: ServerOptions = {}): Promise<ServerHa
 
   let adminServer: ReturnType<typeof Bun.serve> | undefined;
   if (selectionRoutes && configuredAdminPort !== undefined) {
+    const staticPage = createAdminStaticHandler();
     try {
       adminServer = Bun.serve({
         hostname: adminHost, port: configuredAdminPort, idleTimeout: 10,
-        fetch(req) {
+        async fetch(req) {
           if (!managementRequestAllowed(req, adminServer!.port!, adminPublicPort)) {
             return Response.json({ error: { code: "management_origin_rejected", message: "Management Host/Origin check failed." } }, { status: 403 });
           }
-          return selectionRoutes.admin(req);
+          return await staticPage(req) ?? selectionRoutes.admin(req);
         },
       });
     } catch {

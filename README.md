@@ -120,7 +120,7 @@ The exact-ID reviewed profiles advertise only GLM `low` and SWE-2 `medium`, with
 
 The store uses private POSIX directory/file modes (`0700`/`0600`), a flushed temporary file and atomic rename, plus a bounded filesystem writer lock. A corrupt existing file stops initialization or returns a sanitized `503`; it is never overwritten with defaults. After an interrupted writer, an abandoned `.selection-write.lock` fails closed: confirm every writer is stopped before manually removing that lock. Normal saves leave no lock or temporary file.
 
-Management endpoints are served only when `DEVIN_ADMIN_PORT` is explicitly set alongside enabled selection. This separate listener defaults to `127.0.0.1`. Compose explicitly uses `DEVIN_ADMIN_HOST=0.0.0.0` and port `3001` inside the container, published **only** as `127.0.0.1:38644:3001` on the host. `DEVIN_ADMIN_PUBLIC_PORT=38644` permits that exact loopback authority through the Host/Origin guard; LAN hosts and forwarded-host headers are not trusted. The listener rejects cross-site fetch metadata, has no inference CORS/raw tracing, and serves no UI:
+Management endpoints are served only when `DEVIN_ADMIN_PORT` is explicitly set alongside enabled selection. This separate listener defaults to `127.0.0.1`. Compose explicitly uses `DEVIN_ADMIN_HOST=0.0.0.0` and port `3001` inside the container, published **only** as `127.0.0.1:38644:3001` on the host. `DEVIN_ADMIN_PUBLIC_PORT=38644` permits that exact loopback authority through the Host/Origin guard; LAN hosts and forwarded-host headers are not trusted. The listener rejects cross-site fetch metadata and has no inference CORS/raw tracing. The Phase 2 picker at `/admin/` uses this listener only:
 
 | Method/path | Response |
 |---|---|
@@ -609,6 +609,46 @@ Key files:
 - `src/server.ts`: HTTP server and compatibility endpoints
 - `src/client.ts`: high-level `chat()` client for programmatic/Actions use
 - `src/index.ts`: public entry point — re-exports the API, starts the server when run directly
+
+## Web model picker (Phase 2)
+
+Open `http://127.0.0.1:38644/admin/` through an SSH tunnel. The page never handles Devin credentials and is not served on the inference port. Its fixed assets use a same-origin CSP without inline scripts, inline styles, or eval. No external fonts, analytics, or CDN assets are loaded.
+
+The compact dark picker adapts Cody's MIT-licensed category, display and pagination helpers; attribution is in `web/model-picker/THIRD_PARTY_NOTICES.txt` and the built `/admin/assets/third-party-notices.txt`. React/React DOM are the only added runtime dependencies. Bun bundles the frontend; no Next.js or separate UI server is required:
+
+```sh
+bun install --frozen-lockfile
+bun run typecheck
+bun run build
+```
+
+Search matches exact IDs and display names case-insensitively. SWE, Fusion and Other are display categories only, combined as a union. Pages contain at most 60 rows; bulk actions affect every filtered row across pages. The enabled-only filter uses the unsaved draft.
+
+Checkboxes, role assignments and the future-model policy share one draft. Save sends one complete selection using the loaded ETag, `If-Match`, and `X-Devin-Management: 1`. Cancel or Escape discards the whole draft; Escape first closes an open category filter. A 412 preserves the draft and blocks overwrite until explicit reload. Both Phase 1 roles remain required: disabling an assigned model blocks Save until it is re-enabled or reassigned. Only available, enabled models with reviewed profiles and complete export metadata can receive roles. Unreviewed models can be enabled but cannot receive a Codex role.
+
+The future-model option requires all discovered models to be selected. Disabling any model exits future mode. New discoveries may join the enabled selection but never acquire a role automatically. Missing upstream models remain visible as unavailable; no substitute is selected.
+
+**Phase 3 is not implemented:** Windows activation still uses its validated static catalog/worker. Saving here does not change Desktop configuration. Runtime/package changes require a separately reviewed Windows source-fingerprint refresh before using the local launcher; its guard has not been bypassed.
+
+After review and publication of this branch, deploy without removing auth/settings volumes:
+
+```sh
+cd <existing-gateway-checkout>
+git fetch origin
+git switch feat/model-picker-phase2
+git pull --ff-only
+sudo docker compose build devin-gateway
+sudo docker compose up -d --no-deps --force-recreate devin-gateway
+sudo docker compose ps
+```
+
+From a standalone Windows terminal:
+
+```powershell
+ssh.exe -N -o ExitOnForwardFailure=yes -L 127.0.0.1:38644:127.0.0.1:38644 -i '<ssh-key-path>' '<ssh-user>@<private-host>'
+```
+
+Manual acceptance should verify search/filter/page-wide bulk changes, Cancel, required-role errors, future mode, and a conflict between two browser tabs. Confirm `/admin/` remains absent on inference port 38643 and management port 38644 is not LAN-published. Do not submit an inference request for this acceptance.
 
 ## License
 

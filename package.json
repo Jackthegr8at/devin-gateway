@@ -84,16 +84,24 @@
     "login": "bun run src/cli/login.ts",
     "login:paste": "bun run src/cli/login.ts --paste",
     "login:status": "bun run src/cli/login.ts --status",
-    "build": "tsc -p tsconfig.build.json",
+    "build": "tsc -p tsconfig.build.json && bun run build:web",
+    "build:web": "bun run scripts/build-model-picker.ts",
     "clean": "rm -rf dist",
-    "typecheck": "tsc --noEmit",
+    "typecheck": "tsc --noEmit && tsc -p tsconfig.web.json --noEmit",
     "prepack": "bun run typecheck && bun run build"
   },
-  "dependencies": {},
+  "dependencies": {
+    "react": "19",
+    "react-dom": "19"
+  },
   "devDependencies": {
     "@anthropic-ai/sdk": "^0.115.0",
     "@types/bun": "latest",
+    "@types/jsdom": "^30.0.0",
     "@types/node": "latest",
+    "@types/react": "19",
+    "@types/react-dom": "19",
+    "jsdom": "^30.1.1",
     "openai": "^6.49.0",
     "typescript": "^5"
   }
