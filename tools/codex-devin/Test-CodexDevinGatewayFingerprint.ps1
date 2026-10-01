@@ -22,6 +22,11 @@ $launcherText = Get-Content -LiteralPath $launcherPath -Raw
 $pinMatch = [regex]::Match($launcherText, "\`$reviewedSourceSha256\s*=\s*'(?<hash>[A-Fa-f0-9]{64})'")
 Assert-GatewayFingerprint 'launcher pins one explicit reviewed fingerprint' $pinMatch.Success
 $actualFingerprint = Get-CodexDevinGatewayFingerprint -GatewayRoot $gatewayRoot -OAuthHelperPath $oauthHelperPath
+foreach ($file in @(Get-ChildItem -LiteralPath (Join-Path $gatewayRoot 'src') -Recurse -File)) {
+    if ($file.Extension -eq '.ts') {
+        Assert-GatewayFingerprint ('runtime source uses reproducible LF endings: ' + $file.Name) (-not [IO.File]::ReadAllText($file.FullName).Contains("`r`n"))
+    }
+}
 Assert-GatewayFingerprint 'clean-fork runtime source matches the reviewed fingerprint pin' ([string]::Equals($actualFingerprint, $pinMatch.Groups['hash'].Value, [StringComparison]::OrdinalIgnoreCase))
 
 $tempRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd([char[]]@('\', '/'))
