@@ -134,8 +134,8 @@ Devin authentication is owned by the gateway on devhub. Both Compose services mo
 After the first deployment, run this from a Windows PowerShell window. The URL is printed by the existing Devin PKCE login flow. Open it in your browser; if the redirect cannot reach the container, paste the full redirect URL into the SSH terminal prompt. The code exchange and token write happen inside the container, and the token remains on devhub:
 
 ```powershell
-ssh -t gateway-user@<devhub-host> "cd '<gateway-directory>' && docker compose run --rm devin-login"
-ssh gateway-user@<devhub-host> "cd '<gateway-directory>' && docker compose up -d --force-recreate devin-gateway"
+ssh -t gateway-user@<devhub-host> "cd '<gateway-directory>' && sudo -n docker compose run --rm devin-login"
+ssh gateway-user@<devhub-host> "cd '<gateway-directory>' && sudo -n docker compose up -d --force-recreate devin-gateway"
 ```
 
 The guarded Windows worker wrapper can run the same interactive login step automatically over SSH only when remote `/health` reports `fallback_token: not_set`. It does not read or transfer the credential. When the health state is `set`, it skips OAuth and gateway restart. Request-supplied `Authorization` and `x-api-key` values, if any, retain their existing precedence over the fallback.
@@ -161,7 +161,7 @@ foreach ($required in @('glm-5-3-flash-low', 'swe-2-medium')) {
 }
 ```
 
-`/health` is unauthenticated and reports the collapse flag plus `fallback_token: set` or `not_set` (never the token itself). `/v1/models` performs live Devin discovery using the startup fallback token. For first deployment, you can run `docker compose run --rm devin-login` directly on devhub and then recreate the gateway as shown above.
+`/health` is unauthenticated and reports the collapse flag plus `fallback_token: set` or `not_set` (never the token itself). `/v1/models` performs live Devin discovery using the startup fallback token. For first deployment, run `sudo -n docker compose run --rm devin-login` on devhub and then recreate the gateway as shown above.
 
 #### Updating the deployment
 

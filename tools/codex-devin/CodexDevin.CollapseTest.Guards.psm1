@@ -136,8 +136,8 @@ function New-CodexDevinRemoteComposeCommand {
     )
 
     $quotedDirectory = ConvertTo-CodexDevinRemoteShellPath -Path $RemoteGatewayDirectory
-    if ($Action -ceq 'Login') { return "cd $quotedDirectory && docker compose run --rm devin-login" }
-    return "cd $quotedDirectory && docker compose up -d --force-recreate devin-gateway"
+    if ($Action -ceq 'Login') { return "cd $quotedDirectory && sudo -n docker compose run --rm devin-login" }
+    return "cd $quotedDirectory && sudo -n docker compose up -d --force-recreate devin-gateway"
 }
 
 function Invoke-CodexDevinRemoteAuthentication {

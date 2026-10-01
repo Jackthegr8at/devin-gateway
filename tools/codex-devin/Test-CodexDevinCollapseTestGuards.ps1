@@ -128,8 +128,8 @@ Assert-CollapseGuard 'SSH options preserve agent/default identity behavior when 
 $missingIdentityRejected = $false
 try { $null = Get-CodexDevinRemoteSshOptions -Action Login -IdentityFile (Join-Path ([IO.Path]::GetTempPath()) ([guid]::NewGuid().ToString('N'))) } catch { $missingIdentityRejected = $true }
 Assert-CollapseGuard 'SSH identity file must exist before remote auth begins' $missingIdentityRejected $true
-Assert-CollapseGuard 'interactive SSH command runs the existing paste login service' ((New-CodexDevinRemoteComposeCommand -Action Login -RemoteGatewayDirectory '/srv/example/services/devin-gateway') -ceq "cd '/srv/example/services/devin-gateway' && docker compose run --rm devin-login") $true
-Assert-CollapseGuard 'restart SSH command recreates only the gateway service' ((New-CodexDevinRemoteComposeCommand -Action Restart -RemoteGatewayDirectory '/srv/example/services/devin-gateway') -ceq "cd '/srv/example/services/devin-gateway' && docker compose up -d --force-recreate devin-gateway") $true
+Assert-CollapseGuard 'interactive SSH command uses non-interactive sudo for the existing paste login service' ((New-CodexDevinRemoteComposeCommand -Action Login -RemoteGatewayDirectory '/srv/example/services/devin-gateway') -ceq "cd '/srv/example/services/devin-gateway' && sudo -n docker compose run --rm devin-login") $true
+Assert-CollapseGuard 'restart SSH command uses non-interactive sudo and recreates only the gateway service' ((New-CodexDevinRemoteComposeCommand -Action Restart -RemoteGatewayDirectory '/srv/example/services/devin-gateway') -ceq "cd '/srv/example/services/devin-gateway' && sudo -n docker compose up -d --force-recreate devin-gateway") $true
 Assert-CollapseGuard 'remote path quoting preserves spaces' ((ConvertTo-CodexDevinRemoteShellPath -Path '/srv/example space/gateway') -ceq "'/srv/example space/gateway'") $true
 Assert-CollapseGuard 'remote path quoting safely escapes embedded quotes' ((ConvertTo-CodexDevinRemoteShellPath -Path "/srv/example/o'connor") -ceq "'/srv/example/o'`"'`"'connor'") $true
 
