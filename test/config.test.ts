@@ -79,6 +79,26 @@ describe("config token storage", () => {
       await rm(dir, { recursive: true, force: true });
     }
   });
+
+  test("readFallbackToken prefers DEVIN_API_KEY and otherwise uses the saved token", async () => {
+    const dir = await freshConfigDir();
+    const savedApiKey = process.env.DEVIN_API_KEY;
+    process.env.DEVIN_GATEWAY_CONFIG_DIR = dir;
+    try {
+      const mod = await loadConfig();
+      await mod.writeToken("saved-token");
+      delete process.env.DEVIN_API_KEY;
+      expect(await mod.readFallbackToken()).toBe("saved-token");
+
+      process.env.DEVIN_API_KEY = "environment-token";
+      expect(await mod.readFallbackToken()).toBe("environment-token");
+    } finally {
+      process.env.DEVIN_GATEWAY_CONFIG_DIR = savedEnv;
+      if (savedApiKey === undefined) delete process.env.DEVIN_API_KEY;
+      else process.env.DEVIN_API_KEY = savedApiKey;
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
 });
 
 // Belt-and-suspenders: restore the original env in case a test threw before

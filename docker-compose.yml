@@ -1,5 +1,6 @@
 services:
   devin-gateway:
+    image: devin-gateway-codex:local
     build:
       context: .
       dockerfile: Dockerfile
@@ -8,6 +9,7 @@ services:
     environment:
       PORT: "3000"
       HOST: "0.0.0.0"
+      DEVIN_GATEWAY_CONFIG_DIR: "/home/gateway/.devin-gateway"
       DEVIN_CODEX_DESKTOP_COLLAPSE_SYSTEM: "1"
       DEVIN_RESPONSES_SAFE_DIAGNOSTICS: "${DEVIN_RESPONSES_SAFE_DIAGNOSTICS:-0}"
       DEVIN_RESPONSES_SAFE_DIAGNOSTICS_PATH: "/app/logs/responses-safe-diagnostic.jsonl"
@@ -17,6 +19,7 @@ services:
       LOG_FILE: "/app/logs/gateway.log"
     volumes:
       - ./logs:/app/logs
+      - devin-gateway-auth:/home/gateway/.devin-gateway
     restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:$${PORT:-3000}/health | grep -q '\"status\":\"ok\".*\"collapse_system_enabled\":true'"]
@@ -24,3 +27,17 @@ services:
       timeout: 5s
       start_period: 10s
       retries: 3
+
+  devin-login:
+    image: devin-gateway-codex:local
+    profiles: ["auth"]
+    entrypoint: ["su-exec", "gateway", "bun", "run", "src/cli/login.ts", "--paste", "--no-display-token"]
+    environment:
+      DEVIN_GATEWAY_CONFIG_DIR: "/home/gateway/.devin-gateway"
+    volumes:
+      - devin-gateway-auth:/home/gateway/.devin-gateway
+    stdin_open: true
+    tty: true
+
+volumes:
+  devin-gateway-auth:

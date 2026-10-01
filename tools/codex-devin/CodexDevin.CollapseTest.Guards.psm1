@@ -28,6 +28,174 @@ function Test-CodexDevinGatewayPortAvailable {
     return ($Listeners.Count -eq 0)
 }
 
+function Resolve-CodexDevinGatewayTarget {
+    [CmdletBinding()]
+    param([string]$GatewayUrl = 'http://127.0.0.1:38643')
+
+    $uri = $null
+    if (-not [Uri]::TryCreate($GatewayUrl, [UriKind]::Absolute, [ref]$uri)) {
+        throw 'GatewayUrl must be an absolute HTTP gateway root URL.'
+    }
+    if (
+        $uri.Scheme -cne 'http' -or
+        $uri.AbsolutePath -cne '/' -or
+        -not [string]::IsNullOrEmpty($uri.UserInfo) -or
+        -not [string]::IsNullOrEmpty($uri.Query) -or
+        -not [string]::IsNullOrEmpty($uri.Fragment)
+    ) {
+        throw 'GatewayUrl must be an HTTP origin with no path, credentials, query, or fragment.'
+    }
+
+    $isLoopback = [bool]$uri.IsLoopback
+    if ($isLoopback) {
+        if ($uri.Port -ne 38643) {
+            throw 'The local guarded gateway workflow supports only loopback port 38643.'
+        }
+        $rootUrl = 'http://127.0.0.1:38643'
+    } else {
+        $rootUrl = $uri.GetLeftPart([UriPartial]::Authority).TrimEnd('/')
+    }
+
+    return [pscustomobject]@{
+        RootUrl = $rootUrl
+        HealthUri = "$rootUrl/health"
+        ModelsUri = "$rootUrl/v1/models"
+        BaseUrl = "$rootUrl/v1"
+        IsRemote = (-not $isLoopback)
+    }
+}
+
+function Test-CodexDevinRemoteGatewayHealth {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][AllowNull()][object]$Health)
+
+    if ($null -eq $Health) { return $false }
+    $statusProperty = $Health.PSObject.Properties['status']
+    $collapseProperty = $Health.PSObject.Properties['collapse_system_enabled']
+    if ($null -eq $statusProperty -or $null -eq $collapseProperty) { return $false }
+    if ([string]$statusProperty.Value -cne 'ok') { return $false }
+    return ($collapseProperty.Value -is [bool] -and [bool]$collapseProperty.Value)
+}
+
+function Get-CodexDevinFallbackTokenState {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][AllowNull()][object]$Health)
+
+    if ($null -eq $Health) { return 'unknown' }
+    $property = $Health.PSObject.Properties['fallback_token']
+    if ($null -eq $property) { return 'unknown' }
+    if ([string]$property.Value -ceq 'set') { return 'set' }
+    if ([string]$property.Value -ceq 'not_set') { return 'not_set' }
+    return 'unknown'
+}
+
+function Test-CodexDevinSshTarget {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][AllowNull()][AllowEmptyString()][string]$SshTarget)
+
+    if ([string]::IsNullOrWhiteSpace($SshTarget)) { return $false }
+    return ($SshTarget -cmatch '^(?:[A-Za-z0-9._-]+@)?[A-Za-z0-9][A-Za-z0-9.-]*$')
+}
+
+function ConvertTo-CodexDevinRemoteShellPath {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Path)
+
+    if ($Path -notmatch '^/[^\x00\r\n]*$' -or $Path -ceq '/') {
+        throw 'RemoteGatewayDirectory must be an absolute POSIX directory path without line breaks.'
+    }
+    $singleQuote = [string][char]39
+    $doubleQuote = [string][char]34
+    $escape = $singleQuote + $doubleQuote + $singleQuote + $doubleQuote + $singleQuote
+    return $singleQuote + $Path.Replace($singleQuote, $escape) + $singleQuote
+}
+
+function New-CodexDevinRemoteComposeCommand {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][ValidateSet('Login', 'Restart')][string]$Action,
+        [Parameter(Mandatory)][string]$RemoteGatewayDirectory
+    )
+
+    $quotedDirectory = ConvertTo-CodexDevinRemoteShellPath -Path $RemoteGatewayDirectory
+    if ($Action -ceq 'Login') { return "cd $quotedDirectory && docker compose run --rm devin-login" }
+    return "cd $quotedDirectory && docker compose up -d --force-recreate devin-gateway"
+}
+
+function Invoke-CodexDevinRemoteAuthentication {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][AllowNull()][object]$InitialHealth,
+        [Parameter(Mandatory)][scriptblock]$HealthProbe,
+        [Parameter(Mandatory)][scriptblock]$InteractiveLogin,
+        [Parameter(Mandatory)][scriptblock]$RestartGateway,
+        [string]$SshTarget,
+        [string]$RemoteGatewayDirectory,
+        [ValidateRange(1, 120)][int]$MaxHealthChecks = 36,
+        [ValidateRange(0, 60)][int]$PollIntervalSeconds = 5
+    )
+
+    if (-not (Test-CodexDevinRemoteGatewayHealth -Health $InitialHealth)) {
+        throw 'Remote gateway health is not ready; authentication setup was not started.'
+    }
+
+    $state = Get-CodexDevinFallbackTokenState -Health $InitialHealth
+    if ($state -ceq 'set') {
+        return [pscustomobject]@{ FallbackToken = 'set'; LoginPerformed = $false; GatewayRecreated = $false }
+    }
+    if ($state -cne 'not_set') {
+        throw 'Remote /health did not provide a recognized fallback_token state; refusing to switch Codex configuration.'
+    }
+    if ([string]::IsNullOrWhiteSpace($SshTarget) -or -not (Test-CodexDevinSshTarget -SshTarget $SshTarget)) {
+        throw 'A valid RemoteSshTarget is required when devhub reports fallback_token=not_set.'
+    }
+    if ([string]::IsNullOrWhiteSpace($RemoteGatewayDirectory)) {
+        throw 'RemoteGatewayDirectory is required when devhub reports fallback_token=not_set.'
+    }
+    $null = ConvertTo-CodexDevinRemoteShellPath -Path $RemoteGatewayDirectory
+
+    if (-not (& $InteractiveLogin $SshTarget $RemoteGatewayDirectory)) {
+        throw 'Interactive devhub Devin login failed; the gateway was not restarted and Codex configuration was not switched.'
+    }
+    if (-not (& $RestartGateway $SshTarget $RemoteGatewayDirectory)) {
+        throw 'The devhub gateway restart failed after login; Codex configuration was not switched.'
+    }
+
+    for ($attempt = 0; $attempt -lt $MaxHealthChecks; $attempt++) {
+        if ($attempt -gt 0 -and $PollIntervalSeconds -gt 0) { Start-Sleep -Seconds $PollIntervalSeconds }
+        $health = $null
+        try { $health = & $HealthProbe } catch { }
+        if (-not (Test-CodexDevinRemoteGatewayHealth -Health $health)) { continue }
+        if ((Get-CodexDevinFallbackTokenState -Health $health) -ceq 'set') {
+            return [pscustomobject]@{ FallbackToken = 'set'; LoginPerformed = $true; GatewayRecreated = $true }
+        }
+    }
+
+    throw 'Devhub login/restart finished, but bounded /health checks did not confirm fallback_token=set; Codex configuration was not switched.'
+}
+
+function Invoke-CodexDevinGatewayPreflight {
+    [CmdletBinding()]
+    param(
+        [string]$GatewayUrl = 'http://127.0.0.1:38643',
+        [Parameter(Mandatory)][scriptblock]$RemoteHealthProbe,
+        [Parameter(Mandatory)][scriptblock]$LocalGatewayStartup
+    )
+
+    $target = Resolve-CodexDevinGatewayTarget -GatewayUrl $GatewayUrl
+    if ($target.IsRemote) {
+        $health = $null
+        try { $health = & $RemoteHealthProbe $target.HealthUri } catch { }
+        if (-not (Test-CodexDevinRemoteGatewayHealth -Health $health)) {
+            throw 'Remote gateway /health preflight failed; status=ok and collapse_system_enabled=true are required. Codex config was not switched and localhost was not started.'
+        }
+        return [pscustomobject]@{ Target = $target; LocalStartup = $null; RemoteHealth = $health }
+    }
+
+    $localStartup = & $LocalGatewayStartup $target
+    return [pscustomobject]@{ Target = $target; LocalStartup = $localStartup; RemoteHealth = $null }
+}
+
 function Test-CodexDevinLoopbackPortFree {
     [CmdletBinding()]
     param([Parameter(Mandatory)][ValidateRange(1, 65535)][int]$Port)
@@ -188,4 +356,4 @@ function Get-CodexDevinGatewayStartupFailureMessage {
     }
 }
 
-Export-ModuleMember -Function Get-CodexDevinCollapsePortListeners, Test-CodexDevinGatewayPortAvailable, Test-CodexDevinLoopbackPortFree, Resolve-CodexDevinGatewayRoot, Get-CodexDevinGatewayFingerprint, Test-CodexDevinGatewayFingerprint, Test-CodexDevinCollapseGatewayReady, Test-CodexDevinCollapseRestoreSafe, Get-CodexDevinCollapseDesktopWaitAction, Get-CodexDevinGatewayStartupFailureMessage
+Export-ModuleMember -Function Get-CodexDevinCollapsePortListeners, Test-CodexDevinGatewayPortAvailable, Resolve-CodexDevinGatewayTarget, Test-CodexDevinRemoteGatewayHealth, Get-CodexDevinFallbackTokenState, Test-CodexDevinSshTarget, ConvertTo-CodexDevinRemoteShellPath, New-CodexDevinRemoteComposeCommand, Invoke-CodexDevinRemoteAuthentication, Invoke-CodexDevinGatewayPreflight, Test-CodexDevinLoopbackPortFree, Resolve-CodexDevinGatewayRoot, Get-CodexDevinGatewayFingerprint, Test-CodexDevinGatewayFingerprint, Test-CodexDevinCollapseGatewayReady, Test-CodexDevinCollapseRestoreSafe, Get-CodexDevinCollapseDesktopWaitAction, Get-CodexDevinGatewayStartupFailureMessage

@@ -2,8 +2,9 @@
  * Shared config: token file path + read/write helpers.
  *
  * The token file lives at `$DEVIN_GATEWAY_CONFIG_DIR/token` (default
- * `~/.devin-gateway/token`). The CLI login bin writes here; the server no
- * longer reads it — clients pass their own token per request.
+ * `~/.devin-gateway/token`). The CLI login bin writes here. The gateway can
+ * load this saved credential as its in-memory fallback at startup; request
+ * credentials still take precedence.
  */
 
 import { homedir } from "node:os";
@@ -19,6 +20,11 @@ export async function readToken(): Promise<string> {
   } catch {
     return "";
   }
+}
+
+/** Use an explicitly configured fallback before the saved login token. */
+export async function readFallbackToken(): Promise<string> {
+  return process.env.DEVIN_API_KEY || await readToken();
 }
 
 export async function writeToken(token: string): Promise<void> {

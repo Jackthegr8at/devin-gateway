@@ -12,6 +12,7 @@
  */
 
 import { startServer } from "./server.js";
+import { readFallbackToken } from "./config.js";
 
 export * from "./proto.js";
 export * from "./models.js";
@@ -22,5 +23,6 @@ export * from "./client.js";
 export { startServer, type ServerOptions, type ServerHandle } from "./server.js";
 
 if (import.meta.main) {
-  await startServer();
+  const token = await readFallbackToken();
+  await startServer(token ? { token } : {});
 }

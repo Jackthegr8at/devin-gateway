@@ -39,9 +39,125 @@ try {
 }
 Assert-CollapseGuard 'a released loopback port passes the actual bind probe' (Test-CodexDevinLoopbackPortFree -Port $boundPort) $true
 
-$healthEnabled = [pscustomobject]@{ status = 'ok'; fallback_token = 'not_set'; collapse_system_enabled = $true }
+$healthEnabled = [pscustomobject]@{ status = 'ok'; fallback_token = 'set'; collapse_system_enabled = $true }
+$healthNotAuthenticated = [pscustomobject]@{ status = 'ok'; fallback_token = 'not_set'; collapse_system_enabled = $true }
 $healthDisabled = [pscustomobject]@{ status = 'ok'; fallback_token = 'not_set'; collapse_system_enabled = $false }
 $models = @('glm-5-3-flash-low', 'swe-2-medium')
+
+$script:localGatewayStartupCalls = 0
+$script:remoteHealthProbeCalls = 0
+$defaultRoute = Invoke-CodexDevinGatewayPreflight `
+    -RemoteHealthProbe { param($uri) $script:remoteHealthProbeCalls = $script:remoteHealthProbeCalls + 1; return $healthEnabled } `
+    -LocalGatewayStartup { param($target) $script:localGatewayStartupCalls = $script:localGatewayStartupCalls + 1; return [pscustomobject]@{ BaseUrl = $target.BaseUrl } }
+Assert-CollapseGuard 'omitting GatewayUrl keeps the localhost provider URL' ($defaultRoute.Target.BaseUrl -ceq 'http://127.0.0.1:38643/v1') $true
+Assert-CollapseGuard 'omitting GatewayUrl invokes the existing local startup path only' ($script:localGatewayStartupCalls -eq 1 -and $script:remoteHealthProbeCalls -eq 0) $true
+
+$script:localGatewayStartupCalls = 0
+$script:remoteHealthProbeCalls = 0
+$script:remoteHealthProbeUri = $null
+$remoteRoute = Invoke-CodexDevinGatewayPreflight `
+    -GatewayUrl 'http://192.0.2.10:38643' `
+    -RemoteHealthProbe { param($uri) $script:remoteHealthProbeCalls = $script:remoteHealthProbeCalls + 1; $script:remoteHealthProbeUri = $uri; return $healthEnabled } `
+    -LocalGatewayStartup { param($target) $script:localGatewayStartupCalls = $script:localGatewayStartupCalls + 1; return [pscustomobject]@{ BaseUrl = $target.BaseUrl } }
+Assert-CollapseGuard 'healthy remote target writes its /v1 provider base URL' ($remoteRoute.Target.BaseUrl -ceq 'http://192.0.2.10:38643/v1') $true
+Assert-CollapseGuard 'healthy remote target probes its own /health endpoint' ($script:remoteHealthProbeUri -ceq 'http://192.0.2.10:38643/health' -and $script:remoteHealthProbeCalls -eq 1) $true
+Assert-CollapseGuard 'healthy remote target bypasses local gateway startup' ($script:localGatewayStartupCalls -eq 0 -and $null -eq $remoteRoute.LocalStartup) $true
+Assert-CollapseGuard 'remote preflight preserves sanitized fallback-token state' ((Get-CodexDevinFallbackTokenState -Health $remoteRoute.RemoteHealth) -ceq 'set') $true
+Assert-CollapseGuard 'remote health requires the collapse flag' (Test-CodexDevinRemoteGatewayHealth -Health $healthEnabled) $true
+Assert-CollapseGuard 'remote health rejects a disabled collapse flag' (-not (Test-CodexDevinRemoteGatewayHealth -Health $healthDisabled)) $true
+Assert-CollapseGuard 'remote health rejects non-boolean truthy collapse values' (-not (Test-CodexDevinRemoteGatewayHealth -Health ([pscustomobject]@{ status = 'ok'; collapse_system_enabled = 'true' }))) $true
+Assert-CollapseGuard 'fallback-token state accepts only set or not_set' ((Get-CodexDevinFallbackTokenState -Health $healthEnabled) -ceq 'set' -and (Get-CodexDevinFallbackTokenState -Health $healthNotAuthenticated) -ceq 'not_set' -and (Get-CodexDevinFallbackTokenState -Health ([pscustomobject]@{ fallback_token = 'configured' })) -ceq 'unknown') $true
+
+$script:remoteLoginCalls = 0
+$script:remoteRestartCalls = 0
+$script:remotePostLoginHealthCalls = 0
+$alreadyAuthenticated = Invoke-CodexDevinRemoteAuthentication `
+    -InitialHealth $healthEnabled `
+    -HealthProbe { $script:remotePostLoginHealthCalls++; return $healthEnabled } `
+    -InteractiveLogin { $script:remoteLoginCalls++; return $false } `
+    -RestartGateway { $script:remoteRestartCalls++; return $false } `
+    -SshTarget $null `
+    -RemoteGatewayDirectory $null
+Assert-CollapseGuard 'remote fallback_token=set skips OAuth, restart, and follow-up polling' ($alreadyAuthenticated.FallbackToken -ceq 'set' -and -not $alreadyAuthenticated.LoginPerformed -and -not $alreadyAuthenticated.GatewayRecreated -and $script:remoteLoginCalls -eq 0 -and $script:remoteRestartCalls -eq 0 -and $script:remotePostLoginHealthCalls -eq 0) $true
+
+$script:remoteAuthEvents = @()
+$script:remoteAuthHealthCalls = 0
+$authenticatedAfterLogin = Invoke-CodexDevinRemoteAuthentication `
+    -InitialHealth $healthNotAuthenticated `
+    -HealthProbe { $script:remoteAuthHealthCalls++; return $healthEnabled } `
+    -InteractiveLogin { param($target, $directory) $script:remoteAuthEvents += "login:$($target):$($directory)"; return $true } `
+    -RestartGateway { param($target, $directory) $script:remoteAuthEvents += "restart:$($target):$($directory)"; return $true } `
+    -SshTarget 'gateway-user@192.0.2.10' `
+    -RemoteGatewayDirectory '/srv/example/services/devin-gateway' `
+    -MaxHealthChecks 2 `
+    -PollIntervalSeconds 0
+Assert-CollapseGuard 'remote fallback_token=not_set performs interactive login, recreates gateway, and confirms health' ($authenticatedAfterLogin.LoginPerformed -and $authenticatedAfterLogin.GatewayRecreated -and $authenticatedAfterLogin.FallbackToken -ceq 'set' -and $script:remoteAuthHealthCalls -eq 1 -and $script:remoteAuthEvents.Count -eq 2 -and $script:remoteAuthEvents[0] -like 'login:*' -and $script:remoteAuthEvents[1] -like 'restart:*') $true
+
+$script:remoteRestartCalls = 0
+$loginFailureStopped = $false
+try {
+    $null = Invoke-CodexDevinRemoteAuthentication `
+        -InitialHealth $healthNotAuthenticated `
+        -HealthProbe { $healthEnabled } `
+        -InteractiveLogin { $false } `
+        -RestartGateway { $script:remoteRestartCalls++; return $true } `
+        -SshTarget 'gateway-user@192.0.2.10' `
+        -RemoteGatewayDirectory '/srv/example/services/devin-gateway' `
+        -PollIntervalSeconds 0
+} catch { $loginFailureStopped = $_.Exception.Message -like '*login failed*' }
+Assert-CollapseGuard 'failed interactive login stops before gateway recreation' ($loginFailureStopped -and $script:remoteRestartCalls -eq 0) $true
+
+$tokenNotSetStopped = $false
+try {
+    $null = Invoke-CodexDevinRemoteAuthentication `
+        -InitialHealth $healthNotAuthenticated `
+        -HealthProbe { $healthNotAuthenticated } `
+        -InteractiveLogin { $true } `
+        -RestartGateway { $true } `
+        -SshTarget 'gateway-user@192.0.2.10' `
+        -RemoteGatewayDirectory '/srv/example/services/devin-gateway' `
+        -MaxHealthChecks 2 `
+        -PollIntervalSeconds 0
+} catch { $tokenNotSetStopped = $_.Exception.Message -like '*fallback_token=set*' }
+Assert-CollapseGuard 'fallback_token=not_set after restart fails closed' $tokenNotSetStopped $true
+
+Assert-CollapseGuard 'SSH target rejects option injection' (-not (Test-CodexDevinSshTarget -SshTarget '-oProxyCommand=bad')) $true
+Assert-CollapseGuard 'interactive SSH command runs the existing paste login service' ((New-CodexDevinRemoteComposeCommand -Action Login -RemoteGatewayDirectory '/srv/example/services/devin-gateway') -ceq "cd '/srv/example/services/devin-gateway' && docker compose run --rm devin-login") $true
+Assert-CollapseGuard 'restart SSH command recreates only the gateway service' ((New-CodexDevinRemoteComposeCommand -Action Restart -RemoteGatewayDirectory '/srv/example/services/devin-gateway') -ceq "cd '/srv/example/services/devin-gateway' && docker compose up -d --force-recreate devin-gateway") $true
+Assert-CollapseGuard 'remote path quoting preserves spaces' ((ConvertTo-CodexDevinRemoteShellPath -Path '/srv/example space/gateway') -ceq "'/srv/example space/gateway'") $true
+Assert-CollapseGuard 'remote path quoting safely escapes embedded quotes' ((ConvertTo-CodexDevinRemoteShellPath -Path "/srv/example/o'connor") -ceq "'/srv/example/o'`"'`"'connor'") $true
+
+$script:localGatewayStartupCalls = 0
+$script:remoteHealthProbeCalls = 0
+$remoteFailedClosed = $false
+try {
+    $null = Invoke-CodexDevinGatewayPreflight `
+        -GatewayUrl 'http://192.0.2.10:38643' `
+        -RemoteHealthProbe { param($uri) $script:remoteHealthProbeCalls = $script:remoteHealthProbeCalls + 1; return $healthDisabled } `
+        -LocalGatewayStartup { param($target) $script:localGatewayStartupCalls = $script:localGatewayStartupCalls + 1; return $null }
+} catch {
+    $remoteFailedClosed = $_.Exception.Message -like '*localhost was not started*'
+}
+Assert-CollapseGuard 'unhealthy remote target fails closed' $remoteFailedClosed $true
+Assert-CollapseGuard 'unhealthy remote target never falls back to localhost' ($script:remoteHealthProbeCalls -eq 1 -and $script:localGatewayStartupCalls -eq 0) $true
+
+$script:localGatewayStartupCalls = 0
+$requestFailureClosed = $false
+try {
+    $null = Invoke-CodexDevinGatewayPreflight `
+        -GatewayUrl 'http://192.0.2.10:38643' `
+        -RemoteHealthProbe { throw 'synthetic timeout' } `
+        -LocalGatewayStartup { param($target) $script:localGatewayStartupCalls = $script:localGatewayStartupCalls + 1; return $null }
+} catch {
+    $requestFailureClosed = $_.Exception.Message -like '*localhost was not started*'
+}
+Assert-CollapseGuard 'remote health request errors fail closed without local startup' ($requestFailureClosed -and $script:localGatewayStartupCalls -eq 0) $true
+
+$remoteTarget = Resolve-CodexDevinGatewayTarget -GatewayUrl 'http://192.0.2.10:38643/'
+Assert-CollapseGuard 'remote target accepts only an origin and canonicalizes its provider URL' ($remoteTarget.IsRemote -and $remoteTarget.BaseUrl -ceq 'http://192.0.2.10:38643/v1') $true
+$invalidRemoteRejected = $false
+try { $null = Resolve-CodexDevinGatewayTarget -GatewayUrl 'http://user@192.0.2.10:38643' } catch { $invalidRemoteRejected = $true }
+Assert-CollapseGuard 'gateway target rejects embedded URL credentials' $invalidRemoteRejected $true
 
 Assert-CollapseGuard 'ready check requires collapse flag and both models' (Test-CodexDevinCollapseGatewayReady -Health $healthEnabled -ModelIds $models) $true
 Assert-CollapseGuard 'ready check waits safely when health has not started responding' (-not (Test-CodexDevinCollapseGatewayReady -Health $null -ModelIds @())) $true

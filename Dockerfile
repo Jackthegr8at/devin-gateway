@@ -18,11 +18,14 @@ RUN chmod +x /docker-entrypoint.sh
 
 # Create the unprivileged user and a logs dir owned by it (used when no
 # bind mount overlays /app/logs).
-RUN adduser -D -h /app gateway && mkdir -p /app/logs /app/logs/errors && chown -R gateway:gateway /app/logs
+RUN adduser -D -h /app gateway \
+  && mkdir -p /app/logs /app/logs/errors /home/gateway/.devin-gateway \
+  && chown -R gateway:gateway /app/logs /home/gateway/.devin-gateway
 
 ENV PORT=3000
 ENV HOST=0.0.0.0
 ENV LOG_FILE=/app/logs/gateway.log
+ENV DEVIN_GATEWAY_CONFIG_DIR=/home/gateway/.devin-gateway
 EXPOSE 3000
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \

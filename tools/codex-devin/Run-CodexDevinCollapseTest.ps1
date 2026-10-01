@@ -1,5 +1,10 @@
 [CmdletBinding()]
-param([switch]$WorkerTest)
+param(
+    [switch]$WorkerTest,
+    [string]$GatewayUrl = 'http://127.0.0.1:38643',
+    [string]$RemoteSshTarget,
+    [string]$RemoteGatewayDirectory
+)
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
@@ -10,15 +15,15 @@ $codexHome = Get-CodexDevinHome
 $configPath = Join-Path $codexHome 'config.toml'
 $workerPath = Join-Path $codexHome 'agents\swe_worker.toml'
 $backupRoot = Join-Path $codexHome 'devin-desktop-switch-backups'
-$gatewayRoot = Resolve-CodexDevinGatewayRoot -ToolDirectory $PSScriptRoot
-$gatewayHealthUri = 'http://127.0.0.1:38643/health'
-$gatewayModelsUri = 'http://127.0.0.1:38643/v1/models'
+$gatewayTarget = Resolve-CodexDevinGatewayTarget -GatewayUrl $GatewayUrl
+$isRemoteGateway = [bool]$gatewayTarget.IsRemote
+$gatewayRoot = if ($isRemoteGateway) { $null } else { Resolve-CodexDevinGatewayRoot -ToolDirectory $PSScriptRoot }
 $gatewayLauncher = Join-Path $PSScriptRoot 'Start-DevinGateway.ps1'
 $enableScript = Join-Path $PSScriptRoot 'Enable-CodexDevin.ps1'
 $restoreScript = Join-Path $PSScriptRoot 'Restore-CodexOpenAI.ps1'
 $oauthHelperPath = Join-Path $PSScriptRoot 'DevinOAuthBridge.ts'
 $bunPath = Join-Path $env:USERPROFILE '.bun\bin\bun.exe'
-$diagnosticPath = Join-Path (Join-Path $gatewayRoot 'logs') ('responses-safe-diagnostic-' + [guid]::NewGuid().ToString('N') + '.jsonl')
+$diagnosticPath = if ($isRemoteGateway) { $null } else { Join-Path (Join-Path $gatewayRoot 'logs') ('responses-safe-diagnostic-' + [guid]::NewGuid().ToString('N') + '.jsonl') }
 $testName = if ($WorkerTest) { 'Worker test' } else { 'Collapse test' }
 $startupTimeout = [TimeSpan]::FromMinutes(10)
 $gatewayReadyTimeout = [TimeSpan]::FromMinutes(30)
@@ -76,6 +81,29 @@ function Get-CodexDevinCollapseJson([string]$Uri) {
     } catch {
         return $null
     }
+}
+
+function Invoke-CodexDevinRemoteSshCommand {
+    param(
+        [Parameter(Mandatory)][string]$SshTarget,
+        [Parameter(Mandatory)][string]$RemoteGatewayDirectory,
+        [Parameter(Mandatory)][ValidateSet('Login', 'Restart')][string]$Action
+    )
+
+    if (-not (Test-CodexDevinSshTarget -SshTarget $SshTarget)) {
+        throw 'RemoteSshTarget must be a safe SSH host or user@host value.'
+    }
+    $remoteCommand = New-CodexDevinRemoteComposeCommand -Action $Action -RemoteGatewayDirectory $RemoteGatewayDirectory
+
+    $ssh = Get-Command 'ssh.exe' -ErrorAction Stop
+    if ($Action -ceq 'Login') {
+        Write-Host "Starting interactive Devin login on devhub over SSH ($SshTarget). The OAuth URL and prompt will appear below."
+        & $ssh.Source -t $SshTarget $remoteCommand 2>&1 | Out-Host
+    } else {
+        Write-Host "Recreating only the devin-gateway Compose service on devhub over SSH ($SshTarget)."
+        & $ssh.Source -T $SshTarget $remoteCommand 2>&1 | Out-Host
+    }
+    return ($LASTEXITCODE -eq 0)
 }
 
 function Get-CodexDevinCollapseModelIds($Response) {
@@ -148,7 +176,11 @@ function Get-CodexDevinCollapseRunState([string]$Directory) {
 }
 
 function Wait-CodexDevinCollapseGatewayReady {
-    param([Diagnostics.Process]$LauncherProcess)
+    param(
+        [Parameter(Mandatory)][Diagnostics.Process]$LauncherProcess,
+        [Parameter(Mandatory)][string]$StartupStatusPath,
+        [Parameter(Mandatory)][object]$Target
+    )
 
     $deadline = [DateTime]::UtcNow.Add($gatewayReadyTimeout)
     $nextProgress = [DateTime]::UtcNow.AddSeconds(30)
@@ -156,15 +188,13 @@ function Wait-CodexDevinCollapseGatewayReady {
     while ([DateTime]::UtcNow -lt $deadline) {
         $LauncherProcess.Refresh()
         if ($LauncherProcess.HasExited) {
-            $startupFailure = if ($gatewayStartupStatusPath) {
-                Get-CodexDevinGatewayStartupFailureMessage -StatusPath $gatewayStartupStatusPath
-            } else { $null }
+            $startupFailure = Get-CodexDevinGatewayStartupFailureMessage -StatusPath $StartupStatusPath
             if ($startupFailure) { throw $startupFailure }
             throw 'The visible gateway/OAuth PowerShell window exited before the gateway became ready. Codex config was not switched.'
         }
 
-        $health = Get-CodexDevinCollapseJson -Uri $gatewayHealthUri
-        $models = Get-CodexDevinCollapseJson -Uri $gatewayModelsUri
+        $health = Get-CodexDevinCollapseJson -Uri $Target.HealthUri
+        $models = Get-CodexDevinCollapseJson -Uri $Target.ModelsUri
         $modelIds = @(Get-CodexDevinCollapseModelIds -Response $models)
         if ($null -ne $health -and (Test-CodexDevinCollapseGatewayReady -Health $health -ModelIds $modelIds)) {
             $listeners = @(Get-CodexDevinCollapseListeners)
@@ -248,10 +278,14 @@ function Invoke-CodexDevinCollapseAutomaticRestore {
 try {
     Write-Host '[1/7] Checking profile, required scripts, catalog, and existing recovery state...'
     Assert-CodexDevinProfile
-    foreach ($requiredPath in @($configPath, $gatewayLauncher, $enableScript, $restoreScript, $oauthHelperPath, $bunPath, (Join-Path $gatewayRoot 'src\server.ts'))) {
+    $requiredPaths = @($configPath, $enableScript, $restoreScript)
+    if (-not $isRemoteGateway) {
+        $requiredPaths += @($gatewayLauncher, $oauthHelperPath, $bunPath, (Join-Path $gatewayRoot 'src\server.ts'))
+    }
+    foreach ($requiredPath in $requiredPaths) {
         if (-not (Test-Path -LiteralPath $requiredPath -PathType Leaf)) { throw "Required file is missing: $requiredPath" }
     }
-    if (-not (Test-Path -LiteralPath (Join-Path $gatewayRoot 'node_modules') -PathType Container)) {
+    if (-not $isRemoteGateway -and -not (Test-Path -LiteralPath (Join-Path $gatewayRoot 'node_modules') -PathType Container)) {
         throw 'The clean-fork gateway dependencies are missing; this wrapper will not install or update them.'
     }
     Assert-CodexDevinCollapseNoUnresolvedRecovery
@@ -259,32 +293,65 @@ try {
     Write-Host '[2/7] Checking that Codex Desktop and app-server are closed...'
     Assert-CodexDevinStopped
 
-    Write-Host '[3/7] Checking port 38643 with bounded netstat and identifying any existing listener...'
-    $listeners = @(Get-CodexDevinCollapseListeners)
-    if (-not (Test-CodexDevinGatewayPortAvailable -Listeners $listeners)) {
-        throw 'Port 38643 is occupied. This wrapper never stops existing listeners; close the gateway from its own terminal, verify it is stopped, and retry.'
-    }
+    $gatewaySelection = Invoke-CodexDevinGatewayPreflight `
+        -GatewayUrl $GatewayUrl `
+        -RemoteHealthProbe {
+            param($healthUri)
+            Get-CodexDevinCollapseJson -Uri $healthUri
+        } `
+        -LocalGatewayStartup {
+            param($target)
 
-    Write-Host '[4/7] Starting the current gateway in a separate visible PowerShell window for fresh memory-only OAuth...'
-    $powerShellPath = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-    $gatewayStartupStatusPath = Join-Path ([IO.Path]::GetTempPath()) ('devin-gateway-startup-' + [guid]::NewGuid().ToString('N') + '.json')
-    $gatewayArguments = @(
-        '-NoLogo'
-        '-NoProfile'
-        '-ExecutionPolicy'
-        'Bypass'
-        '-File'
-        ('"' + $gatewayLauncher + '"')
-        '-CollapseCodexDesktopSystem'
-        '-StartupStatusPath'
-        ('"' + $gatewayStartupStatusPath + '"')
-        '-SafeDiagnosticPath'
-        ('"' + $diagnosticPath + '"')
-    )
-    $gatewayShell = Start-Process -FilePath $powerShellPath -ArgumentList $gatewayArguments -WorkingDirectory $PSScriptRoot -PassThru
-    Write-Host "Clean-fork gateway launcher window PID: $($gatewayShell.Id). Complete the fresh Devin sign-in in its browser flow; leave the window open."
-    Wait-CodexDevinCollapseGatewayReady -LauncherProcess $gatewayShell
-    Write-Host 'Gateway preflight: health=ok; collapse_system_enabled=true; required models=present; listener=127.0.0.1:38643.'
+            Write-Host '[3/7] Checking port 38643 with bounded netstat and identifying any existing listener...'
+            $listeners = @(Get-CodexDevinCollapseListeners)
+            if (-not (Test-CodexDevinGatewayPortAvailable -Listeners $listeners)) {
+                throw 'Port 38643 is occupied. This wrapper never stops existing listeners; close the gateway from its own terminal, verify it is stopped, and retry.'
+            }
+
+            Write-Host '[4/7] Starting the current gateway in a separate visible PowerShell window for fresh memory-only OAuth...'
+            $powerShellPath = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+            $startupStatusPath = Join-Path ([IO.Path]::GetTempPath()) ('devin-gateway-startup-' + [guid]::NewGuid().ToString('N') + '.json')
+            $gatewayArguments = @(
+                '-NoLogo'
+                '-NoProfile'
+                '-ExecutionPolicy'
+                'Bypass'
+                '-File'
+                ('"' + $gatewayLauncher + '"')
+                '-CollapseCodexDesktopSystem'
+                '-StartupStatusPath'
+                ('"' + $startupStatusPath + '"')
+                '-SafeDiagnosticPath'
+                ('"' + $diagnosticPath + '"')
+            )
+            $launcherProcess = Start-Process -FilePath $powerShellPath -ArgumentList $gatewayArguments -WorkingDirectory $PSScriptRoot -PassThru
+            Write-Host "Clean-fork gateway launcher window PID: $($launcherProcess.Id). Complete the fresh Devin sign-in in its browser flow; leave it open."
+            Wait-CodexDevinCollapseGatewayReady -LauncherProcess $launcherProcess -StartupStatusPath $startupStatusPath -Target $target
+            return [pscustomobject]@{ LauncherProcess = $launcherProcess; StartupStatusPath = $startupStatusPath }
+        }
+    $gatewayTarget = $gatewaySelection.Target
+    if ($isRemoteGateway) {
+        Write-Host "Remote gateway preflight passed: $($gatewayTarget.HealthUri) returned status=ok and collapse_system_enabled=true. Local gateway startup and port checks were skipped."
+        if ($WorkerTest) {
+            Write-Host 'Checking devhub fallback-token state before changing Codex configuration...'
+            $remoteAuthentication = Invoke-CodexDevinRemoteAuthentication `
+                -InitialHealth $gatewaySelection.RemoteHealth `
+                -HealthProbe { Get-CodexDevinCollapseJson -Uri $gatewayTarget.HealthUri } `
+                -InteractiveLogin { param($sshTarget, $directory) Invoke-CodexDevinRemoteSshCommand -SshTarget $sshTarget -RemoteGatewayDirectory $directory -Action Login } `
+                -RestartGateway { param($sshTarget, $directory) Invoke-CodexDevinRemoteSshCommand -SshTarget $sshTarget -RemoteGatewayDirectory $directory -Action Restart } `
+                -SshTarget $RemoteSshTarget `
+                -RemoteGatewayDirectory $RemoteGatewayDirectory
+            if ($remoteAuthentication.LoginPerformed) {
+                Write-Host 'Remote Devin login completed and devin-gateway was recreated; bounded health checks confirmed fallback_token=set.'
+            } else {
+                Write-Host 'Remote gateway already reports fallback_token=set; interactive login and gateway restart were skipped.'
+            }
+        }
+    } else {
+        $gatewayShell = $gatewaySelection.LocalStartup.LauncherProcess
+        $gatewayStartupStatusPath = $gatewaySelection.LocalStartup.StartupStatusPath
+        Write-Host 'Local gateway preflight: health=ok; collapse_system_enabled=true; required models=present; listener=127.0.0.1:38643.'
+    }
 
     Write-Host '[5/7] Capturing the immediate pre-switch config and worker baseline...'
     if ((Get-Item -LiteralPath $configPath -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) {
@@ -311,7 +378,7 @@ try {
     try {
         [Console]::SetError($enableErrorWriter)
         try {
-            & $enableScript -GatewayBaseUrl 'http://127.0.0.1:38643/v1'
+            & $enableScript -GatewayBaseUrl $gatewayTarget.BaseUrl
         } catch {
             $enableException = $_.Exception
         }
@@ -338,6 +405,15 @@ try {
     if ($enableErrorText) { [Console]::Error.Write($enableErrorText) }
     $newRunDirectory = Get-CodexDevinCollapseNewRun -ExistingDirectories $existingDirectories
     if ([string]::IsNullOrWhiteSpace($newRunDirectory)) { throw 'Enable returned without creating a fresh recovery record.' }
+    if ($isRemoteGateway) {
+        $remoteHealth = Get-CodexDevinCollapseJson -Uri $gatewayTarget.HealthUri
+        if (-not (Test-CodexDevinRemoteGatewayHealth -Health $remoteHealth)) {
+            throw 'Remote gateway health no longer reports status=ok and collapse_system_enabled=true after the guarded config switch; automatic restore will run.'
+        }
+        if ($WorkerTest -and (Get-CodexDevinFallbackTokenState -Health $remoteHealth) -cne 'set') {
+            throw 'Remote gateway no longer reports fallback_token=set after the guarded config switch; automatic restore will run.'
+        }
+    }
     $runState = Get-CodexDevinCollapseRunState -Directory $newRunDirectory
     if ($null -eq $runState -or $runState.status -cne 'Enabled') { throw 'Enable did not finish in the expected Enabled state.' }
     if ($runState.configOriginalSha256 -cne $preTestConfigSha256) { throw 'The enable script backup hash differs from the immediate pre-test config snapshot.' }
@@ -476,7 +552,11 @@ Then fully close Codex Desktop.
     }
 
     if ($newRunDirectory -and ($restoreVerified -or $restoreFailure)) {
-        Write-Host "Safe gateway diagnostic: $diagnosticPath"
+        if ($isRemoteGateway) {
+            Write-Host "Remote gateway: $($gatewayTarget.RootUrl). This wrapper does not read or expose remote diagnostic files."
+        } elseif ($diagnosticPath) {
+            Write-Host "Safe gateway diagnostic: $diagnosticPath"
+        }
         if ($gatewayShell -and -not $gatewayShell.HasExited) {
             Write-Host 'The separately authenticated gateway remains in its visible window. Press Ctrl+C there when finished.'
         }

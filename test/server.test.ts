@@ -353,7 +353,7 @@ describe("/health", () => {
     }
   });
 
-  test("returns configured when a fallback token is set", async () => {
+  test("returns set when a fallback token is configured", async () => {
     const upstream = startUpstream();
     const { url, cleanup } = await startGateway(upstream.url.origin, "fallback-key");
     try {
@@ -362,7 +362,7 @@ describe("/health", () => {
       const body = await res.json();
       expect(body).toEqual({
         status: "ok",
-        fallback_token: "configured",
+        fallback_token: "set",
         collapse_system_enabled: process.env.DEVIN_CODEX_DESKTOP_COLLAPSE_SYSTEM === "1",
       });
     } finally {

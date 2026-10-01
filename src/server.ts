@@ -8,10 +8,9 @@
  *   GET  /v1/models             — OpenAI-style model list
  *   GET  /health                — health check
  *
- * The server holds no token state. Each request must carry its own
- * credentials via `Authorization: Bearer <token>` or `x-api-key: <token>`.
- * `DEVIN_API_KEY` (or `ServerOptions.token`) is an optional fallback used
- * only when a request omits both headers.
+ * The server holds an optional fallback token in memory. Request credentials
+ * via `Authorization: Bearer <token>` or `x-api-key: <token>` take precedence.
+ * The fallback can be supplied through `DEVIN_API_KEY` or `ServerOptions.token`.
  */
 
 import { streamChat, discoverModels, type ChatStreamEvent } from "./devin.js";
@@ -51,7 +50,7 @@ import {
 
 let PORT = 3000;
 let HOST = "0.0.0.0";
-/** Optional fallback token (from DEVIN_API_KEY or ServerOptions.token) when a request carries no credentials. */
+/** Optional in-memory fallback token when a request carries no credentials. */
 let DEFAULT_DEVIN_KEY = "";
 /** Base URL override for the Devin API (default: https://server.codeium.com). */
 let DEVIN_BASE_URL = "";
@@ -1208,7 +1207,7 @@ export interface ServerOptions {
   port?: number;
   /** Listening address (default: `HOST` env or `0.0.0.0`). */
   host?: string;
-  /** Optional fallback token when a request carries no credentials (default: `DEVIN_API_KEY` env). */
+  /** Optional in-memory fallback token when a request carries no credentials. */
   token?: string;
   /** Override for the Devin API base URL (default: `DEVIN_BASE_URL` env). */
   baseUrl?: string;
@@ -1223,9 +1222,9 @@ export interface ServerHandle {
 
 /**
  * Start the HTTP gateway. Reads `PORT`/`HOST`/`DEVIN_API_KEY`/`DEVIN_BASE_URL`
- * from the environment when the equivalent option is omitted. The server holds
- * no token state; `DEVIN_API_KEY` is only a fallback for requests that omit
- * `Authorization`/`x-api-key` headers.
+ * from the environment when the equivalent option is omitted. The executable
+ * also passes a saved login token through `ServerOptions.token`; a fallback
+ * is used only when a request omits `Authorization`/`x-api-key` headers.
  */
 export async function startServer(options: ServerOptions = {}): Promise<ServerHandle> {
   PORT = options.port ?? Number(process.env.PORT ?? 3000);
@@ -1290,7 +1289,7 @@ export async function startServer(options: ServerOptions = {}): Promise<ServerHa
           if (path === "/health" && method === "GET") {
             return jsonResponse(req, {
               status: "ok",
-              fallback_token: DEFAULT_DEVIN_KEY ? "configured" : "not_set",
+              fallback_token: DEFAULT_DEVIN_KEY ? "set" : "not_set",
               collapse_system_enabled: process.env.DEVIN_CODEX_DESKTOP_COLLAPSE_SYSTEM === "1",
             });
           } else if (path === "/v1/models" && method === "GET") {
@@ -1374,7 +1373,7 @@ export async function startServer(options: ServerOptions = {}): Promise<ServerHa
   console.log(`  Anthropic: POST /v1/messages`);
   console.log(`  Health:    GET  /health`);
   console.log(DEFAULT_DEVIN_KEY
-    ? "  Fallback:  DEVIN_API_KEY configured (used when a request sends no credentials)"
+    ? "  Fallback:  configured (used when a request sends no credentials)"
     : "  Fallback:  none — each request must send Authorization / x-api-key");
   if (log.debugMode) {
     console.log(`  Debug:     ON — verbose logs tee'd to ${log.filePath}`);

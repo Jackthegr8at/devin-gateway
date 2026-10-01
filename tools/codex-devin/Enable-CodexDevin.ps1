@@ -17,20 +17,20 @@ $statePath = $null
 
 $gatewayUri = $null
 if (-not [Uri]::TryCreate($GatewayBaseUrl, [UriKind]::Absolute, [ref]$gatewayUri)) {
-    throw 'GatewayBaseUrl must be an absolute loopback URL such as http://127.0.0.1:38721/v1.'
+    throw 'GatewayBaseUrl must be an absolute HTTP gateway URL ending in /v1.'
 }
 if (
     $gatewayUri.Scheme -cne 'http' -or
-    $gatewayUri.Host -cne '127.0.0.1' -or
     $gatewayUri.AbsolutePath -cne '/v1' -or
     $gatewayUri.UserInfo -or
     $gatewayUri.Query -or
     $gatewayUri.Fragment
 ) {
-    throw 'GatewayBaseUrl must use only http://127.0.0.1:<port>/v1 with no credentials, query, or fragment.'
+    throw 'GatewayBaseUrl must use http://<gateway-host>:<port>/v1 with no credentials, query, or fragment.'
 }
-$gatewayBaseUrl = "http://127.0.0.1:$($gatewayUri.Port)/v1"
-$gatewayHealthUri = "http://127.0.0.1:$($gatewayUri.Port)/health"
+$gatewayAuthority = $gatewayUri.GetLeftPart([UriPartial]::Authority).TrimEnd('/')
+$gatewayBaseUrl = "$gatewayAuthority/v1"
+$gatewayHealthUri = "$gatewayAuthority/health"
 
 function Save-SwitchState($State) {
     $json = ConvertTo-Json -InputObject $State -Depth 8

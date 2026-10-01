@@ -12,6 +12,7 @@
  *   devin-gateway login              # interactive — opens browser
  *   devin-gateway login --paste      # paste redirect URL manually
  *   devin-gateway login --print      # print token only, don't save
+ *   devin-gateway login --no-display-token # save token without printing it
  *   devin-gateway login --status     # show current saved token status
  *
  * Also runnable directly:
@@ -31,6 +32,7 @@ const TIMEOUT_MS = 5 * 60 * 1000;
 export async function runLogin(argv: string[]): Promise<void> {
   const pasteMode = argv.includes("--paste");
   const printOnly = argv.includes("--print");
+  const hideToken = argv.includes("--no-display-token");
   const statusMode = argv.includes("--status");
 
   // ─── Status ──────────────────────────────────────────────────────────────────
@@ -75,7 +77,7 @@ export async function runLogin(argv: string[]): Promise<void> {
 
     try {
       const token = await completeLoginWithUrl(session, input.trim());
-      await finishLogin(token, printOnly);
+      await finishLogin(token, printOnly, hideToken);
     } catch (err) {
       console.error(`Login failed: ${String((err as Error).message ?? err)}`);
       process.exit(1);
@@ -112,7 +114,7 @@ export async function runLogin(argv: string[]): Promise<void> {
 
     try {
       const t = await token;
-      await finishLogin(t, printOnly);
+      await finishLogin(t, printOnly, hideToken);
     } catch (err) {
       console.error(`Login failed: ${String((err as Error).message ?? err)}`);
       process.exit(1);
@@ -122,22 +124,25 @@ export async function runLogin(argv: string[]): Promise<void> {
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
-async function finishLogin(token: string, printOnly: boolean): Promise<void> {
-  if (printOnly) {
-    console.log(token);
-    return;
+export function getLoginCompletionLines(token: string, printOnly: boolean, hideToken: boolean): string[] {
+  if (printOnly) return hideToken ? [] : [token];
+
+  const lines = [
+    "  ✅ Login successful!",
+    "",
+    `  Token saved to: ${TOKEN_FILE}`,
+    "",
+  ];
+  if (!hideToken) {
+    lines.push("  Token (copy to your client's API key field):", `  ${token}`, "");
   }
-  await writeToken(token);
-  console.log("  ✅ Login successful!");
-  console.log("");
-  console.log(`  Token saved to: ${TOKEN_FILE}`);
-  console.log("");
-  console.log("  Token (copy to your client's API key field):");
-  console.log(`  ${token}`);
-  console.log("");
-  console.log("  Start the gateway and point your client at it:");
-  console.log("    bun run src/index.ts");
-  console.log("");
+  lines.push("  Start the gateway and point your client at it:", "    bun run src/index.ts", "");
+  return lines;
+}
+
+async function finishLogin(token: string, printOnly: boolean, hideToken: boolean): Promise<void> {
+  if (!printOnly) await writeToken(token);
+  for (const line of getLoginCompletionLines(token, printOnly, hideToken)) console.log(line);
 }
 
 function startCallbackServer(session: {

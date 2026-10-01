@@ -42,7 +42,7 @@ bun run login -- --print  # Print the token without saving it
 bun run start
 ```
 
-The gateway listens on `http://localhost:3000` by default. It holds no token state — each request must carry credentials via `Authorization: Bearer <token>` (OpenAI clients) or `x-api-key: <token>` (Anthropic clients). Set `DEVIN_API_KEY` only if you want a fallback for requests that omit both headers.
+The gateway listens on `http://localhost:3000` by default. Requests may carry credentials via `Authorization: Bearer <token>` (OpenAI clients) or `x-api-key: <token>` (Anthropic clients). A fallback can also be loaded at startup from `DEVIN_API_KEY` or the saved login token; per-request credentials continue to take precedence.
 
 ### Codex Desktop (Responses API)
 
@@ -70,12 +70,11 @@ name = "Devin Gateway"
 base_url = "http://127.0.0.1:38643/v1"
 wire_api = "responses"
 requires_openai_auth = false
-env_key = "DEVIN_API_KEY"
 request_max_retries = 0
 stream_max_retries = 0
 ```
 
-Make `DEVIN_API_KEY` available to the Codex Desktop process through your normal environment/secret-management workflow. The gateway accepts that credential per request; its optional server-side `DEVIN_API_KEY` fallback is separate. The upstream `bun run login` helper stores a token in `~/.devin-gateway/token`. The gateway runtime does not import credentials from the POC. For guarded manual Desktop tests, the separate helper under `tools/codex-devin` uses lower-level OAuth primitives and passes its credential to the gateway in memory without writing token files.
+For the devhub Docker workflow below, Codex Desktop does not manage a Devin credential and the provider has no `env_key`: the gateway uses its server-side fallback loaded from the Docker auth volume. The ordinary CLI login remains available for standalone setups. No POC credential helper is used by the gateway runtime.
 
 `model_catalog_json` is local Codex picker metadata, not a Devin entitlement check or a live model catalog. The tested Desktop setup used a static catalog containing the exact Devin model IDs and reasoning metadata. A custom catalog may replace Codex's built-in catalog for that configuration, so include every model needed in that Codex environment. See the [Codex config reference](https://developers.openai.com/codex/config-reference/) for provider and catalog settings.
 
@@ -130,9 +129,16 @@ The container runs the existing Alpine/Bun image entrypoint, which starts Bun as
 
 #### Authentication and secret handling
 
-The gateway is stateless: Codex must send a Devin credential on each API request using `Authorization: Bearer …` (or `x-api-key`). This Compose configuration deliberately does not set the server-side `DEVIN_API_KEY` fallback and does not mount a token file. Do not run the persistent `bun run login` flow on the host for this deployment; that CLI flow writes a token file, while the HTTP server does not need a saved login.
+Devin authentication is owned by the gateway on devhub. Both Compose services mount the named volume `devin-gateway-auth` at `/home/gateway/.devin-gateway`; the existing login CLI writes its token there, and the gateway reads it once at startup into the existing in-memory fallback-token path. The token is not included in the image, repository, `.env`, Compose values, or logs. The Docker login service uses `--no-display-token` so successful login output never prints the credential.
 
-Keep the Devin token on the Windows client in Windows Credential Manager or another protected local secret store. Make it available only to the Codex Desktop process through a controlled launcher/secret-injection step and configure the provider's `env_key` to read that variable. Do not put the token in `.env`, Compose YAML, Codex config, Git, or the devhub filesystem. When testing `/v1/models`, use a short-lived PowerShell process whose `DEVIN_API_KEY` was populated from the protected store; the request is authenticated and the live catalog is account-specific. For remote access, route the bearer token only over WireGuard (or another encrypted private channel).
+After the first deployment, run this from a Windows PowerShell window. The URL is printed by the existing Devin PKCE login flow. Open it in your browser; if the redirect cannot reach the container, paste the full redirect URL into the SSH terminal prompt. The code exchange and token write happen inside the container, and the token remains on devhub:
+
+```powershell
+ssh -t gateway-user@<devhub-host> "cd '<gateway-directory>' && docker compose run --rm devin-login"
+ssh gateway-user@<devhub-host> "cd '<gateway-directory>' && docker compose up -d --force-recreate devin-gateway"
+```
+
+The guarded Windows worker wrapper can run the same interactive login step automatically over SSH only when remote `/health` reports `fallback_token: not_set`. It does not read or transfer the credential. When the health state is `set`, it skips OAuth and gateway restart. Request-supplied `Authorization` and `x-api-key` values, if any, retain their existing precedence over the fallback.
 
 The container writes normal operational logs to stderr, so `docker compose logs -f devin-gateway` works without debug mode. `DEBUG` and `ERROR_TRACE` are explicitly disabled; error traces can otherwise include request bodies. Safe Responses diagnostics are disabled by default. Their configured path is `/app/logs/responses-safe-diagnostic.jsonl`, under the ignored `./logs` bind mount, so they can be explicitly enabled later without changing the image. Do not enable raw debug/error tracing for routine operation.
 
@@ -144,19 +150,18 @@ On devhub, replace the placeholder with the actual private host address:
 curl -fsS 'http://<private-devhub-ip>:38643/health' | jq -e '.status == "ok" and .collapse_system_enabled == true'
 ```
 
-For the live Devin catalog, run this from a Windows PowerShell process after securely populating its temporary `$env:DEVIN_API_KEY` from your local secret store. Replace the host placeholder; the token value itself is never part of the command text:
+For the live Devin catalog, replace the host placeholder. The remote gateway uses its startup fallback token; no credential is needed in the Windows process:
 
 ```powershell
 $base = 'http://<private-devhub-ip>:38643'
-$headers = @{ Authorization = "Bearer $env:DEVIN_API_KEY" }
-$ids = (Invoke-RestMethod -Uri "$base/v1/models" -Headers $headers).data.id
+$ids = (Invoke-RestMethod -Uri "$base/v1/models" -TimeoutSec 3).data.id
 foreach ($required in @('glm-5-3-flash-low', 'swe-2-medium')) {
     if ($required -notin $ids) { throw "Required Devin model is missing: $required" }
     "AVAILABLE $required"
 }
 ```
 
-`/health` is unauthenticated and reports the collapse flag. `/v1/models` performs live Devin discovery and therefore requires a valid per-request credential.
+`/health` is unauthenticated and reports the collapse flag plus `fallback_token: set` or `not_set` (never the token itself). `/v1/models` performs live Devin discovery using the startup fallback token. For first deployment, you can run `docker compose run --rm devin-login` directly on devhub and then recreate the gateway as shown above.
 
 #### Updating the deployment
 
@@ -513,7 +518,7 @@ const handle = await startServer({ port: 3000 });
 await handle.stop();
 ```
 
-`chat()` only needs the Bun runtime when reading the token file; pass `token` explicitly and it runs under plain Node.js too, which makes it suitable for GitHub Actions runners. Lower-level building blocks (`streamChat`, `discoverModels`, `getUserJwt`, converters, model catalog) are all re-exported from the package entry point. The server itself holds no token state — clients send credentials per request.
+`chat()` only needs the Bun runtime when reading the token file; pass `token` explicitly and it runs under plain Node.js too, which makes it suitable for GitHub Actions runners. Lower-level building blocks (`streamChat`, `discoverModels`, `getUserJwt`, converters, model catalog) are all re-exported from the package entry point. The server can hold an optional fallback credential in memory; clients may still send credentials per request.
 
 ## GitHub Actions
 
@@ -539,7 +544,7 @@ Key files:
 - `src/devin.ts`: Devin API client for GetUserJwt and streaming GetChatMessage
 - `src/models.ts`: model catalog and workload routing
 - `src/convert.ts`: conversion between OpenAI, Anthropic, and Devin formats
-- `src/config.ts`: token file read/write helpers (used by the CLI login tool; the server no longer reads it)
+- `src/config.ts`: token file read/write helpers and startup fallback-token lookup
 - `src/login.ts`: OAuth PKCE login flow
 - `src/cli/login.ts`: command-line login tool
 - `src/server.ts`: HTTP server and compatibility endpoints
