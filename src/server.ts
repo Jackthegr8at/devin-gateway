@@ -13,7 +13,9 @@
  * The fallback can be supplied through `DEVIN_API_KEY` or `ServerOptions.token`.
  */
 
-import { streamChat, discoverModels, type ChatStreamEvent } from "./devin.js";
+import { streamChat, discoverModels, discoverModelMetadata, type ChatStreamEvent } from "./devin.js";
+import { ModelSelectionStore } from "./admin/model-selection-store.js";
+import { CODEX_SELECTION_PATH, createModelSelectionRoutes, managementRequestAllowed } from "./admin/routes.js";
 import { listModels, type ModelInfo } from "./models.js";
 import {
   openaiToInternal,
@@ -1212,11 +1214,14 @@ export interface ServerOptions {
   token?: string;
   /** Override for the Devin API base URL (default: `DEVIN_BASE_URL` env). */
   baseUrl?: string;
+  /** Backend selection is opt-in. Docker may bind admin internally on all interfaces; publish only on host loopback. */
+  modelSelection?: { directory?: string; adminPort?: number; adminHost?: "127.0.0.1" | "0.0.0.0"; adminPublicPort?: number };
 }
 
 export interface ServerHandle {
   port: number;
   host: string;
+  adminPort?: number;
   /** Gracefully stop the server. */
   stop: () => Promise<void>;
 }
@@ -1233,6 +1238,30 @@ export async function startServer(options: ServerOptions = {}): Promise<ServerHa
   DEFAULT_DEVIN_KEY = options.token ?? process.env.DEVIN_API_KEY ?? "";
   DEVIN_BASE_URL = options.baseUrl ?? process.env.DEVIN_BASE_URL ?? "";
 
+  const selectionEnabled = options.modelSelection !== undefined || process.env.DEVIN_MODEL_SELECTION_ENABLED === "1";
+  const configuredAdminPort = options.modelSelection?.adminPort
+    ?? (process.env.DEVIN_ADMIN_PORT === undefined ? undefined : Number(process.env.DEVIN_ADMIN_PORT));
+  if (configuredAdminPort !== undefined && (!selectionEnabled || !Number.isInteger(configuredAdminPort) || configuredAdminPort < 0 || configuredAdminPort > 65535)) {
+    throw new Error("Management listener requires enabled model selection and a valid port.");
+  }
+  const adminHost = options.modelSelection?.adminHost ?? process.env.DEVIN_ADMIN_HOST ?? "127.0.0.1";
+  const adminPublicPort = options.modelSelection?.adminPublicPort
+    ?? (process.env.DEVIN_ADMIN_PUBLIC_PORT === undefined ? undefined : Number(process.env.DEVIN_ADMIN_PUBLIC_PORT));
+  if (adminHost !== "127.0.0.1" && adminHost !== "0.0.0.0") throw new Error("Management bind must be loopback or the explicit Docker interface bind.");
+  if (adminPublicPort !== undefined && (!Number.isInteger(adminPublicPort) || adminPublicPort < 1 || adminPublicPort > 65535)) {
+    throw new Error("Management public loopback port must be valid.");
+  }
+  const selectionStore = selectionEnabled ? new ModelSelectionStore(options.modelSelection?.directory) : undefined;
+  if (selectionStore) await selectionStore.initialize();
+  const selectionRoutes = selectionStore ? createModelSelectionRoutes({
+    store: selectionStore,
+    discover: async (req) => {
+      const token = extractToken(req);
+      if (!token) throw new Error("No model discovery credential configured.");
+      return discoverModelMetadata(token, DEVIN_BASE_URL || undefined, req.signal, 5000);
+    },
+  }) : undefined;
+
   const server = Bun.serve({
     port: PORT,
     hostname: HOST,
@@ -1244,6 +1273,13 @@ export async function startServer(options: ServerOptions = {}): Promise<ServerHa
       const url = new URL(req.url);
       const method = req.method;
       const path = url.pathname;
+      // Management never reaches inference CORS, raw body/header logging, or tracing.
+      if (path === "/admin" || path.startsWith("/admin/")) {
+        return Response.json({ error: { code: "not_found", message: "Management API is not exposed on the inference listener." } }, { status: 404 });
+      }
+      if (path === CODEX_SELECTION_PATH) {
+        return selectionRoutes ? selectionRoutes.codex(req) : Response.json({ error: { code: "selection_disabled", message: "Model selection is disabled." } }, { status: 404 });
+      }
       const startedAt = Date.now();
       const id = crypto.randomUUID().slice(0, 8);
       const useSafeResponsesDiagnostic = path === "/v1/responses"
@@ -1354,10 +1390,28 @@ export async function startServer(options: ServerOptions = {}): Promise<ServerHa
     },
   });
 
+  let adminServer: ReturnType<typeof Bun.serve> | undefined;
+  if (selectionRoutes && configuredAdminPort !== undefined) {
+    try {
+      adminServer = Bun.serve({
+        hostname: adminHost, port: configuredAdminPort, idleTimeout: 10,
+        fetch(req) {
+          if (!managementRequestAllowed(req, adminServer!.port!, adminPublicPort)) {
+            return Response.json({ error: { code: "management_origin_rejected", message: "Management Host/Origin check failed." } }, { status: 403 });
+          }
+          return selectionRoutes.admin(req);
+        },
+      });
+    } catch {
+      await server.stop(true);
+      throw new Error("Management listener could not start.");
+    }
+  }
   let shutdownStarted = false;
   const stop = async (): Promise<void> => {
     if (shutdownStarted) return;
     shutdownStarted = true;
+    await adminServer?.stop();
     await server.stop();
   };
 
@@ -1381,5 +1435,5 @@ export async function startServer(options: ServerOptions = {}): Promise<ServerHa
   } else {
     console.log("  Debug:     off (set DEBUG=true to enable verbose + file logging)");
   }
-  return { port: PORT, host: HOST, stop };
+  return { port: PORT, host: HOST, ...(adminServer ? { adminPort: adminServer.port! } : {}), stop };
 }

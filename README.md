@@ -98,6 +98,63 @@ The worker intentionally omits `model_provider`, so it inherits the parent's pro
 
 The optional `DEVIN_CODEX_DESKTOP_COLLAPSE_SYSTEM=1` gateway setting enables the tested system-prompt compatibility transformation only for `glm-5-3-flash-low` and `swe-2-medium`. It moves the exact composed system/developer text into the latest user turn without truncating or rewriting it; it does not change history or tool declarations. Leave it unset unless using that compatibility path.
 
+### Model selection foundation (backend only)
+
+`DEVIN_MODEL_SELECTION_ENABLED=1` enables version-1 selection storage and the read-only `GET /gateway/api/codex-selection` manifest. It is disabled by default for standalone/library users; the private Docker Compose gateway enables it. There is no browser UI and the existing Windows activation scripts still use their validated static catalog. `/v1/models`, inference credentials, CORS, tool translation, and the collapse allowlist are unchanged.
+
+Settings live in `$DEVIN_GATEWAY_SETTINGS_DIR/model-selection.json` (default `~/.devin-gateway-settings/model-selection.json`). Compose mounts the separate `devin-gateway-settings` named volume at `/home/gateway/.devin-gateway-settings`; `devin-login` continues to mount only `devin-gateway-auth`. Never combine those directories or delete either named volume during recreation.
+
+First initialization seeds only:
+
+```json
+{
+  "schemaVersion": 1,
+  "revision": 1,
+  "enabledModels": ["glm-5-3-flash-low", "swe-2-medium"],
+  "roles": {"default": "glm-5-3-flash-low", "swe_worker": "swe-2-medium"},
+  "includeFutureModels": false
+}
+```
+
+The exact-ID reviewed profiles advertise only GLM `low` and SWE-2 `medium`, with descriptions on their singleton supported-effort rows. Unknown IDs can be enabled but cannot be assigned to a role or acquire an inferred profile. Removed upstream models remain in the selection and are shown as unavailable. A missing role model or incomplete upstream limits/image metadata blocks manifest generation rather than substituting another model. Discovery itself does not prove an account can invoke a listed model.
+
+The store uses private POSIX directory/file modes (`0700`/`0600`), a flushed temporary file and atomic rename, plus a bounded filesystem writer lock. A corrupt existing file stops initialization or returns a sanitized `503`; it is never overwritten with defaults. After an interrupted writer, an abandoned `.selection-write.lock` fails closed: confirm every writer is stopped before manually removing that lock. Normal saves leave no lock or temporary file.
+
+Management endpoints are served only when `DEVIN_ADMIN_PORT` is explicitly set alongside enabled selection. This separate listener defaults to `127.0.0.1`. Compose explicitly uses `DEVIN_ADMIN_HOST=0.0.0.0` and port `3001` inside the container, published **only** as `127.0.0.1:38644:3001` on the host. `DEVIN_ADMIN_PUBLIC_PORT=38644` permits that exact loopback authority through the Host/Origin guard; LAN hosts and forwarded-host headers are not trusted. The listener rejects cross-site fetch metadata, has no inference CORS/raw tracing, and serves no UI:
+
+| Method/path | Response |
+|---|---|
+| `GET /admin/api/models` | `{source:"remote", selectionRevision, models:[...]}` with exact ID/name, availability, nullable upstream metadata, provenance and reviewed compatibility |
+| `GET /admin/api/model-selection` | Version-1 selection plus an `ETag` header |
+| `PUT /admin/api/model-selection` | Validated saved selection and new ETag |
+| `GET /gateway/api/codex-selection` (inference listener) | Allowlisted selection revision/profile version, eligible models, explicit role efforts and excluded-model reasons |
+
+PUT requires `Content-Type: application/json`, `X-Devin-Management: 1`, and the exact current `If-Match` ETag. Submit the current revision in the JSON; the store increments it on success. Missing precondition is `428`, stale revision is `412`, invalid selection is `400`. Reads are `no-store`; bodies are bounded to 256 KiB and five seconds. The explicit management header and same-origin checks provide the non-cookie CSRF foundation; Phase 2 must preserve these protections.
+
+`includeFutureModels=true` can be saved only when every currently discovered model is selected. Newly discovered models then become effectively enabled, without changing roles or gaining Codex compatibility. An ordinary partial selection must use `false`. Discovery failures do not fall back to the bundled catalog.
+
+The Codex manifest contains no scripts, instructions, TOML, permissions or OAuth credentials. It is **not** a complete Codex `ModelInfo` catalog: later Windows integration must combine these facts with a trusted template for the exact installed Codex runtime. Only the two currently reviewed IDs are eligible. Unvalidated selections are reported under `excludedModels`, not silently included.
+
+Access management through an SSH local forward from Windows (`ssh -L 38644:127.0.0.1:38644 <private-host>`), then use `http://127.0.0.1:38644/admin/api/...`. Do not publish port 38644 on a LAN, WireGuard, or public interface. Inference remains on its existing private port 38643. The Windows reviewed-source pin is refreshed only after reviewing the final Phase 1 runtime diff; the fingerprint algorithm and guards remain unchanged.
+
+Offline coverage:
+
+```bash
+bun test test/model-selection.test.ts test/model-selection-api.test.ts test/model-selection-docker.test.ts
+bun run typecheck
+bun run build
+```
+
+Linux permission tests run only on POSIX. Phase 1 acceptance additionally checks actual named-volume persistence across gateway recreation without removing the existing auth/settings volumes; a filesystem/gateway restart test alone is not Docker runtime proof.
+
+For an explicitly approved operator acceptance run against the seeded two-model setup, `tools/Validate-ModelSelectionPhase1.ts` verifies discovery, the safe manifest and optimistic concurrency using only configuration/discovery APIs:
+
+```bash
+docker compose exec -T --user gateway devin-gateway bun - < tools/Validate-ModelSelectionPhase1.ts
+```
+
+This helper temporarily enables a clearly synthetic unknown ID, verifies it cannot receive a role, and restores the original two-model selection in `finally`. Successful acceptance advances the revision by two rather than resetting it. It never submits inference or OAuth requests and never reads credentials. Run the separate byte-for-byte recreation check before these intentional settings updates.
+
 Safe Responses diagnostics are disabled by default. To opt in, set `DEVIN_RESPONSES_SAFE_DIAGNOSTICS=1`; one allowlisted JSON record per Responses request is appended to the ignored `logs/responses-safe-diagnostic.jsonl`. Records contain hashes/byte lengths and limited model, tool, status, error-category, and call-ID metadata—not raw prompt text, tool arguments, schemas, descriptions, credentials, or headers. Hashes can still reveal matches for guessable text, so treat the log as diagnostic data and do not publish it. An alternate output path can be set with `DEVIN_RESPONSES_SAFE_DIAGNOSTICS_PATH`.
 
 ### Self-hosted Docker Compose (Codex Desktop)

@@ -6,10 +6,16 @@ services:
       dockerfile: Dockerfile
     ports:
       - "${DEVIN_GATEWAY_BIND_IP:?Set DEVIN_GATEWAY_BIND_IP in .env to a private devhub interface IP}:38643:3000"
+      - "127.0.0.1:38644:3001"
     environment:
       PORT: "3000"
       HOST: "0.0.0.0"
       DEVIN_GATEWAY_CONFIG_DIR: "/home/gateway/.devin-gateway"
+      DEVIN_GATEWAY_SETTINGS_DIR: "/home/gateway/.devin-gateway-settings"
+      DEVIN_MODEL_SELECTION_ENABLED: "1"
+      DEVIN_ADMIN_HOST: "0.0.0.0"
+      DEVIN_ADMIN_PORT: "3001"
+      DEVIN_ADMIN_PUBLIC_PORT: "38644"
       DEVIN_CODEX_DESKTOP_COLLAPSE_SYSTEM: "1"
       DEVIN_RESPONSES_SAFE_DIAGNOSTICS: "${DEVIN_RESPONSES_SAFE_DIAGNOSTICS:-0}"
       DEVIN_RESPONSES_SAFE_DIAGNOSTICS_PATH: "/app/logs/responses-safe-diagnostic.jsonl"
@@ -20,6 +26,7 @@ services:
     volumes:
       - ./logs:/app/logs
       - devin-gateway-auth:/home/gateway/.devin-gateway
+      - devin-gateway-settings:/home/gateway/.devin-gateway-settings
     restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:$${PORT:-3000}/health | grep -q '\"status\":\"ok\".*\"collapse_system_enabled\":true'"]
@@ -41,3 +48,4 @@ services:
 
 volumes:
   devin-gateway-auth:
+  devin-gateway-settings:

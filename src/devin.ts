@@ -464,6 +464,20 @@ export interface DiscoveredModel {
   supportsImages: boolean;
 }
 
+/** Additional admin-only facts; legacy discovery and /v1/models retain their shape. */
+export interface DiscoveredModelMetadata extends DiscoveredModel {
+  upstreamThinking: boolean | null;
+  metadataProvenance: {
+    id: "upstream";
+    displayName: "upstream" | "id_fallback";
+    contextWindow: "upstream" | "fallback";
+    maxOutputTokens: "upstream" | "fallback";
+    imageSupport: "upstream" | "omitted";
+    upstreamThinking: "upstream" | "omitted";
+    reasoning: "upstream_indicator_and_label_heuristic";
+  };
+}
+
 const GET_CLI_MODEL_CONFIGS_PATH = "/exa.api_server_pb.ApiServerService/GetCliModelConfigs";
 
 export async function discoverModels(
@@ -472,6 +486,18 @@ export async function discoverModels(
   signal?: AbortSignal,
   timeoutMs = 30_000,
 ): Promise<DiscoveredModel[]> {
+  const models = await discoverModelMetadata(apiKey, baseUrl, signal, timeoutMs);
+  return models.map(({ id, name, contextWindow, maxTokens, reasoning, supportsImages }) => ({
+    id, name, contextWindow, maxTokens, reasoning, supportsImages,
+  }));
+}
+
+export async function discoverModelMetadata(
+  apiKey: string,
+  baseUrl: string = DEVIN_API_URL,
+  signal?: AbortSignal,
+  timeoutMs = 30_000,
+): Promise<DiscoveredModelMetadata[]> {
   const timeout = AbortSignal.timeout(timeoutMs);
   const discoverySignal = signal ? AbortSignal.any([signal, timeout]) : timeout;
   const token = normalizeToken(apiKey);
@@ -513,8 +539,8 @@ export async function discoverModels(
   }
 }
 
-function parseCliModelConfigs(data: Uint8Array): DiscoveredModel[] {
-  const models: DiscoveredModel[] = [];
+function parseCliModelConfigs(data: Uint8Array): DiscoveredModelMetadata[] {
+  const models: DiscoveredModelMetadata[] = [];
   const decoder = new ProtoDecoder(data);
 
   while (!decoder.done) {
@@ -535,7 +561,7 @@ const REASONING_LABEL_PATTERN = /think|thinking|minimal|high|medium|low|xhigh|ma
 const NO_REASONING_LABEL_PATTERN = /\bno thinking\b/i;
 
 /** Parse `ModelFeatures` (field 6 of `ModelInfo`) for `supports_thinking` (field 15). */
-function parseModelFeaturesThinking(decoder: ProtoDecoder): boolean {
+function parseModelFeaturesThinking(decoder: ProtoDecoder): boolean | null {
   while (!decoder.done) {
     const { field, wire } = decoder.readTag();
     if (field === 15 && wire === 0) {
@@ -543,7 +569,7 @@ function parseModelFeaturesThinking(decoder: ProtoDecoder): boolean {
     }
     decoder.skip(wire);
   }
-  return false;
+  return null;
 }
 
 /** Subset of `ModelInfo` (field 23 of `ClientModelConfig`) the gateway needs. */
@@ -551,12 +577,12 @@ interface ModelInfoFields {
   /** `max_output_tokens` (field 13), 0 when the upstream omits it. */
   maxOutputTokens: number;
   /** `model_features.supports_thinking` (field 6, inner field 15). */
-  supportsThinking: boolean;
+  supportsThinking: boolean | null;
 }
 
 /** Parse `ModelInfo` (field 23 of `ClientModelConfig`); scans to the end — field order is not guaranteed. */
 function parseModelInfo(decoder: ProtoDecoder): ModelInfoFields {
-  const info: ModelInfoFields = { maxOutputTokens: 0, supportsThinking: false };
+  const info: ModelInfoFields = { maxOutputTokens: 0, supportsThinking: null };
   while (!decoder.done) {
     const { field, wire } = decoder.readTag();
     if (field === 13 && wire === 0) {
@@ -570,14 +596,15 @@ function parseModelInfo(decoder: ProtoDecoder): ModelInfoFields {
   return info;
 }
 
-function parseClientModelConfig(decoder: ProtoDecoder): DiscoveredModel | null {
+function parseClientModelConfig(decoder: ProtoDecoder): DiscoveredModelMetadata | null {
   let id = "";
   let label = "";
   let disabled = false;
   let contextWindowTokens = 0;
   let maxOutputTokens = 0;
   let supportsImages = false;
-  let supportsThinking = false;
+  let imageSupportPresent = false;
+  let supportsThinking: boolean | null = null;
 
   while (!decoder.done) {
     const { field, wire } = decoder.readTag();
@@ -587,6 +614,7 @@ function parseClientModelConfig(decoder: ProtoDecoder): DiscoveredModel | null {
       disabled = decoder.readVarint() !== 0n;
     } else if (field === 5 && wire === 0) {
       supportsImages = decoder.readVarint() !== 0n;
+      imageSupportPresent = true;
     } else if (field === 18 && wire === 0) {
       contextWindowTokens = Number(decoder.readVarint());
     } else if (field === 22 && wire === 2) {
@@ -603,7 +631,7 @@ function parseClientModelConfig(decoder: ProtoDecoder): DiscoveredModel | null {
   if (disabled || !id.trim()) return null;
 
   const reasoning = !NO_REASONING_LABEL_PATTERN.test(label) &&
-    (supportsThinking || REASONING_LABEL_PATTERN.test(label));
+    (supportsThinking === true || REASONING_LABEL_PATTERN.test(label));
   const contextWindow = contextWindowTokens > 0 ? contextWindowTokens : 200_000;
   // Upstream reports `max_output_tokens` for every catalog entry; 64K stays as the
   // conservative fallback for an entry that omits it.
@@ -615,5 +643,14 @@ function parseClientModelConfig(decoder: ProtoDecoder): DiscoveredModel | null {
     maxTokens,
     reasoning,
     supportsImages,
+    upstreamThinking: supportsThinking,
+    metadataProvenance: {
+      id: "upstream", displayName: label.trim() ? "upstream" : "id_fallback",
+      contextWindow: contextWindowTokens > 0 ? "upstream" : "fallback",
+      maxOutputTokens: maxOutputTokens > 0 ? "upstream" : "fallback",
+      imageSupport: imageSupportPresent ? "upstream" : "omitted",
+      upstreamThinking: supportsThinking === null ? "omitted" : "upstream",
+      reasoning: "upstream_indicator_and_label_heuristic",
+    },
   };
 }
