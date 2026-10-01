@@ -1,5 +1,5 @@
 import { expect, test, describe } from "bun:test";
-import { mkdtemp, rm, readFile } from "node:fs/promises";
+import { mkdtemp, rm, readFile, stat, readdir, mkdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
@@ -25,6 +25,42 @@ async function freshConfigDir(): Promise<string> {
 const SAVED_ENV = process.env.DEVIN_GATEWAY_CONFIG_DIR;
 
 describe("config token storage", () => {
+  test("atomic replacement leaves no temporary credential and restricts POSIX permissions", async () => {
+    const dir = await freshConfigDir();
+    const previous = process.env.DEVIN_GATEWAY_CONFIG_DIR;
+    process.env.DEVIN_GATEWAY_CONFIG_DIR = dir;
+    try {
+      const mod = await loadConfig();
+      await mod.writeToken("synthetic-old");
+      await mod.writeToken("synthetic-new");
+      expect(await mod.readToken()).toBe("synthetic-new");
+      expect(await readdir(dir)).toEqual(["token"]);
+      if (process.platform !== "win32") {
+        expect((await stat(dir)).mode & 0o777).toBe(0o700);
+        expect((await stat(mod.TOKEN_FILE)).mode & 0o777).toBe(0o600);
+      }
+    } finally {
+      if (previous === undefined) delete process.env.DEVIN_GATEWAY_CONFIG_DIR;
+      else process.env.DEVIN_GATEWAY_CONFIG_DIR = previous;
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("failed atomic replacement removes the temporary credential", async () => {
+    const dir = await freshConfigDir();
+    const previous = process.env.DEVIN_GATEWAY_CONFIG_DIR;
+    process.env.DEVIN_GATEWAY_CONFIG_DIR = dir;
+    try {
+      const mod = await loadConfig();
+      await mkdir(mod.TOKEN_FILE);
+      await expect(mod.writeToken("synthetic")).rejects.toThrow();
+      expect(await readdir(dir)).toEqual(["token"]);
+    } finally {
+      if (previous === undefined) delete process.env.DEVIN_GATEWAY_CONFIG_DIR;
+      else process.env.DEVIN_GATEWAY_CONFIG_DIR = previous;
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
   // Snapshot once; each test restores the env to the pre-test value so a
   // leaked env var can never point subsequent tests at the real config dir.
   const savedEnv = process.env.DEVIN_GATEWAY_CONFIG_DIR;

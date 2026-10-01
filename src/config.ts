@@ -9,6 +9,7 @@
 
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { randomUUID } from "node:crypto";
 
 const CONFIG_DIR = process.env.DEVIN_GATEWAY_CONFIG_DIR ?? join(homedir(), ".devin-gateway");
 export const TOKEN_FILE = join(CONFIG_DIR, "token");
@@ -28,9 +29,22 @@ export async function readFallbackToken(): Promise<string> {
 }
 
 export async function writeToken(token: string): Promise<void> {
-  const { writeFile, mkdir } = await import("node:fs/promises");
-  await mkdir(CONFIG_DIR, { recursive: true });
-  await writeFile(TOKEN_FILE, token.trim(), "utf8");
+  const { open, mkdir, chmod, rename, unlink } = await import("node:fs/promises");
+  await mkdir(CONFIG_DIR, { recursive: true, mode: 0o700 });
+  if (process.platform !== "win32") await chmod(CONFIG_DIR, 0o700);
+  const temporary = join(CONFIG_DIR, `.token-${randomUUID()}.tmp`);
+  try {
+    const file = await open(temporary, "wx", 0o600);
+    try {
+      await file.writeFile(token.trim(), "utf8");
+      await file.sync();
+    } finally { await file.close(); }
+    await rename(temporary, TOKEN_FILE);
+  } finally {
+    await unlink(temporary).catch((error: NodeJS.ErrnoException) => {
+      if (error.code !== "ENOENT") throw error;
+    });
+  }
 }
 
 export { CONFIG_DIR };
