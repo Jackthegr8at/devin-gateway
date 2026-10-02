@@ -6,6 +6,7 @@ import { getModelPageWindow } from "./model-pagination.js";
 import { ModelRow } from "./ModelRow.js";
 import { RoleAssignments } from "./RoleAssignments.js";
 import { ConfigurationZone } from "./ConfigurationZone.js";
+import { usePickerViewport } from "./usePickerViewport.js";
 import { orderFamilyVariants } from "./effort-order.js";
 import { allDiscoveredEnabled, bulkSelection, createDraft, draftErrors, draftsEqual, matchingModels, type ModelSelection, type Snapshot } from "./state.js";
 
@@ -23,6 +24,8 @@ export function ModelPicker({ api = defaultApi }: { api?: PickerApi }) {
   const [status, setStatus] = useState("Loading Devin models…");
   const searchRef = useRef<HTMLInputElement>(null);
   const categoriesRef = useRef<HTMLDetailsElement>(null);
+  const pickerRef = useRef<HTMLElement>(null);
+  usePickerViewport(pickerRef);
   const mounted = useRef(true);
   const actionPending = useRef(false);
   const baseline = snapshot ? createDraft(snapshot.selection, snapshot.models) : null;
@@ -97,7 +100,7 @@ export function ModelPicker({ api = defaultApi }: { api?: PickerApi }) {
     } finally { actionPending.current = false; if (mounted.current) setBusy(false); }
   }
 
-  return <main className="picker" aria-labelledby="picker-title" aria-busy={busy} onKeyDown={(event) => {
+  return <main ref={pickerRef} className="picker" aria-labelledby="picker-title" aria-busy={busy} onKeyDown={(event) => {
     if (event.key === "Escape" && !busy) {
       const details = event.currentTarget.querySelector("details[open]");
       if (details) { details.removeAttribute("open"); details.querySelector("summary")?.focus(); }

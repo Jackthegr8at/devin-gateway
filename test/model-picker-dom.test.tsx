@@ -9,6 +9,7 @@ const dom = new JSDOM("<!doctype html><html><body></body></html>", { url: "http:
 const installed = new Map<string, PropertyDescriptor | undefined>();
 for (const [name, value] of Object.entries({ window: dom.window, document: dom.window.document, navigator: dom.window.navigator,
   HTMLElement: dom.window.HTMLElement, HTMLInputElement: dom.window.HTMLInputElement, Node: dom.window.Node,
+  getComputedStyle: dom.window.getComputedStyle.bind(dom.window),
   requestAnimationFrame: dom.window.requestAnimationFrame.bind(dom.window), IS_REACT_ACT_ENVIRONMENT: true })) {
   installed.set(name, Object.getOwnPropertyDescriptor(globalThis, name));
   Object.defineProperty(globalThis, name, { configurable: true, writable: true, value });
@@ -64,6 +65,32 @@ function rows() { return [...document.querySelectorAll(".model-row")]; }
 async function checkModel(id: string) { await click(document.querySelector(`.model-row[data-model-id="${id}"] input`) as HTMLElement); }
 
 describe("rendered Cody-style model picker", () => {
+  test("page fallback follows available height and releases its resize observer on unmount", async () => {
+    const originalHeight = Object.getOwnPropertyDescriptor(dom.window, "innerHeight");
+    const originalObserver = Object.getOwnPropertyDescriptor(globalThis, "ResizeObserver");
+    let observed = 0; let disconnected = 0;
+    Object.defineProperty(globalThis, "ResizeObserver", { configurable: true, value: class {
+      observe() { observed++; }
+      disconnect() { disconnected++; }
+    } });
+    Object.defineProperty(dom.window, "innerHeight", { configurable: true, value: 40 });
+    try {
+      await mount(mockApi().api);
+      const picker = document.querySelector('.picker')!;
+      expect(picker.classList.contains("page-scroll")).toBe(true);
+      expect(observed).toBeGreaterThan(0);
+      Object.defineProperty(dom.window, "innerHeight", { configurable: true, value: 800 });
+      await act(() => dom.window.dispatchEvent(new dom.window.Event("resize")));
+      expect(picker.classList.contains("page-scroll")).toBe(false);
+      const before = disconnected;
+      await act(() => root!.unmount()); root = undefined;
+      expect(disconnected).toBe(before + 1);
+    } finally {
+      if (originalHeight) Object.defineProperty(dom.window, "innerHeight", originalHeight);
+      if (originalObserver) Object.defineProperty(globalThis, "ResizeObserver", originalObserver);
+      else Reflect.deleteProperty(globalThis, "ResizeObserver");
+    }
+  });
   test("height-aware default follows viewport changes until explicitly toggled and cleans up its listener", async () => {
     const original = Object.getOwnPropertyDescriptor(dom.window, "matchMedia");
     const listeners = new Set<() => void>();
