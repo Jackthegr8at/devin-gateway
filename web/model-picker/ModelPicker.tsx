@@ -5,6 +5,7 @@ import { MODEL_CATEGORY_OPTIONS, modelCategoryBucket, type ModelCategory } from 
 import { getModelPageWindow } from "./model-pagination.js";
 import { ModelRow } from "./ModelRow.js";
 import { RoleAssignments } from "./RoleAssignments.js";
+import { ConfigurationZone } from "./ConfigurationZone.js";
 import { orderFamilyVariants } from "./effort-order.js";
 import { allDiscoveredEnabled, bulkSelection, createDraft, draftErrors, draftsEqual, matchingModels, type ModelSelection, type Snapshot } from "./state.js";
 
@@ -112,13 +113,17 @@ export function ModelPicker({ api = defaultApi }: { api?: PickerApi }) {
       {error ? <div className="error" role="alert"><p>{error}</p>{conflict || !snapshot ? <button type="button" disabled={busy} onClick={() => void load()}>{conflict ? "Reload latest (discard draft)" : "Retry loading"}</button> : null}</div> : null}
       {snapshot && draft ? <>
         <fieldset className="edit-controls" disabled={busy}>
+          <ConfigurationZone models={snapshot.models} draft={draft}>
           <label className="future-control"><span><span className="control-title">Include future Devin models</span><span className="help" id="future-help">{allSelected
             ? "Enable future discoveries. New models never receive roles automatically."
             : "Partial selections save exact IDs. Enable all for future models; disabling a model turns future inclusion off."}</span></span>
             <input type="checkbox" aria-describedby="future-help" checked={draft.includeFutureModels} disabled={!allSelected || busy} onChange={(event) => setDraft({ ...draft, includeFutureModels: event.target.checked })} />
           </label>
           <RoleAssignments models={snapshot.models} draft={draft} disabled={busy} onChange={(role, id) => setDraft((previous) => previous ? { ...previous, roles: { ...previous.roles, [role]: id } } : previous)} />
+          </ConfigurationZone>
           {errors.length ? <div className="validation" role="alert" id="draft-errors">{errors.map((message) => <p key={message}>{message}</p>)}</div> : null}
+          <section className="model-browser" aria-label="Model browser">
+          <div className="browser-toolbar">
           <div className="filters">
             <label className="search"><span className="sr-only">Search Devin models</span><input ref={searchRef} type="search" placeholder={`Search ${discovered.length} models…`} value={query} onChange={(event) => { setQuery(event.target.value); setPageIndex(0); }} /></label>
             <details ref={categoriesRef} className="categories"><summary><span>{categories.size ? MODEL_CATEGORY_OPTIONS.filter((category) => categories.has(category)).join(" + ") : "All categories"}</span><svg className="category-chevron" viewBox="0 0 16 16" width="16" height="16" aria-hidden="true" focusable="false"><path d="m4 6 4 4 4-4" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" /></svg></summary>
@@ -127,6 +132,7 @@ export function ModelPicker({ api = defaultApi }: { api?: PickerApi }) {
             <label className="enabled-only"><input type="checkbox" checked={enabledOnly} onChange={(event) => { setEnabledOnly(event.target.checked); setPageIndex(0); }} />Enabled only</label>
           </div>
           <div className="bulk-actions"><button type="button" disabled={!matches.length} onClick={() => bulk(matches.map((model) => model.id), true)}>Enable {filtered ? `these ${matches.length}` : "all"}</button><button type="button" disabled={!matches.length} onClick={() => bulk(matches.map((model) => model.id), false)}>Disable {filtered ? `these ${matches.length}` : "all"}</button><span>Applies to every match, across all pages.</span></div>
+          </div>
           <div className="model-list" role="group" aria-label="Devin model selection">
             {visible.length ? [...groups].map(([id, models]) => models[0].family ? <section key={id} className="model-family" aria-label={`${models[0].family.displayName} variants`}>
               <h3>{models[0].family.displayName}</h3><p className="help">Thinking variants · {models[0].family.provenance === "upstream_family_metadata" ? "Devin family metadata" : "Reviewed fallback"}{models[0].family.upstreamDefaultEffort ? ` · upstream default ${models[0].family.upstreamDefaultEffort}` : ""}</p>
@@ -135,6 +141,7 @@ export function ModelPicker({ api = defaultApi }: { api?: PickerApi }) {
               : <p className="empty">{enabledOnly ? "No enabled models match these filters. Turn off Enabled only to add models." : "No models match these filters. Try another search or category."}</p>}
           </div>
           <nav className="pagination" aria-label="Devin model pages"><span aria-live="polite">{matches.length ? `Showing ${page.start + 1}–${page.end} of ${matches.length}` : "0 matching models"}</span><div><button type="button" disabled={page.pageIndex === 0} onClick={() => setPageIndex(page.pageIndex - 1)}>Previous</button><span>Page {page.pageIndex + 1} of {page.pageCount}</span><button type="button" disabled={page.pageIndex === page.pageCount - 1} onClick={() => setPageIndex(page.pageIndex + 1)}>Next</button></div></nav>
+          </section>
         </fieldset>
       </> : null}
     </div>

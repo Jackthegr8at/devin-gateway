@@ -64,6 +64,51 @@ function rows() { return [...document.querySelectorAll(".model-row")]; }
 async function checkModel(id: string) { await click(document.querySelector(`.model-row[data-model-id="${id}"] input`) as HTMLElement); }
 
 describe("rendered Cody-style model picker", () => {
+  test("height-aware default follows viewport changes until explicitly toggled and cleans up its listener", async () => {
+    const original = Object.getOwnPropertyDescriptor(dom.window, "matchMedia");
+    const listeners = new Set<() => void>();
+    const media = { matches: true, addEventListener: (_: string, callback: () => void) => listeners.add(callback),
+      removeEventListener: (_: string, callback: () => void) => listeners.delete(callback) };
+    Object.defineProperty(dom.window, "matchMedia", { configurable: true, value: () => media });
+    try {
+      await mount(mockApi().api);
+      const toggle = document.querySelector('.configuration-toggle') as HTMLButtonElement;
+      expect(toggle.getAttribute("aria-expanded")).toBe("false");
+      await act(() => { media.matches = false; for (const callback of listeners) callback(); });
+      expect(toggle.getAttribute("aria-expanded")).toBe("true");
+      await click(toggle);
+      await act(() => { media.matches = true; for (const callback of listeners) callback(); });
+      await act(() => { media.matches = false; for (const callback of listeners) callback(); });
+      expect(toggle.getAttribute("aria-expanded")).toBe("false");
+      await act(() => root!.unmount()); root = undefined;
+      expect(listeners.size).toBe(0);
+    } finally {
+      if (original) Object.defineProperty(dom.window, "matchMedia", original);
+      else Reflect.deleteProperty(dom.window, "matchMedia");
+    }
+  });
+  test("configuration collapse retains draft controls and updates the role summary", async () => {
+    const base = mockApi();
+    await mount(base.api);
+    const toggle = document.querySelector('.configuration-toggle') as HTMLButtonElement;
+    expect(toggle.getAttribute("aria-expanded")).toBe("true");
+    await checkModel("other-fixture-2");
+    const select = document.querySelector('select[aria-label="Default / parent model"]') as HTMLSelectElement;
+    await act(() => {
+      select.value = "swe-2";
+      select.dispatchEvent(new dom.window.Event("change", { bubbles: true }));
+    });
+    expect(toggle.textContent).toContain("Parent: SWE-2 / medium");
+    await click(toggle);
+    expect(document.getElementById("configuration-controls")!.hidden).toBe(true);
+    expect(document.querySelector('select[aria-label="Default / parent model"]')).toBe(select);
+    await click(toggle);
+    expect(select.value).toBe("swe-2");
+    expect((document.querySelector('.model-row[data-model-id="other-fixture-2"] input') as HTMLInputElement).checked).toBe(true);
+    await click(button("Save selection"));
+    expect(base.saves[0].draft.roles.default).toEqual({ modelId: "swe-2", effort: "medium" });
+    expect(base.saves[0].draft.enabledModels).toContain("other-fixture-2");
+  });
   test("category chevron, click-away and keyboard dismissal preserve the multi-select draft", async () => {
     await mount(mockApi().api);
     const details = document.querySelector("details")!;
