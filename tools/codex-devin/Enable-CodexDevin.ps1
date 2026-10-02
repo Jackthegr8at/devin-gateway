@@ -5,12 +5,14 @@ param(
 
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'CodexDevin.Common.ps1')
+Import-Module (Join-Path $PSScriptRoot 'CodexDevin.CollapseTest.Guards.psm1') -Force
+. (Join-Path $PSScriptRoot 'CodexDevin.Selection.ps1')
 
 $codexHome = Get-CodexDevinHome
 $configPath = Join-Path $codexHome 'config.toml'
 $agentPath = Join-Path $codexHome 'agents\swe_worker.toml'
-$catalogPath = Join-Path $codexHome 'model-catalogs\devin-0.158.json'
-$catalogSha256 = '0ED2DF70B20D3CD5EFFF5747D71A84553CBA1085BA42F6D0EDE9F455CDD7065A'
+$catalogPath = $null
+$catalogSha256 = $null
 $backupRoot = Join-Path $codexHome 'devin-desktop-switch-backups'
 $runDirectory = $null
 $statePath = $null
@@ -69,15 +71,10 @@ try {
         throw 'The existing worker file is a reparse point; refusing to replace it.'
     }
 
-    if (-not (Test-Path -LiteralPath $catalogPath -PathType Leaf)) {
-        throw "The validated durable Devin model catalog is missing: $catalogPath"
-    }
-    Assert-CodexDevinNoReparsePoint -Path $catalogPath
-    if ((Get-CodexDevinSha256 -Path $catalogPath) -ne $catalogSha256) {
-        throw 'The validated durable Devin model catalog has changed; refusing to switch.'
-    }
-    $catalogText = [IO.File]::ReadAllText($catalogPath, [Text.UTF8Encoding]::new($false, $true))
-    Assert-CodexDevinCatalogModels -JsonText $catalogText -RequiredSlugs @('glm-5-3-flash-low', 'swe-2-medium')
+    # Validate saved roles, availability, metadata and the actual runtime before creating backups or modifying Codex files.
+    $selection = Get-CodexDevinPreparedSelection -GatewayAuthority $gatewayAuthority
+    $catalogSha256 = $selection.catalogSha256
+    $catalogBytes = [Text.UTF8Encoding]::new($false).GetBytes($selection.catalogText)
 
     if (Test-Path -LiteralPath $backupRoot -PathType Container) {
         foreach ($existingRun in @(Get-ChildItem -LiteralPath $backupRoot -Directory)) {
@@ -111,7 +108,8 @@ try {
     $runDirectory = Join-Path $backupRoot ((Get-Date).ToString('yyyyMMdd-HHmmss-fff') + '-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
     [void][IO.Directory]::CreateDirectory($runDirectory)
     $statePath = Join-Path $runDirectory 'state.json'
-    $workerBytes = Get-CodexDevinWorkerBytes
+    $catalogPath = Join-Path $runDirectory 'model-catalog.json'
+    $workerBytes = Get-CodexDevinWorkerBytes -ModelId $selection.roles.swe_worker.modelId -ReasoningEffort $selection.roles.swe_worker.reasoningEffort
     $workerManagedHash = Get-CodexDevinBytesSha256 -Bytes $workerBytes
     $workerBackupPath = $null
     if ($workerExisted) { $workerBackupPath = Join-Path $runDirectory 'swe_worker.toml.original' }
@@ -129,6 +127,11 @@ try {
         workerManagedSha256 = $workerManagedHash
         catalogPath = $catalogPath
         catalogSha256 = $catalogSha256
+        selectionRevision = $selection.revision
+        selectionETag = $selection.selectionETag
+        runtimeVersion = $selection.runtimeVersion
+        instructionSha256 = $selection.instructionSha256
+        instructionUtf8ByteLength = $selection.instructionUtf8ByteLength
     }
     Save-SwitchState $state
 
@@ -142,11 +145,12 @@ try {
     $state.status = 'Prepared'
     Save-SwitchState $state
 
-    Write-Host '[4/8] Revalidating the durable Devin model catalog...'
+    Write-Host '[4/8] Installing and hash-verifying this run''s generated Devin model catalog...'
     Assert-CodexDevinNoReparsePoint -Path $catalogPath
-    if ((Get-CodexDevinSha256 -Path $catalogPath) -ne $catalogSha256) { throw 'Durable catalog SHA-256 changed before the config switch.' }
+    Write-CodexDevinBytesAtomically -Path $catalogPath -Bytes $catalogBytes
+    if ((Get-CodexDevinSha256 -Path $catalogPath) -ne $catalogSha256) { throw 'Generated catalog SHA-256 changed before the config switch.' }
     $catalogText = [IO.File]::ReadAllText($catalogPath, [Text.UTF8Encoding]::new($false, $true))
-    Assert-CodexDevinCatalogModels -JsonText $catalogText -RequiredSlugs @('glm-5-3-flash-low', 'swe-2-medium')
+    Assert-CodexDevinCatalogModels -JsonText $catalogText -RequiredSlugs @($selection.roles.default.modelId, $selection.roles.swe_worker.modelId)
     $state.status = 'CatalogReady'
     Save-SwitchState $state
 
@@ -155,7 +159,8 @@ try {
     $sandboxBefore = Get-CodexDevinTomlKeyLine -Text $text -Section '' -Key 'sandbox_mode'
     $approvalBefore = Get-CodexDevinTomlKeyLine -Text $text -Section '' -Key 'approval_policy'
 
-    $text = Set-CodexDevinTomlKey -Text $text -Section '' -Key 'model' -Value '"glm-5-3-flash-low"'
+    $text = Set-CodexDevinTomlKey -Text $text -Section '' -Key 'model' -Value (ConvertTo-CodexDevinTomlString -Value $selection.roles.default.modelId)
+    $text = Set-CodexDevinTomlKey -Text $text -Section '' -Key 'model_reasoning_effort' -Value (ConvertTo-CodexDevinTomlString -Value $selection.roles.default.reasoningEffort)
     $text = Set-CodexDevinTomlKey -Text $text -Section '' -Key 'model_provider' -Value '"devin_gateway"'
     $text = Set-CodexDevinTomlKey -Text $text -Section '' -Key 'model_catalog_json' -Value (ConvertTo-CodexDevinTomlString -Value $catalogPath)
     $text = Set-CodexDevinTomlKey -Text $text -Section '' -Key 'multi_agent_version' -Value '"v1"'
@@ -169,13 +174,14 @@ try {
     $text = Set-CodexDevinTomlKey -Text $text -Section $providerSection -Key 'stream_max_retries' -Value '0'
 
     $agentSection = 'agents.swe_worker'
-    $text = Set-CodexDevinTomlKey -Text $text -Section $agentSection -Key 'description' -Value '"Scoped SWE-2 Medium repository worker."'
+    $text = Set-CodexDevinTomlKey -Text $text -Section $agentSection -Key 'description' -Value '"Scoped repository worker using the saved validated gateway role."'
     $text = Set-CodexDevinTomlKey -Text $text -Section $agentSection -Key 'config_file' -Value (ConvertTo-CodexDevinTomlString -Value $agentPath)
 
     if ((Get-CodexDevinTomlKeyLine -Text $text -Section '' -Key 'sandbox_mode') -cne $sandboxBefore) { throw 'Internal validation failed: sandbox_mode would change.' }
     if ((Get-CodexDevinTomlKeyLine -Text $text -Section '' -Key 'approval_policy') -cne $approvalBefore) { throw 'Internal validation failed: approval_policy would change.' }
     foreach ($expected in @(
-        @{ Section = ''; Key = 'model'; Pattern = '^\s*model\s*=\s*"glm-5-3-flash-low"' }
+        @{ Section = ''; Key = 'model'; Pattern = '^\s*model\s*=\s*' + [regex]::Escape((ConvertTo-CodexDevinTomlString -Value $selection.roles.default.modelId)) }
+        @{ Section = ''; Key = 'model_reasoning_effort'; Pattern = '^\s*model_reasoning_effort\s*=\s*' + [regex]::Escape((ConvertTo-CodexDevinTomlString -Value $selection.roles.default.reasoningEffort)) }
         @{ Section = ''; Key = 'model_provider'; Pattern = '^\s*model_provider\s*=\s*"devin_gateway"' }
         @{ Section = ''; Key = 'model_catalog_json'; Pattern = '^\s*model_catalog_json\s*=' }
         @{ Section = ''; Key = 'multi_agent_version'; Pattern = '^\s*multi_agent_version\s*=\s*"v1"' }
@@ -227,7 +233,7 @@ try {
     Write-Host 'Temporary provider mode configured for the normal Codex Desktop home.'
     Write-Host "Responses endpoint: $gatewayBaseUrl"
     Write-Host "Recovery backup: $runDirectory"
-    Write-Host 'The durable model catalog is dormant after OpenAI restore and is intentionally retained.'
+    Write-Host 'The per-run catalog and its SHA-256 are retained with this recovery record; restore removes its active configuration reference.'
     Write-Host '[8/8] Checking loopback gateway health (maximum 3 seconds)...'
     $health = Get-CodexDevinGatewayHealth -Uri $gatewayHealthUri
     if ($health.Healthy) {

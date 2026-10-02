@@ -23,7 +23,7 @@ try {
         $existing = $case -ceq 'ActiveExistingWorker'
         if ($existing) { [IO.File]::WriteAllBytes((Join-Path $run 'swe_worker.toml.original'), $workerBytes) }
         [IO.File]::WriteAllText($config, 'synthetic-current-config')
-        [IO.File]::WriteAllBytes($worker, (Get-CodexDevinWorkerBytes))
+        [IO.File]::WriteAllBytes($worker, (Get-CodexDevinWorkerBytes -ModelId 'swe-2-medium' -ReasoningEffort 'medium'))
         $state = [pscustomobject]@{
             status = $(if ($case -ceq 'Preparing') { 'Preparing' } else { 'Enabled' })
             configPath = $config

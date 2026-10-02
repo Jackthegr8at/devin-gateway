@@ -44,10 +44,22 @@ try {
     [IO.File]::WriteAllText((Join-Path $fixtureRoot 'tsconfig.json'), '{"compilerOptions":{}}', [Text.UTF8Encoding]::new($false))
     [IO.File]::WriteAllText((Join-Path $fixtureRoot 'bunfig.toml'), "[run]`n", [Text.UTF8Encoding]::new($false))
     [IO.File]::WriteAllText($fixtureHelper, 'synthetic-oauth-helper-v1', [Text.UTF8Encoding]::new($false))
+    $fixtureSelection = Join-Path $fixtureTools 'CodexSelection.ts'
+    $fixtureTemplateDirectory = Join-Path $fixtureTools 'templates'
+    [void][IO.Directory]::CreateDirectory($fixtureTemplateDirectory)
+    $fixtureTemplate = Join-Path $fixtureTemplateDirectory 'codex-synthetic.json'
+    [IO.File]::WriteAllText($fixtureSelection, 'synthetic-selection-v1', [Text.UTF8Encoding]::new($false))
+    [IO.File]::WriteAllText($fixtureTemplate, '{"synthetic":1}', [Text.UTF8Encoding]::new($false))
 
     $resolvedFixtureRoot = Resolve-CodexDevinGatewayRoot -ToolDirectory $fixtureTools
     $fixtureFingerprint = Get-CodexDevinGatewayFingerprint -GatewayRoot $resolvedFixtureRoot -OAuthHelperPath $fixtureHelper
     Assert-GatewayFingerprint 'fingerprint includes clean-fork source, package, lockfile, runtime config, and OAuth helper' (Test-CodexDevinGatewayFingerprint -GatewayRoot $resolvedFixtureRoot -OAuthHelperPath $fixtureHelper -ExpectedFingerprint $fixtureFingerprint)
+    [IO.File]::WriteAllText($fixtureSelection, 'synthetic-selection-v2', [Text.UTF8Encoding]::new($false))
+    Assert-GatewayFingerprint 'changed selection processor fails fingerprint validation' (-not (Test-CodexDevinGatewayFingerprint -GatewayRoot $resolvedFixtureRoot -OAuthHelperPath $fixtureHelper -ExpectedFingerprint $fixtureFingerprint))
+    [IO.File]::WriteAllText($fixtureSelection, 'synthetic-selection-v1', [Text.UTF8Encoding]::new($false))
+    [IO.File]::WriteAllText($fixtureTemplate, '{"synthetic":2}', [Text.UTF8Encoding]::new($false))
+    Assert-GatewayFingerprint 'changed reviewed runtime metadata fails fingerprint validation' (-not (Test-CodexDevinGatewayFingerprint -GatewayRoot $resolvedFixtureRoot -OAuthHelperPath $fixtureHelper -ExpectedFingerprint $fixtureFingerprint))
+    [IO.File]::WriteAllText($fixtureTemplate, '{"synthetic":1}', [Text.UTF8Encoding]::new($false))
 
     [IO.File]::WriteAllText((Join-Path $fixtureSrc 'server.ts'), 'synthetic-server-v2', [Text.UTF8Encoding]::new($false))
     Assert-GatewayFingerprint 'a changed runtime source fails the fingerprint guard' (-not (Test-CodexDevinGatewayFingerprint -GatewayRoot $resolvedFixtureRoot -OAuthHelperPath $fixtureHelper -ExpectedFingerprint $fixtureFingerprint))

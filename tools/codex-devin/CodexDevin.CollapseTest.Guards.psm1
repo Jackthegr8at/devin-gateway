@@ -340,6 +340,13 @@ function Get-CodexDevinGatewayFingerprint {
     $lockfiles = @(@('bun.lock', 'bun.lockb') | ForEach-Object { Join-Path $root $_ } | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf })
     if ($lockfiles.Count -eq 0) { throw 'No supported Bun lockfile was found in the gateway root.' }
     foreach ($lockfile in $lockfiles) { $inputs += Get-Item -LiteralPath $lockfile }
+    # Runtime metadata and the local manifest processor are trusted activation inputs.
+    foreach ($selectionInput in @('CodexSelection.ts', 'CodexDevin.Selection.ps1', 'CodexDevin.Common.ps1', 'CodexDevin.CollapseTest.Guards.psm1', 'Enable-CodexDevin.ps1')) {
+        $inputPath = Join-Path (Join-Path $root 'tools\codex-devin') $selectionInput
+        if (Test-Path -LiteralPath $inputPath -PathType Leaf) { $inputs += Get-Item -LiteralPath $inputPath }
+    }
+    $templateDirectory = Join-Path $root 'tools\codex-devin\templates'
+    if (Test-Path -LiteralPath $templateDirectory -PathType Container) { $inputs += @(Get-ChildItem -LiteralPath $templateDirectory -Recurse -File -Filter '*.json') }
 
     $entries = foreach ($file in $inputs) {
         if ($file.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw "Fingerprint input is a reparse point: $($file.FullName)" }
@@ -347,8 +354,13 @@ function Get-CodexDevinGatewayFingerprint {
         $hash = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToUpperInvariant()
         [pscustomobject]@{ Path = $relativePath; Hash = $hash }
     }
-    $ordered = @($entries | Sort-Object -Property Path -CaseSensitive)
-    $manifest = ($ordered | ForEach-Object { $_.Path + "`0" + $_.Hash + "`n" }) -join ''
+    # Ordinal ordering is reproducible across Windows PowerShell/.NET Framework
+    # and PowerShell 7/.NET; culture-sensitive Sort-Object differs between them.
+    $entryHashes = [Collections.Generic.Dictionary[string, string]]::new([StringComparer]::Ordinal)
+    foreach ($entry in $entries) { $entryHashes.Add($entry.Path, $entry.Hash) }
+    [string[]]$paths = @($entryHashes.Keys)
+    [Array]::Sort($paths, [StringComparer]::Ordinal)
+    $manifest = ($paths | ForEach-Object { $_ + "`0" + $entryHashes[$_] + "`n" }) -join ''
     $sha = [Security.Cryptography.SHA256]::Create()
     try {
         $bytes = [Text.UTF8Encoding]::new($false).GetBytes($manifest)
@@ -379,7 +391,12 @@ function Test-CodexDevinCollapseGatewayReady {
     if ([string]$Health.status -cne 'ok') { return $false }
     $collapseProperty = $Health.PSObject.Properties['collapse_system_enabled']
     if ($null -eq $collapseProperty -or -not [bool]$collapseProperty.Value) { return $false }
-    return ($ModelIds -ccontains 'glm-5-3-flash-low' -and $ModelIds -ccontains 'swe-2-medium')
+    # Discovery is only readiness evidence. Exact role/profile/availability checks
+    # now occur against the saved schema-v2 manifest before any Codex file write.
+    $invalidIds = @($ModelIds | Where-Object { $_ -cnotmatch '^[a-zA-Z0-9][a-zA-Z0-9._:-]{0,199}$' })
+    $uniqueIds = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($modelId in $ModelIds) { if (-not $uniqueIds.Add($modelId)) { return $false } }
+    return ($invalidIds.Count -eq 0 -and $uniqueIds.Count -gt 0)
 }
 
 function Test-CodexDevinCollapseRestoreSafe {

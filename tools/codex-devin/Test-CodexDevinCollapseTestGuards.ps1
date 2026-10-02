@@ -184,11 +184,13 @@ $invalidRemoteRejected = $false
 try { $null = Resolve-CodexDevinGatewayTarget -GatewayUrl 'http://user@192.0.2.10:38643' } catch { $invalidRemoteRejected = $true }
 Assert-CollapseGuard 'gateway target rejects embedded URL credentials' $invalidRemoteRejected $true
 
-Assert-CollapseGuard 'ready check requires collapse flag and both models' (Test-CodexDevinCollapseGatewayReady -Health $healthEnabled -ModelIds $models) $true
+Assert-CollapseGuard 'ready check requires collapse flag and valid nonempty discovery' (Test-CodexDevinCollapseGatewayReady -Health $healthEnabled -ModelIds $models) $true
 Assert-CollapseGuard 'ready check waits safely when health has not started responding' (-not (Test-CodexDevinCollapseGatewayReady -Health $null -ModelIds @())) $true
 Assert-CollapseGuard 'ready check rejects a disabled collapse flag' (-not (Test-CodexDevinCollapseGatewayReady -Health $healthDisabled -ModelIds $models)) $true
-Assert-CollapseGuard 'ready check rejects missing GLM model' (-not (Test-CodexDevinCollapseGatewayReady -Health $healthEnabled -ModelIds @('swe-2-medium'))) $true
-Assert-CollapseGuard 'ready check rejects missing SWE-2 Medium model' (-not (Test-CodexDevinCollapseGatewayReady -Health $healthEnabled -ModelIds @('glm-5-3-flash-low'))) $true
+Assert-CollapseGuard 'discovery readiness is not tied to the old parent/worker pair; manifest validates saved roles separately' (Test-CodexDevinCollapseGatewayReady -Health $healthEnabled -ModelIds @('swe-2-medium')) $true
+Assert-CollapseGuard 'discovery readiness rejects malformed IDs' (-not (Test-CodexDevinCollapseGatewayReady -Health $healthEnabled -ModelIds @('invalid model'))) $true
+Assert-CollapseGuard 'discovery readiness rejects duplicate IDs' (-not (Test-CodexDevinCollapseGatewayReady -Health $healthEnabled -ModelIds @('swe-2-medium', 'swe-2-medium'))) $true
+Assert-CollapseGuard 'discovery readiness accepts a valid nonempty list before saved-role validation' (Test-CodexDevinCollapseGatewayReady -Health $healthEnabled -ModelIds @('glm-5-3-flash-low')) $true
 Assert-CollapseGuard 'restore is permitted only after switch attempt and Desktop exit' (Test-CodexDevinCollapseRestoreSafe -SwitchAttempted $true -ActiveDesktopProcessCount 0) $true
 Assert-CollapseGuard 'restore is blocked while Desktop remains active' (-not (Test-CodexDevinCollapseRestoreSafe -SwitchAttempted $true -ActiveDesktopProcessCount 1)) $true
 Assert-CollapseGuard 'restore is not attempted when switch never started' (-not (Test-CodexDevinCollapseRestoreSafe -SwitchAttempted $false -ActiveDesktopProcessCount 0)) $true

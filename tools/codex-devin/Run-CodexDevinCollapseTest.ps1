@@ -432,7 +432,7 @@ try {
 WORKER TEST READY
 
 In Codex Desktop:
-- select GLM-5.3 Flash Low
+- use the saved Default / parent model and thinking effort
 - create a NEW thread
 - send EXACTLY ONCE:
 
@@ -449,7 +449,7 @@ Then fully close Codex Desktop.
 LIVE COLLAPSE TEST READY
 
 In Codex Desktop:
-- select GLM-5.3 Flash Low
+- use the saved Default / parent model and thinking effort
 - create a NEW thread
 - send EXACTLY ONCE:
 

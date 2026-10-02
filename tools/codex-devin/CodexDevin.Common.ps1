@@ -306,10 +306,14 @@ function ConvertTo-CodexDevinTomlString([string]$Value) {
 }
 
 function Get-CodexDevinWorkerBytes {
+    param(
+        [Parameter(Mandatory)][string]$ModelId,
+        [Parameter(Mandatory)][string]$ReasoningEffort
+    )
     $newline = "`r`n"
     $lines = @(
-        'model = "swe-2-medium"'
-        'model_reasoning_effort = "medium"'
+        ('model = ' + (ConvertTo-CodexDevinTomlString -Value $ModelId))
+        ('model_reasoning_effort = ' + (ConvertTo-CodexDevinTomlString -Value $ReasoningEffort))
         ''
         'developer_instructions = """'
         'Explore the assigned repository and complete only the scoped subtask. For implementation work, make focused changes and run relevant tests. Do not change permissions, sandbox settings, or unrelated files. Report changes, checks, and blockers concisely to the parent.'
