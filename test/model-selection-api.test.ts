@@ -47,6 +47,28 @@ async function fixture(run: (context: { gateway: string; admin: string; director
 }
 const putHeaders = (etag: string) => ({ "content-type": "application/json", "x-devin-management": "1", "if-match": etag });
 
+test("manual test status is protected, exact-variant scoped, persistent and independent of selection", async () => fixture(async ({ gateway, admin }) => {
+  const initial = await (await fetch(`${admin}/admin/api/model-selection`)).json();
+  const get = await fetch(`${admin}/admin/api/model-test-status`); const etag = get.headers.get("etag")!;
+  expect(await get.json()).toEqual({ schemaVersion: 1, revision: 1, variants: {} });
+  const path = `${admin}/admin/api/model-test-status`;
+  const body = JSON.stringify({ modelId: "swe-2-medium", status: "tested" });
+  expect((await fetch(`${gateway}/admin/api/model-test-status`)).status).toBe(404);
+  expect((await fetch(path, { headers: { origin: "https://example.com" } })).status).toBe(403);
+  expect((await fetch(path, { method: "PUT", headers: { "content-type": "application/json" }, body })).status).toBe(403);
+  expect((await fetch(path, { method: "PUT", headers: putHeaders(etag), body: JSON.stringify({ modelId: "swe-2", status: "tested" }) })).status).toBe(400);
+  const marked = await fetch(path, { method: "PUT", headers: putHeaders(etag), body }); expect(marked.status).toBe(200);
+  const nextETag = marked.headers.get("etag")!; const status = await marked.json();
+  expect(status.variants["swe-2-medium"].manual.status).toBe("tested");
+  expect((await fetch(path, { method: "PUT", headers: putHeaders(etag), body })).status).toBe(412);
+  let models = await (await fetch(`${admin}/admin/api/models`)).json();
+  expect(models.models.find((m: any) => m.id === "swe-2-medium")).toMatchObject({ enabled: true, testStatus: { status: "tested", source: "manual" }, codex: { tested: true } });
+  expect((await fetch(path, { method: "PUT", headers: putHeaders(nextETag), body: JSON.stringify({ modelId: "swe-2-medium", status: "untested" }) })).status).toBe(200);
+  models = await (await fetch(`${admin}/admin/api/models`)).json();
+  expect(models.models.find((m: any) => m.id === "swe-2-medium")).toMatchObject({ enabled: true, testStatus: { status: "untested", source: "manual" }, codex: { exportEligible: true } });
+  expect(await (await fetch(`${admin}/admin/api/model-selection`)).json()).toEqual(initial);
+}));
+
 describe("admin discovery facts without changing legacy discovery", () => {
   test("protobuf facts have exact provenance while legacy discovery has only its old fields", async () => {
     const backend = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response(payload(["swe-2-medium", "unknown-low"])) });

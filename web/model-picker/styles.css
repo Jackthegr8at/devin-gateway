@@ -76,6 +76,8 @@ summary > span { min-width: 0; overflow-wrap: anywhere; }
 .model-list { flex: 1; min-height: 0; min-width: 0; border: 1px solid var(--border); border-radius: 6px; overflow-y: auto; overscroll-behavior: contain; background: var(--bg); }
 .model-row { display: flex; align-items: center; gap: 10px; padding: 8px 12px; min-height: 52px; border-bottom: 1px solid #333; cursor: pointer; }
 .model-row:last-child { border-bottom: none; }
+.test-status-action { font-size: 11px; padding: 4px 7px; min-height: 28px; }
+.model-toggle { display: flex; align-items: center; gap: 10px; flex: 1; min-width: 0; cursor: pointer; }
 .model-row:hover, .model-row:focus-within { background: #262626; }
 .model-identity { display: grid; gap: 3px; flex: 1 1 200px; min-width: 0; }
 .model-name { font-size: 12px; color: var(--text); overflow-wrap: anywhere; }

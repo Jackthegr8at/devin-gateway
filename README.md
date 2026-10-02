@@ -1,5 +1,7 @@
 # Devin Gateway
 
+Model-picker validation status is persistent and independent of selection. See [model validation status](tools/codex-devin/MODEL_TEST_STATUS.md) for automatic evidence, manual variant marking and management API details.
+
 English | [简体中文](README.zh-CN.md)
 
 Expose the Devin/Windsurf Cascade API through OpenAI- and Anthropic-compatible endpoints for Cherry Studio and other compatible clients.

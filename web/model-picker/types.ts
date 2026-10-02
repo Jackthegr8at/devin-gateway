@@ -8,6 +8,7 @@ export interface ModelSelection {
 }
 export interface ModelRole { modelId: string; effort: string }
 export interface AdminModel {
+  testStatus?: { status: "tested" | "untested"; source: "manual" | "automatic" | null; lastSuccessAt?: string; updatedAt?: string };
   family?: { id: string; displayName: string; effort: string; provenance: string; upstreamDefaultEffort: string | null };
   id: string;
   displayName: string;

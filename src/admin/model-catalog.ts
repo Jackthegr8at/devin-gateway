@@ -2,8 +2,10 @@ import type { DiscoveredModelMetadata } from "../devin.js";
 import { CODEX_PROFILE_VERSION, getCodexModelProfile, type CodexModelProfile } from "./codex-model-profiles.js";
 import { isModelId, ModelSelectionError, selectionETag, type ModelSelection } from "./model-selection.js";
 import { FAMILY_EFFORTS, inspectModelFamilies, type ModelFamily, type FamilyEffort } from "../model-families.js";
+import { effectiveTestStatus, type ModelTestStatus, type EffectiveTestStatus } from "./model-test-status.js";
 
 export interface AdminModel {
+  testStatus: EffectiveTestStatus;
   id: string; displayName: string; available: boolean; enabled: boolean;
   contextWindow: number | null; maxOutputTokens: number | null; supportsImages: boolean | null;
   upstreamThinking: boolean | null; metadataProvenance: DiscoveredModelMetadata["metadataProvenance"] | null;
@@ -13,7 +15,7 @@ export interface AdminModel {
 }
 
 /** Trusted upstream facts, not suffix heuristics or successful-inference approval records. */
-export function adminModels(discovered: readonly DiscoveredModelMetadata[], selection: ModelSelection): AdminModel[] {
+export function adminModels(discovered: readonly DiscoveredModelMetadata[], selection: ModelSelection, testStatuses: ModelTestStatus = { schemaVersion: 1, revision: 1, variants: {} }): AdminModel[] {
   const { families, excluded } = inspectModelFamilies(discovered);
   const ids = new Set<string>();
   const rows: AdminModel[] = discovered.map((model) => {
@@ -36,8 +38,9 @@ export function adminModels(discovered: readonly DiscoveredModelMetadata[], sele
       supportedReasoningEfforts: [{ effort, description: effort === "off" ? "Explicit non-thinking upstream route." : `Upstream ${effort} reasoning variant.` }],
       multiAgentVersion: "v1", shellType: "shell_command",
     } : null;
-    const tested = !!getCodexModelProfile(model.id);
-    return { id: model.id, displayName: model.name, available: true, enabled: selection.includeFutureModels || selection.enabledModels.includes(model.id),
+    const testStatus = effectiveTestStatus(testStatuses, model.id);
+    const tested = testStatus.status === "tested";
+    return { id: model.id, testStatus, displayName: model.name, available: true, enabled: selection.includeFutureModels || selection.enabledModels.includes(model.id),
       contextWindow, maxOutputTokens, supportsImages, upstreamThinking: model.upstreamThinking, metadataProvenance: {
         id: p.id, displayName: p.displayName, contextWindow: p.contextWindow, maxOutputTokens: p.maxOutputTokens,
         imageSupport: p.imageSupport, upstreamThinking: p.upstreamThinking, reasoning: p.reasoning,
@@ -45,9 +48,9 @@ export function adminModels(discovered: readonly DiscoveredModelMetadata[], sele
       codex: { status: reason ? "cannot_export" : tested ? "tested" : "untested", tested, exclusionReason: reason, profile, exportEligible: !!profile },
       ...(family ? { family: { id: family.id, displayName: family.displayName, effort: effort!, provenance: family.provenance, upstreamDefaultEffort: family.upstreamDefaultEffort } } : {}) };
   });
-  for (const id of selection.enabledModels) if (!ids.has(id)) rows.push({ id, displayName: id, available: false, enabled: true,
+  for (const id of selection.enabledModels) if (!ids.has(id)) rows.push({ id, testStatus: effectiveTestStatus(testStatuses, id), displayName: id, available: false, enabled: true,
     contextWindow: null, maxOutputTokens: null, supportsImages: null, upstreamThinking: null, metadataProvenance: null,
-    codex: { status: "cannot_export", tested: !!getCodexModelProfile(id), exclusionReason: "unavailable", profile: null, exportEligible: false } });
+    codex: { status: "cannot_export", tested: effectiveTestStatus(testStatuses, id).status === "tested", exclusionReason: "unavailable", profile: null, exportEligible: false } });
   return rows;
 }
 

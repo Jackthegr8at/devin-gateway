@@ -19,6 +19,8 @@ import { getCodexModelProfile } from "./admin/codex-model-profiles.js";
 import { ModelSelectionStore } from "./admin/model-selection-store.js";
 import { CODEX_SELECTION_PATH, createModelSelectionRoutes, managementRequestAllowed } from "./admin/routes.js";
 import { createAdminStaticHandler } from "./admin/static.js";
+import { ModelTestStatusStore, ModelValidationTracker, returnedToolSucceeded } from "./admin/model-test-status.js";
+import { createHash } from "node:crypto";
 import { listModels, type ModelInfo } from "./models.js";
 import {
   openaiToInternal,
@@ -625,6 +627,9 @@ async function handleResponses(req: Request, reqId: string, trace: ErrorTrace): 
     sensitiveValues: [token],
   });
   diagnostic?.recordRouting(body.model, body.reasoning?.effort, modelUid);
+  if (Array.isArray(body.input)) for (const item of body.input) {
+    if (item?.type === "function_call_output") diagnostic?.recordFunctionCallOutput(item.call_id, returnedToolSucceeded(item.output));
+  }
   if (diagnostic) recordResponsesHistoryCalls(diagnostic, messages);
   const responseId = `resp_${crypto.randomUUID().replace(/-/g, "").slice(0, 24)}`;
   const created = Math.floor(Date.now() / 1000);
@@ -662,6 +667,7 @@ async function handleResponses(req: Request, reqId: string, trace: ErrorTrace): 
     diagnostic?.recordUpstreamComplete();
 
     const toolCalls = finishResponsesToolCalls(toolCallState, declaredTools);
+    for (const call of toolCalls.values()) diagnostic?.recordEmittedToolCall(call.name, call.id);
     const output: Record<string, unknown>[] = [];
     if (text || toolCalls.size === 0) {
       output.push({
@@ -821,6 +827,7 @@ function streamOpenAIResponses(
         diagnostic?.recordUpstreamComplete();
         slog(`done — upstream chunks: ${upstreamChunks}`);
         const toolCalls = finishResponsesToolCalls(toolCallState, declaredTools);
+        for (const call of toolCalls.values()) diagnostic?.recordEmittedToolCall(call.name, call.id);
 
         if (reasoningStarted) {
           send("response.output_item.done", {
@@ -1271,8 +1278,12 @@ export async function startServer(options: ServerOptions = {}): Promise<ServerHa
   }
   const selectionStore = selectionEnabled ? new ModelSelectionStore(options.modelSelection?.directory) : undefined;
   if (selectionStore) await selectionStore.initialize();
+  const testStatusStore = selectionStore ? new ModelTestStatusStore(selectionStore.directory) : undefined;
+  if (testStatusStore) await testStatusStore.initialize();
+  const validationTracker = testStatusStore ? new ModelValidationTracker(testStatusStore) : undefined;
   const selectionRoutes = selectionStore ? createModelSelectionRoutes({
     store: selectionStore,
+    testStatusStore,
     discover: async (req) => {
       const token = extractToken(req);
       if (!token) throw new Error("No model discovery credential configured.");
@@ -1305,7 +1316,11 @@ export async function startServer(options: ServerOptions = {}): Promise<ServerHa
       const useSafeResponsesDiagnostic = path === "/v1/responses"
         && method === "POST"
         && responsesSafeDiagnosticsEnabled();
-      const diagnostic = useSafeResponsesDiagnostic ? new ResponsesSafeDiagnostic(id, startedAt) : undefined;
+      const credentialScope = validationTracker ? createHash("sha256").update(extractToken(req)).digest("hex") : "";
+      const diagnostic = path === "/v1/responses" && method === "POST" && (useSafeResponsesDiagnostic || validationTracker)
+        ? new ResponsesSafeDiagnostic(id, startedAt, undefined,
+          validationTracker ? (record, evidence) => validationTracker.observe(credentialScope, record, evidence) : undefined,
+          useSafeResponsesDiagnostic) : undefined;
 
       // CORS preflight
       if (method === "OPTIONS") {
@@ -1434,6 +1449,7 @@ export async function startServer(options: ServerOptions = {}): Promise<ServerHa
     shutdownStarted = true;
     await adminServer?.stop();
     await server.stop();
+    await validationTracker?.drain();
   };
 
   const handleShutdown = (): void => {

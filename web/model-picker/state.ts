@@ -1,7 +1,7 @@
 import type { AdminModel, ModelSelection } from "./types.js";
 import { modelMatchesCategories, type ModelCategory } from "./model-categories.js";
 export type { AdminModel, ModelSelection };
-export interface Snapshot { models: AdminModel[]; selection: ModelSelection; etag: string }
+export interface Snapshot { models: AdminModel[]; selection: ModelSelection; etag: string; testStatusETag?: string }
 export interface Filters { query: string; categories: ReadonlySet<ModelCategory>; enabledOnly: boolean }
 export const ROLES = ["default", "swe_worker"] as const;
 export function createDraft(selection: ModelSelection, models: readonly AdminModel[]): ModelSelection {

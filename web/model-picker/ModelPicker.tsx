@@ -100,6 +100,20 @@ export function ModelPicker({ api = defaultApi }: { api?: PickerApi }) {
     } finally { actionPending.current = false; if (mounted.current) setBusy(false); }
   }
 
+  async function markTestStatus(modelId: string, tested: "tested" | "untested") {
+    if (actionPending.current || busy || !snapshot?.testStatusETag || !api.markTestStatus) return;
+    actionPending.current = true; setBusy(true); setError("");
+    try {
+      const etag = await api.markTestStatus(modelId, tested, snapshot.testStatusETag);
+      if (!mounted.current) return;
+      setSnapshot(previous => previous ? { ...previous, testStatusETag: etag, models: previous.models.map(model => model.id === modelId
+        ? { ...model, testStatus: { ...model.testStatus, status: tested, source: "manual" }, codex: { ...model.codex, tested: tested === "tested", status: model.codex.exportEligible ? tested : "cannot_export" } } : model) } : previous);
+      setStatus(`Marked ${modelId} ${tested} manually. Selection draft is unchanged.`);
+    } catch (failure) {
+      if (mounted.current) setError(failure instanceof PickerApiError ? failure.message : "Test status could not be saved. Refresh the picker before retrying.");
+    } finally { actionPending.current = false; if (mounted.current) setBusy(false); }
+  }
+
   return <main ref={pickerRef} className="picker" aria-labelledby="picker-title" aria-busy={busy} onKeyDown={(event) => {
     if (event.key === "Escape" && !busy) {
       const details = event.currentTarget.querySelector("details[open]");
@@ -139,8 +153,8 @@ export function ModelPicker({ api = defaultApi }: { api?: PickerApi }) {
           <div className="model-list" role="group" aria-label="Devin model selection">
             {visible.length ? [...groups].map(([id, models]) => models[0].family ? <section key={id} className="model-family" aria-label={`${models[0].family.displayName} variants`}>
               <h3>{models[0].family.displayName}</h3><p className="help">Thinking variants · {models[0].family.provenance === "upstream_family_metadata" ? "Devin family metadata" : "Reviewed fallback"}{models[0].family.upstreamDefaultEffort ? ` · upstream default ${models[0].family.upstreamDefaultEffort}` : ""}</p>
-              {models.map((model) => <ModelRow key={model.id} model={{ ...model, displayName: `${model.family!.effort} · ${model.displayName}` }} enabled={enabled.has(model.id)} disabled={busy} onToggle={(on) => bulk([model.id], on)} />)}
-            </section> : <ModelRow key={id} model={models[0]} enabled={enabled.has(id)} disabled={busy} onToggle={(on) => bulk([id], on)} />)
+              {models.map((model) => <ModelRow key={model.id} model={{ ...model, displayName: `${model.family!.effort} · ${model.displayName}` }} enabled={enabled.has(model.id)} disabled={busy} onToggle={(on) => bulk([model.id], on)} onMark={snapshot.testStatusETag && api.markTestStatus ? status => void markTestStatus(model.id, status) : undefined} />)}
+            </section> : <ModelRow key={id} model={models[0]} enabled={enabled.has(id)} disabled={busy} onToggle={(on) => bulk([id], on)} onMark={snapshot.testStatusETag && api.markTestStatus ? status => void markTestStatus(id, status) : undefined} />)
               : <p className="empty">{enabledOnly ? "No enabled models match these filters. Turn off Enabled only to add models." : "No models match these filters. Try another search or category."}</p>}
           </div>
           <nav className="pagination" aria-label="Devin model pages"><span aria-live="polite">{matches.length ? `Showing ${page.start + 1}–${page.end} of ${matches.length}` : "0 matching models"}</span><div><button type="button" disabled={page.pageIndex === 0} onClick={() => setPageIndex(page.pageIndex - 1)}>Previous</button><span>Page {page.pageIndex + 1} of {page.pageCount}</span><button type="button" disabled={page.pageIndex === page.pageCount - 1} onClick={() => setPageIndex(page.pageIndex + 1)}>Next</button></div></nav>

@@ -3,10 +3,13 @@ import { adminModels, codexSelectionManifest, validateDiscoveredRoles } from "./
 import { inspectModelFamilies } from "../model-families.js";
 import { MAX_SELECTION_BYTES, ModelSelectionError, selectionETag, validateModelSelection } from "./model-selection.js";
 import type { ModelSelectionStore } from "./model-selection-store.js";
+import { isModelId } from "./model-selection.js";
+import { testStatusETag, type ModelTestStatusStore } from "./model-test-status.js";
 
 export const CODEX_SELECTION_PATH = "/gateway/api/codex-selection";
 export interface ModelSelectionRoutesOptions {
   store: ModelSelectionStore;
+  testStatusStore?: ModelTestStatusStore;
   discover: (request: Request) => Promise<DiscoveredModelMetadata[]>;
 }
 const json = (body: unknown, status = 200, etag?: string): Response => Response.json(body, {
@@ -60,6 +63,23 @@ export function createModelSelectionRoutes(options: ModelSelectionRoutesOptions)
     /** Called only on the separate management listener; strict Host/Origin checks precede this. */
     admin: (req: Request): Promise<Response> => guarded(async () => {
       const path = new URL(req.url).pathname;
+      if (path === "/admin/api/model-test-status" && options.testStatusStore) {
+        if (req.method === "GET") {
+          const status = await options.testStatusStore.read(); return json(status, 200, testStatusETag(status));
+        }
+        if (req.method === "PUT") {
+          if (req.headers.get("content-type")?.split(";")[0].trim().toLowerCase() !== "application/json") return error(415, "invalid_content_type", "Management writes require application/json.");
+          if (req.headers.get("x-devin-management") !== "1") return error(403, "management_header_required", "Management writes require the explicit management header.");
+          const expected = req.headers.get("if-match"); if (!expected) return error(428, "revision_required", "If-Match is required for status writes.");
+          const body = await selectionBody(req) as Record<string, unknown>;
+          if (!body || typeof body !== "object" || Array.isArray(body) || Object.keys(body).length !== 2
+            || !isModelId(body.modelId) || (body.status !== "tested" && body.status !== "untested")) return error(400, "invalid_status", "An exact concrete model ID and tested/untested status are required.");
+          const selection = await options.store.read(); const discovered = await discover(req);
+          if (!discovered.some(m => m.id === body.modelId) && !selection.enabledModels.includes(body.modelId)) return error(400, "unknown_model", "Only a discovered or saved concrete variant may be marked.");
+          const status = await options.testStatusStore.markManual(body.modelId, body.status, expected);
+          return json(status, 200, testStatusETag(status));
+        }
+      }
       if (req.method === "GET" && path === "/admin/api/model-selection") {
         const selection = await options.store.read();
         return json(selection, 200, selectionETag(selection));
@@ -67,7 +87,10 @@ export function createModelSelectionRoutes(options: ModelSelectionRoutesOptions)
       if (req.method === "GET" && path === "/admin/api/models") {
         const selection = await options.store.read();
         const discovered = await discover(req);
-        return json({ source: "remote", selectionRevision: selection.revision, models: adminModels(discovered, selection), families: inspectModelFamilies(discovered).families });
+        const testStatus = await options.testStatusStore?.read();
+        return json({ source: "remote", selectionRevision: selection.revision,
+          ...(testStatus ? { testStatusETag: testStatusETag(testStatus) } : {}),
+          models: adminModels(discovered, selection, testStatus), families: inspectModelFamilies(discovered).families });
       }
       if (req.method === "PUT" && path === "/admin/api/model-selection") {
         if (req.headers.get("content-type")?.split(";")[0].trim().toLowerCase() !== "application/json") {

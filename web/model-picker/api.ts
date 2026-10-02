@@ -2,7 +2,7 @@ import type { AdminModel, ModelSelection, Snapshot } from "./state.js";
 export class PickerApiError extends Error {
   constructor(public readonly status: number, message: string) { super(message); }
 }
-export interface PickerApi { load(): Promise<Snapshot>; save(selection: ModelSelection, etag: string): Promise<{ selection: ModelSelection; etag: string }> }
+export interface PickerApi { load(): Promise<Snapshot>; save(selection: ModelSelection, etag: string): Promise<{ selection: ModelSelection; etag: string }>; markTestStatus?(modelId: string, status: "tested" | "untested", etag: string): Promise<string> }
 const selectionPath = "/admin/api/model-selection";
 function parseSelection(value: any): ModelSelection {
   if (!value || value.schemaVersion !== 2 || !Number.isSafeInteger(value.revision) || value.revision < 1
@@ -17,7 +17,7 @@ export function createPickerApi(send: typeof fetch = fetch): PickerApi {
     try { response = await send(path, { ...init, mode: "same-origin", credentials: "omit", redirect: "error", cache: "no-store", signal: AbortSignal.timeout(15_000) }); }
     catch { throw new PickerApiError(0, "The management gateway could not be reached. Check your SSH tunnel, then retry."); }
     if (!response.ok) throw new PickerApiError(response.status, response.status === 412
-      ? "Another client changed the selection. Your draft was not saved. Reload the latest state before editing again."
+      ? path === "/admin/api/model-test-status" ? "Model test status changed. Refresh/reopen the picker before marking again; your selection draft is unchanged." : "Another client changed the selection. Your draft was not saved. Reload the latest state before editing again."
       : `The gateway rejected this request (HTTP ${response.status}). Your draft has not been discarded.`);
     try { return { body: await response.json(), response }; }
     catch { throw new PickerApiError(0, "The gateway returned invalid JSON. Reload after checking the gateway."); }
@@ -40,10 +40,21 @@ export function createPickerApi(send: typeof fetch = fetch): PickerApi {
         || typeof model.available !== "boolean" || !model.codex || !["tested", "untested", "cannot_export"].includes(model.codex.status))) {
         throw new PickerApiError(0, "The gateway returned invalid model metadata. Reload after checking the gateway.");
       }
-      return { ...selection, models };
+      const testStatusETag = catalog.body.testStatusETag;
+      if (models.some(model => model.testStatus && (!['tested', 'untested'].includes(model.testStatus.status)
+        || ![null, 'manual', 'automatic'].includes(model.testStatus.source)
+        || (model.testStatus.lastSuccessAt !== undefined && (typeof model.testStatus.lastSuccessAt !== 'string' || !Number.isFinite(Date.parse(model.testStatus.lastSuccessAt))))))) throw new PickerApiError(0, "Invalid model test status.");
+      if (testStatusETag !== undefined && (typeof testStatusETag !== "string" || !/^"model-test-status-v1-[1-9]\d*"$/.test(testStatusETag))) throw new PickerApiError(0, "Invalid model test-status revision.");
+      return { ...selection, models, testStatusETag };
     },
     async save(selection, etag) {
       return selectionResult(await json(selectionPath, { method: "PUT", headers: { "content-type": "application/json", "x-devin-management": "1", "if-match": etag }, body: JSON.stringify(selection) }));
+    },
+    async markTestStatus(modelId, status, etag) {
+      const result = await json("/admin/api/model-test-status", { method: "PUT", headers: { "content-type": "application/json", "x-devin-management": "1", "if-match": etag }, body: JSON.stringify({ modelId, status }) });
+      const next = result.response.headers.get("etag");
+      if (!next || !/^"model-test-status-v1-[1-9]\d*"$/.test(next)) throw new PickerApiError(0, "Invalid model test-status revision.");
+      return next;
     },
   };
 }

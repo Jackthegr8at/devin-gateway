@@ -65,6 +65,22 @@ function rows() { return [...document.querySelectorAll(".model-row")]; }
 async function checkModel(id: string) { await click(document.querySelector(`.model-row[data-model-id="${id}"] input`) as HTMLElement); }
 
 describe("rendered Cody-style model picker", () => {
+  test("exact family variant manual marking retains unsaved enabled/role drafts", async () => {
+    const marked: unknown[] = []; const selection = initialModelSelection();
+    const medium = { ...model("swe-2-medium"), codex: { ...model("swe-2-medium").codex, tested: false, status: "untested" as const }, testStatus: { status: "untested" as const, source: null } };
+    await mount({ load: async () => ({ models: [model("glm-5-3-flash-low"), medium, model("synthetic-extra")], selection, etag: '"model-selection-v2-1"', testStatusETag: '"model-test-status-v1-1"' }),
+      save: async () => { throw new Error("No selection save expected"); },
+      markTestStatus: async (...args) => { marked.push(args); return '"model-test-status-v1-2"'; } });
+    await checkModel("synthetic-extra");
+    const row = document.querySelector('[data-model-id="swe-2-medium"]')!;
+    await click(row.querySelector("button") as HTMLElement);
+    expect(marked).toEqual([["swe-2-medium", "tested", '"model-test-status-v1-1"']]);
+    expect(row.textContent).toContain("Tested"); expect(row.textContent).toContain("Mark untested");
+    expect(row.querySelector('[title="Marked tested manually"]')).not.toBeNull();
+    expect((document.querySelector('[data-model-id="synthetic-extra"] input') as HTMLInputElement).checked).toBe(true);
+    expect(document.querySelector(".picker-footer")!.textContent).toContain("Unsaved changes");
+    expect((row.querySelector('input') as HTMLInputElement).checked).toBe(true);
+  });
   test("structurally compatible untested High is a role option when enabled", async () => {
     const selection = initialModelSelection();
     const high = { ...model("swe-2-high"), family: { id: "swe-2", displayName: "SWE-2", effort: "high", provenance: "upstream_family_metadata", upstreamDefaultEffort: "high" },

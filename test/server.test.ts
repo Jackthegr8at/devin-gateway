@@ -285,7 +285,7 @@ interface Gateway {
   cleanup: () => Promise<void>;
 }
 
-async function startGateway(upstreamUrl: string, token?: string): Promise<Gateway> {
+async function startGateway(upstreamUrl: string, token?: string, modelSelection?: { directory: string }): Promise<Gateway> {
   const port = await reservePort();
   const before = new Map(SIGNALS.map((s) => [s, new Set(process.listeners(s))]));
   const handle = await startServer({
@@ -293,6 +293,7 @@ async function startGateway(upstreamUrl: string, token?: string): Promise<Gatewa
     port,
     token,
     baseUrl: upstreamUrl,
+    modelSelection,
   });
   const url = `http://${HOST}:${port}`;
   const cleanup = async () => {
@@ -1110,6 +1111,33 @@ describe("POST /v1/responses (non-streaming)", () => {
 });
 
 // ─── POST /v1/messages (Anthropic, non-streaming) ────────────────────────────
+
+test("runtime status persists only after an issued tool and its successful Responses continuation, streaming or JSON", async () => {
+  for (const stream of [false, true]) {
+    const directory = mkdtempSync(join(tmpdir(), "synthetic-status-roundtrip-"));
+    let calls = 0;
+    const upstream = startUpstream({ chatBody: () => ++calls === 1
+      ? framesBody([dataFrame({ toolCalls: [{ id: "synthetic-status-call", name: "exec_command", argumentsJson: '{"cmd":"synthetic"}' }], stopReason: 10 })])
+      : defaultChatBody() });
+    const { url, cleanup } = await startGateway(upstream.url.origin, "synthetic-key", { directory });
+    try {
+      const send = async (input: unknown) => {
+        const response = await fetch(`${url}/v1/responses`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({
+          model: "swe-2-medium", reasoning: { effort: "medium" }, stream, input,
+          tools: [{ type: "function", name: "exec_command", parameters: { type: "object" } }],
+        }) }); expect(response.status).toBe(200); await response.text();
+      };
+      await send("Synthetic private prompt");
+      expect(JSON.parse(readFileSync(join(directory, "model-test-status.json"), "utf8")).variants).toEqual({});
+      await send([{ type: "function_call", call_id: "synthetic-status-call", name: "exec_command", arguments: '{"cmd":"synthetic"}' },
+        { type: "function_call_output", call_id: "synthetic-status-call", output: "Exit code: 0\nOutput:\nSynthetic private tool output" }]);
+      await cleanup();
+      const bytes = readFileSync(join(directory, "model-test-status.json"), "utf8");
+      expect(JSON.parse(bytes).variants["swe-2-medium"].automatic).toMatchObject({ logicalModel: "swe-2-medium", effort: "medium" });
+      expect(bytes).not.toContain("private"); expect(bytes).not.toContain("synthetic-key");
+    } finally { await cleanup(); await upstream.stop(); rmSync(directory, { recursive: true, force: true }); }
+  }
+});
 
 describe("POST /v1/messages (Anthropic, non-streaming)", () => {
   test("returns a message with text content, end_turn stop_reason, and usage", async () => {

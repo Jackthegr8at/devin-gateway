@@ -1,5 +1,7 @@
 # Clean-fork Devin Desktop worker test
 
+The model picker now persists exact-variant Tested/Untested status separately from enabled models and roles. See [model validation status](MODEL_TEST_STATUS.md); manual marks save immediately and never change the activation manifest.
+
 This guarded, one-run workflow uses the gateway source in the current repository checkout. It never starts Codex Desktop or submits a model request; you perform both manually.
 
 ## Run the manual test

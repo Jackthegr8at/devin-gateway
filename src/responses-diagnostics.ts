@@ -60,6 +60,8 @@ export interface ResponsesSafeDiagnosticRecord {
   requested_effort?: string;
   resolved_model_id?: string;
   terminal_status?: string;
+  had_tool_call: boolean;
+  had_function_call_output: boolean;
   tool_count: number;
   tool_names: string[];
   tool_mappings: ToolMapping[];
@@ -99,6 +101,8 @@ export const RESPONSES_SAFE_DIAGNOSTIC_FIELDS = [
   "requested_effort",
   "resolved_model_id",
   "terminal_status",
+  "had_tool_call",
+  "had_function_call_output",
   "tool_count",
   "tool_names",
   "tool_mappings",
@@ -206,23 +210,32 @@ function connectClassification(code: string, message: string, details?: unknown)
   return "devin_connect_error";
 }
 
+export interface ToolValidationEvidence {
+  emitted: Array<{ id: string; name: string }>;
+  returned: Array<{ id: string; success: boolean }>;
+}
 export class ResponsesSafeDiagnostic {
   private readonly record: ResponsesSafeDiagnosticRecord;
   private readonly secrets = new Set<string>();
   private readonly startedAt: number;
   private finalized = false;
   private deferred = false;
+  private readonly evidence: ToolValidationEvidence = { emitted: [], returned: [] };
 
   constructor(
     requestId: string,
     startedAt = Date.now(),
     private readonly outputPath = resolve(process.env[RESPONSES_SAFE_DIAGNOSTICS_PATH_ENV]?.trim() || DEFAULT_LOG_PATH),
+    private readonly observer?: (record: ResponsesSafeDiagnosticRecord, evidence: ToolValidationEvidence) => void,
+    private readonly writeLog = true,
   ) {
     this.startedAt = startedAt;
     this.record = {
       timestamp: new Date(startedAt).toISOString(),
       request_id: identifier(requestId) ?? "invalid_request_id",
       tool_count: 0,
+      had_tool_call: false,
+      had_function_call_output: false,
       tool_names: [],
       tool_mappings: [],
       forwarded_tool_fingerprints: [],
@@ -308,10 +321,9 @@ export class ResponsesSafeDiagnostic {
   recordRouting(logicalModel: unknown, requestedEffort: unknown, resolvedModelId: unknown): void {
     const logical = safeTraceId(logicalModel, this.secrets);
     const concrete = safeTraceId(resolvedModelId, this.secrets);
-    if (!logical || !concrete || typeof requestedEffort !== "string" ||
-      !["none", "off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(requestedEffort)) return;
+    if (!logical || !concrete) return;
     this.record.logical_model = logical;
-    this.record.requested_effort = requestedEffort;
+    if (typeof requestedEffort === "string" && ["none", "off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(requestedEffort)) this.record.requested_effort = requestedEffort;
     this.record.resolved_model_id = concrete;
   }
 
@@ -362,6 +374,20 @@ export class ResponsesSafeDiagnostic {
     if (!this.record.tool_calls.some((call) => call.call_id === safeCallId)) {
       this.record.tool_calls.push({ name: safeName, call_id: safeCallId });
     }
+  }
+
+  /** Only completed, validated emitted calls qualify; history/deltas never do. */
+  recordEmittedToolCall(name: unknown, callId: unknown): void {
+    const id = safeTraceId(callId, this.secrets); const safeName = identifier(name);
+    if (!id || !safeName || this.evidence.emitted.length >= 16) return;
+    this.record.had_tool_call = true;
+    this.evidence.emitted.push({ id, name: safeName });
+  }
+  recordFunctionCallOutput(callId: unknown, success: boolean): void {
+    const id = safeTraceId(callId, this.secrets);
+    if (!id || this.evidence.returned.length >= 16) return;
+    this.record.had_function_call_output = true;
+    this.evidence.returned.push({ id, success });
   }
 
   recordConnectError(options: { code?: unknown; message?: unknown; details?: unknown; traceIds?: unknown[] }): void {
@@ -439,6 +465,8 @@ export class ResponsesSafeDiagnostic {
       RESPONSES_SAFE_DIAGNOSTIC_FIELDS.map((field) => [field, this.record[field]]),
     );
     const line = `${JSON.stringify(safeRecord)}\n`;
+    try { this.observer?.(this.record, this.evidence); } catch { /* Observability never changes inference. */ }
+    if (!this.writeLog) { this.secrets.clear(); return true; }
     try {
       mkdirSync(dirname(this.outputPath), { recursive: true });
       appendFileSync(this.outputPath, line, { encoding: "utf8" });
