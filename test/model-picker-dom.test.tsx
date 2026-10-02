@@ -64,6 +64,65 @@ function rows() { return [...document.querySelectorAll(".model-row")]; }
 async function checkModel(id: string) { await click(document.querySelector(`.model-row[data-model-id="${id}"] input`) as HTMLElement); }
 
 describe("rendered Cody-style model picker", () => {
+  test("category chevron, click-away and keyboard dismissal preserve the multi-select draft", async () => {
+    await mount(mockApi().api);
+    const details = document.querySelector("details")!;
+    const summary = details.querySelector("summary")!;
+    expect(summary.querySelector('svg[aria-hidden="true"]')).not.toBeNull();
+    await click(summary);
+    expect(details.open).toBe(true);
+    const inputs = details.querySelectorAll("input");
+    await click(inputs[0]); await click(inputs[1]);
+    expect(details.open).toBe(true);
+    expect((inputs[0] as HTMLInputElement).checked).toBe(true);
+    expect((inputs[1] as HTMLInputElement).checked).toBe(true);
+    await act(() => document.querySelector("h1")!.dispatchEvent(new dom.window.Event("pointerdown", { bubbles: true })));
+    expect(details.open).toBe(false);
+    await click(summary);
+    await act(() => inputs[0].dispatchEvent(new dom.window.KeyboardEvent("keydown", { key: "Escape", bubbles: true })));
+    expect(details.open).toBe(false);
+    expect(document.activeElement).toBe(summary);
+    expect((inputs[0] as HTMLInputElement).checked).toBe(true);
+    await click(summary);
+    await act(() => button("Cancel").focus());
+    expect(details.open).toBe(false); // Keyboard focus outside also dismisses without trapping it.
+  });
+  test("unsorted family rows display only discovered efforts in canonical order", async () => {
+    const base = mockApi(); const load = base.api.load;
+    base.api.load = async () => {
+      const snapshot = await load();
+      snapshot.models.unshift(...["max", "xhigh", "high", "low"].map((effort) => ({
+        ...model(`swe-order-${effort}`), family: { id: "swe-2", displayName: "SWE-2", effort, provenance: "upstream_family_metadata", upstreamDefaultEffort: "high" },
+      })));
+      return snapshot;
+    };
+    await mount(base.api);
+    const group = document.querySelector('.model-family[aria-label="SWE-2 variants"]')!;
+    expect([...group.querySelectorAll(".model-row")].map((row) => row.getAttribute("data-model-id"))).toEqual([
+      "swe-order-low", "swe-2-medium", "swe-order-high", "swe-order-xhigh", "swe-order-max",
+    ]);
+    expect(group.textContent).not.toContain("off ·");
+    expect(group.textContent).not.toContain("minimal ·");
+  });
+  test("role thinking choices use canonical ordering without adding unreviewed levels", async () => {
+    const base = mockApi(); const load = base.api.load;
+    base.api.load = async () => {
+      const snapshot = await load();
+      // Synthetic shared family exercises ordering; the exact two reviewed profiles are unchanged.
+      snapshot.models = [snapshot.models[1], snapshot.models[0]].map((row) => ({ ...row,
+        family: { id: "synthetic-shared-family", displayName: "Synthetic family", effort: row.codex.profile!.defaultReasoningEffort,
+          provenance: "upstream_family_metadata", upstreamDefaultEffort: null },
+      }));
+      snapshot.selection.roles = { default: { modelId: "synthetic-shared-family", effort: "low" },
+        swe_worker: { modelId: "synthetic-shared-family", effort: "medium" } };
+      return snapshot;
+    };
+    await mount(base.api);
+    for (const label of ["Default / parent thinking", "swe_worker thinking"]) {
+      const select = document.querySelector(`select[aria-label="${label}"]`) as HTMLSelectElement;
+      expect([...select.options].map((option) => option.value)).toEqual(["low", "medium"]);
+    }
+  });
   test("family variants group once; only enabled reviewed Medium appears in worker effort choices", async () => {
     const base = mockApi();
     const load = base.api.load;

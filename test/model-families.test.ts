@@ -44,6 +44,20 @@ describe("authoritative family metadata and deterministic effort routing", () =>
     for (const family of families) expect(family.supportsOff).toBe(false);
     expect(getCodexModelProfile("opaque-b")).toBeUndefined();
   });
+  test("GLM Flash Low's authoritative 1M lane stays separate from a standard lane without changing the concrete role", () => {
+    const low = familyFixture("glm-5-3-flash-low", "GLM-5.3 Flash", "low", { context1m: true });
+    low.contextWindow = 1_000_000;
+    const models = [familyFixture("synthetic-standard-glm-low", "GLM-5.3 Flash", "low"),
+      low, familyFixture("glm-5-3-flash-high", "GLM-5.3 Flash", "high", { context1m: true })];
+    const families = projectModelFamilies(models);
+    expect(families.map((family) => family.id)).toEqual(["glm-5-3-flash", "glm-5-3-flash-1m"]);
+    expect(families[0].variants.low).toBe("synthetic-standard-glm-low");
+    expect(families[1]).toMatchObject({ lanes: { context1m: true }, variants: { low: "glm-5-3-flash-low", high: "glm-5-3-flash-high" } });
+    const selection = initialModelSelection();
+    const rows = adminModels(models, selection);
+    expect(rows.find((row) => row.id === "glm-5-3-flash-low")?.family?.displayName).toBe("GLM-5.3 Flash 1M");
+    expect(selection.roles.default).toEqual({ modelId: "glm-5-3-flash-low", effort: "low" });
+  });
   test("Off requires a genuine route, generic thinking never invents efforts", () => {
     const models = [familyFixture("plain", "Optional Thinking", "off"), familyFixture("think", "Optional Thinking", "medium"), familyFixture("unknown-medium")];
     const family = projectModelFamilies(models)[0];

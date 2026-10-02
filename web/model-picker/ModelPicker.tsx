@@ -5,6 +5,7 @@ import { MODEL_CATEGORY_OPTIONS, modelCategoryBucket, type ModelCategory } from 
 import { getModelPageWindow } from "./model-pagination.js";
 import { ModelRow } from "./ModelRow.js";
 import { RoleAssignments } from "./RoleAssignments.js";
+import { orderFamilyVariants } from "./effort-order.js";
 import { allDiscoveredEnabled, bulkSelection, createDraft, draftErrors, draftsEqual, matchingModels, type ModelSelection, type Snapshot } from "./state.js";
 
 const defaultApi = createPickerApi();
@@ -20,6 +21,7 @@ export function ModelPicker({ api = defaultApi }: { api?: PickerApi }) {
   const [conflict, setConflict] = useState(false);
   const [status, setStatus] = useState("Loading Devin models…");
   const searchRef = useRef<HTMLInputElement>(null);
+  const categoriesRef = useRef<HTMLDetailsElement>(null);
   const mounted = useRef(true);
   const actionPending = useRef(false);
   const baseline = snapshot ? createDraft(snapshot.selection, snapshot.models) : null;
@@ -41,12 +43,24 @@ export function ModelPicker({ api = defaultApi }: { api?: PickerApi }) {
   }
   useEffect(() => { mounted.current = true; void load(); return () => { mounted.current = false; }; }, [api]);
   useEffect(() => {
+    const closeCategories = (event: Event) => {
+      const details = categoriesRef.current;
+      if (details?.open && event.target instanceof Node && !details.contains(event.target)) details.open = false;
+    };
+    document.addEventListener("pointerdown", closeCategories);
+    document.addEventListener("focusin", closeCategories);
+    return () => {
+      document.removeEventListener("pointerdown", closeCategories);
+      document.removeEventListener("focusin", closeCategories);
+    };
+  }, []);
+  useEffect(() => {
     if (!dirty) return;
     const warn = (event: BeforeUnloadEvent) => { event.preventDefault(); event.returnValue = ""; };
     window.addEventListener("beforeunload", warn);
     return () => window.removeEventListener("beforeunload", warn);
   }, [dirty]);
-  const matches = useMemo(() => snapshot && draft ? matchingModels(snapshot.models, draft, { query, categories, enabledOnly }) : [], [snapshot, draft, query, categories, enabledOnly]);
+  const matches = useMemo(() => snapshot && draft ? orderFamilyVariants(matchingModels(snapshot.models, draft, { query, categories, enabledOnly })) : [], [snapshot, draft, query, categories, enabledOnly]);
   const page = getModelPageWindow(matches.length, pageIndex);
   const visible = matches.slice(page.start, page.end);
   const groups = new Map<string, typeof visible>();
@@ -99,15 +113,15 @@ export function ModelPicker({ api = defaultApi }: { api?: PickerApi }) {
       {snapshot && draft ? <>
         <fieldset className="edit-controls" disabled={busy}>
           <label className="future-control"><span><span className="control-title">Include future Devin models</span><span className="help" id="future-help">{allSelected
-            ? "All discovered models are selected. Turn this on to enable future discoveries; new models never receive roles automatically."
-            : "Enable all discovered models first. Partial selections save exact IDs; disabling any model turns future inclusion off."}</span></span>
+            ? "Enable future discoveries. New models never receive roles automatically."
+            : "Partial selections save exact IDs. Enable all for future models; disabling a model turns future inclusion off."}</span></span>
             <input type="checkbox" aria-describedby="future-help" checked={draft.includeFutureModels} disabled={!allSelected || busy} onChange={(event) => setDraft({ ...draft, includeFutureModels: event.target.checked })} />
           </label>
           <RoleAssignments models={snapshot.models} draft={draft} disabled={busy} onChange={(role, id) => setDraft((previous) => previous ? { ...previous, roles: { ...previous.roles, [role]: id } } : previous)} />
           {errors.length ? <div className="validation" role="alert" id="draft-errors">{errors.map((message) => <p key={message}>{message}</p>)}</div> : null}
           <div className="filters">
             <label className="search"><span className="sr-only">Search Devin models</span><input ref={searchRef} type="search" placeholder={`Search ${discovered.length} models…`} value={query} onChange={(event) => { setQuery(event.target.value); setPageIndex(0); }} /></label>
-            <details className="categories"><summary> {categories.size ? MODEL_CATEGORY_OPTIONS.filter((category) => categories.has(category)).join(" + ") : "All categories"} <span aria-hidden="true">⌄</span></summary>
+            <details ref={categoriesRef} className="categories"><summary><span>{categories.size ? MODEL_CATEGORY_OPTIONS.filter((category) => categories.has(category)).join(" + ") : "All categories"}</span><svg className="category-chevron" viewBox="0 0 16 16" width="16" height="16" aria-hidden="true" focusable="false"><path d="m4 6 4 4 4-4" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" /></svg></summary>
               <div className="category-menu" role="group" aria-label="Model categories"><span className="help">Select any categories</span>{MODEL_CATEGORY_OPTIONS.map((category) => <label key={category}><input type="checkbox" checked={categories.has(category)} onChange={() => { setCategories((previous) => { const next = new Set(previous); if (next.has(category)) next.delete(category); else next.add(category); return next; }); setPageIndex(0); }} /><span>{category}</span><small>{snapshot.models.filter((model) => modelCategoryBucket(model) === category).length}</small></label>)}</div>
             </details>
             <label className="enabled-only"><input type="checkbox" checked={enabledOnly} onChange={(event) => { setEnabledOnly(event.target.checked); setPageIndex(0); }} />Enabled only</label>

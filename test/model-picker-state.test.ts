@@ -5,6 +5,7 @@ import { allDiscoveredEnabled, bulkSelection, createDraft, draftErrors, draftsEq
 import { modelCategories, modelCategoryBucket } from "../web/model-picker/model-categories.ts";
 import { getModelPageWindow } from "../web/model-picker/model-pagination.ts";
 import { formatModelDisplayName } from "../web/model-picker/model-display.ts";
+import { compareEfforts, EFFORT_ORDER, orderFamilyVariants } from "../web/model-picker/effort-order.ts";
 
 export function fixtureModel(id: string, displayName = id, available = true): AdminModel {
   const profile = getCodexModelProfile(id) ?? null;
@@ -19,6 +20,18 @@ export function fixtureModels() {
     fixtureModel("saved-removed", "Saved unavailable model", false)];
 }
 describe("Cody-adapted display helpers", () => {
+  test("one display ordering preserves missing efforts and input immutability", () => {
+    expect(EFFORT_ORDER).toEqual(["low", "medium", "high", "xhigh", "max"]);
+    expect(["max", "high", "low"].sort(compareEfforts)).toEqual(["low", "high", "max"]);
+    expect(["medium"].sort(compareEfforts)).toEqual(["medium"]);
+    expect(["high", "off"].sort(compareEfforts)).toEqual(["off", "high"]);
+    const models = [
+      { id: "high-member", family: { id: "family", effort: "high" } },
+      { id: "standalone" }, { id: "low-member", family: { id: "family", effort: "low" } },
+    ];
+    expect(orderFamilyVariants(models).map((model) => model.id)).toEqual(["low-member", "high-member", "standalone"]);
+    expect(models.map((model) => model.id)).toEqual(["high-member", "standalone", "low-member"]);
+  });
   test("categories are exactly display buckets; overlap belongs to Fusion", () => {
     expect(modelCategories({ id: "swe-2-fusion", displayName: "SWE Fusion" })).toEqual(["SWE", "Fusion"]);
     expect(modelCategoryBucket({ id: "swe-2-fusion", displayName: "SWE Fusion" })).toBe("Fusion");
