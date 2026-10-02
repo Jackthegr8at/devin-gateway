@@ -630,6 +630,7 @@ async function handleResponses(req: Request, reqId: string, trace: ErrorTrace): 
     collapsedUserPayload: collapse.collapsedUserPayload,
     sensitiveValues: [token],
   });
+  diagnostic?.recordRouting(body.model, body.reasoning?.effort, modelUid);
   if (diagnostic) recordResponsesHistoryCalls(diagnostic, messages);
   const responseId = `resp_${crypto.randomUUID().replace(/-/g, "").slice(0, 24)}`;
   const created = Math.floor(Date.now() / 1000);

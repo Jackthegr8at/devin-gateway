@@ -49,12 +49,17 @@ function Get-CodexDevinDesktopRuntime {
 
 function Get-CodexDevinPreparedSelection {
     param([Parameter(Mandatory)][string]$GatewayAuthority)
-    Write-Host 'Checking gateway health and fetching saved Codex selection (three-second deadlines)...'
+    Write-Host 'Checking gateway health (3 seconds) and saved selection/discovery (15 seconds)...'
     $health = Get-CodexDevinGatewayHealth -Uri ($GatewayAuthority + '/health')
     if (-not $health.Healthy) { throw 'Gateway health failed before selection preparation; no Codex files were changed.' }
     try {
-        $response = Invoke-WebRequest -UseBasicParsing -Uri ($GatewayAuthority + '/gateway/api/codex-selection') -TimeoutSec 3 -MaximumRedirection 0 -ErrorAction Stop
-    } catch { throw 'Saved Codex selection could not be fetched within the bounded request; no defaults were substituted.' }
+        $response = Invoke-WebRequest -UseBasicParsing -Uri ($GatewayAuthority + '/gateway/api/codex-selection') -TimeoutSec 15 -MaximumRedirection 0 -ErrorAction Stop
+    } catch {
+        $status = $null
+        if ($_.Exception.PSObject.Properties['Response']) { try { $status = [int]$_.Exception.Response.StatusCode } catch {} }
+        if ($status) { throw ('Saved Codex selection failed with HTTP ' + $status + '. Verify model selection is enabled on the selected GatewayUrl; no local fallback was used.') }
+        throw 'Saved Codex selection transport failed or exceeded 15 seconds on the selected GatewayUrl; no defaults were substituted.'
+    }
     if ($response.StatusCode -ne 200 -or $response.RawContentLength -gt 262144 -or [Text.Encoding]::UTF8.GetByteCount([string]$response.Content) -gt 262144) {
         throw 'Saved Codex selection response is invalid or exceeds the size limit.'
     }
@@ -77,5 +82,11 @@ function Get-CodexDevinPreparedSelection {
     }
     $hash = Get-CodexDevinBytesSha256 -Bytes ([Text.UTF8Encoding]::new($false).GetBytes($prepared.catalogText))
     if ($hash -cne $prepared.catalogSha256) { throw 'Generated catalog bytes do not match their recorded hash.' }
+    Write-Host ('Fetched selection revision: ' + $prepared.revision)
+    $catalogSummary = ConvertFrom-Json -InputObject $prepared.catalogText -ErrorAction Stop
+    Write-Host 'Generated logical models / efforts:'
+    foreach ($model in $catalogSummary.models) {
+        Write-Host ('  ' + $model.slug + ': ' + (($model.supported_reasoning_levels | ForEach-Object { $_.effort }) -join ', '))
+    }
     return $prepared
 }

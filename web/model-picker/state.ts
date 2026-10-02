@@ -28,7 +28,7 @@ export function bulkSelection(draft: ModelSelection, ids: readonly string[], ena
   return { ...draft, enabledModels: [...next], includeFutureModels: enabled ? draft.includeFutureModels : false };
 }
 export function roleEligible(model: AdminModel, draft: ModelSelection): boolean {
-  return draft.enabledModels.includes(model.id) && model.available && model.codex.status === "validated"
+  return draft.enabledModels.includes(model.id) && model.available
     && model.codex.profile !== null && model.codex.exportEligible;
 }
 export function draftErrors(draft: ModelSelection, models: readonly AdminModel[]): string[] {
@@ -37,7 +37,7 @@ export function draftErrors(draft: ModelSelection, models: readonly AdminModel[]
     const assignment = draft.roles[role];
     const model = models.find((entry) => (entry.family?.id === assignment.modelId || entry.id === assignment.modelId)
       && (entry.family?.effort ?? entry.codex.profile?.defaultReasoningEffort) === assignment.effort);
-    if (!model || !roleEligible(model, draft)) errors.push(`${role === "default" ? "Default / parent" : role}: re-enable its model or assign an enabled, available reviewed model before saving.`);
+    if (!model || !roleEligible(model, draft)) errors.push(`${role === "default" ? "Default / parent" : role}: re-enable its model or assign an enabled, available structurally compatible model before saving.`);
   }
   if (draft.includeFutureModels && !allDiscoveredEnabled(draft, models)) errors.push("Enable every discovered model before including future models.");
   return errors;

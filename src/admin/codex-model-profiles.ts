@@ -1,9 +1,9 @@
-/** Reviewed exact IDs. Discovery labels and suffixes never create profiles. */
+/** Historical tested variants, informational only. Never a catalog eligibility gate. */
 export const CODEX_PROFILE_VERSION = 1;
 export interface CodexModelProfile {
   modelId: string;
-  defaultReasoningEffort: "low" | "medium";
-  supportedReasoningEfforts: readonly { effort: "low" | "medium"; description: string }[];
+  defaultReasoningEffort: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+  supportedReasoningEfforts: readonly { effort: CodexModelProfile["defaultReasoningEffort"]; description: string }[];
   multiAgentVersion: "v1";
   shellType: "shell_command";
 }

@@ -141,12 +141,12 @@ describe("discovery representation and Codex manifest", () => {
   test("unknown thinking models gain no efforts; explicit profiles pass through unchanged", () => {
     const state = initialModelSelection(); state.enabledModels.push("unknown-high");
     const rows = adminModels(state.enabledModels.map(discovered), state);
-    expect(rows.at(-1)?.codex).toEqual({ status: "unvalidated", profile: null, exportEligible: false });
+    expect(rows.at(-1)?.codex).toEqual({ status: "cannot_export", tested: false, exclusionReason: "missing_effort_metadata", profile: null, exportEligible: false });
     const manifest = codexSelectionManifest(state, rows);
     expect(manifest.models.map((model) => [model.id, model.defaultReasoningEffort, model.supportedReasoningEfforts.map((r) => r.effort)])).toEqual([
       ["glm-5-3-flash-low", "low", ["low"]], ["swe-2", "medium", ["medium"]],
     ]);
-    expect(manifest.excludedModels).toEqual([{ id: "unknown-high", reason: "unvalidated_profile" }]);
+    expect(manifest.excludedModels).toEqual([{ id: "unknown-high", reason: "missing_effort_metadata" }]);
     expect(manifest.roles).toEqual({ default: { modelId: "glm-5-3-flash-low", reasoningEffort: "low", concreteModelId: "glm-5-3-flash-low" }, swe_worker: { modelId: "swe-2", reasoningEffort: "medium", concreteModelId: "swe-2-medium" } });
   });
   test("fallback limits and missing upstream thinking remain distinguishable", () => {

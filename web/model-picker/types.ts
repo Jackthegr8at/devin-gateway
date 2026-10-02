@@ -19,12 +19,14 @@ export interface AdminModel {
   upstreamThinking: boolean | null;
   metadataProvenance: Record<string, string> | null;
   codex: {
-    status: "validated" | "unvalidated";
+    status: "tested" | "untested" | "cannot_export";
+    tested?: boolean;
+    exclusionReason?: string | null;
     exportEligible: boolean;
     profile: {
       modelId: string;
-      defaultReasoningEffort: "low" | "medium";
-      supportedReasoningEfforts: readonly { effort: "low" | "medium"; description: string }[];
+      defaultReasoningEffort: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+      supportedReasoningEfforts: readonly { effort: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"; description: string }[];
       multiAgentVersion: "v1";
       shellType: "shell_command";
     } | null;

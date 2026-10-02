@@ -1,5 +1,5 @@
 import { getCodexModelProfile } from "./codex-model-profiles.js";
-import { REVIEWED_FAMILY_ROUTES, type FamilyEffort } from "../model-families.js";
+import { FAMILY_EFFORTS, type FamilyEffort } from "../model-families.js";
 
 export const MAX_SELECTION_BYTES = 256 * 1024;
 export interface ModelSelection {
@@ -10,10 +10,6 @@ export interface ModelSelection {
   includeFutureModels: boolean;
 }
 export interface ModelRole { modelId: string; effort: FamilyEffort }
-/** Static reviewed role resolution is used only for persisted validation/migration. */
-export function reviewedRoleConcreteId(role: ModelRole): string {
-  return REVIEWED_FAMILY_ROUTES[role.modelId]?.[role.effort] ?? role.modelId;
-}
 export class ModelSelectionError extends Error {
   constructor(public readonly code: "invalid_selection" | "selection_unavailable" | "revision_conflict" | "discovery_unavailable" | "role_unavailable", message: string) { super(message); }
 }
@@ -45,9 +41,8 @@ export function validateModelSelection(value: unknown): ModelSelection {
     const value = object(roles[role]);
     keys(value, ["modelId", "effort"]);
     if (!isModelId(value.modelId) || typeof value.effort !== "string") invalid();
-    const id = reviewedRoleConcreteId(value as unknown as ModelRole);
-    const profile = getCodexModelProfile(id);
-    if (!enabledModels.includes(id) || !profile || !profile.supportedReasoningEfforts.some((row) => row.effort === value.effort)) invalid();
+    if (!FAMILY_EFFORTS.includes(value.effort as FamilyEffort) || !enabledModels.length) invalid();
+    // Logical membership requires current authoritative discovery; save/export validates it.
   }
   const selection: ModelSelection = {
     schemaVersion: 2, revision: input.revision as number, enabledModels: [...enabledModels],
@@ -74,6 +69,7 @@ export function migrateModelSelection(value: unknown): ModelSelection {
   const migratedRoles = Object.fromEntries((["default", "swe_worker"] as const).map((role) => {
     const id = roles[role];
     if (!isModelId(id)) invalid();
+    if (!Array.isArray(input.enabledModels) || !input.enabledModels.includes(id)) invalid();
     const profile = getCodexModelProfile(id);
     if (!profile) invalid();
     return [role, { modelId: id === "swe-2-medium" ? "swe-2" : id, effort: profile.defaultReasoningEffort }];

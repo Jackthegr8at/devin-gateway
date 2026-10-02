@@ -81,15 +81,16 @@ describe("authoritative family metadata and deterministic effort routing", () =>
   test("reviewed fallback only groups exact SWE IDs and does not infer Sol", () => {
     expect(projectModelFamilies([familyFixture("swe-2-medium"), familyFixture("swe-2-max"), familyFixture("gpt-6-1-sol-high")])[0].variants).toEqual({ medium: "swe-2-medium", max: "swe-2-max" });
   });
-  test("exports only reviewed enabled routes; unvalidated siblings never become role candidates", () => {
+  test("exports enabled structural routes regardless of tested history", () => {
     const models = [familyFixture("glm-5-3-flash-low"), familyFixture("swe-2-medium", "SWE-2", "medium"), familyFixture("swe-2-high", "SWE-2", "high", {}, true), familyFixture("swe-2-max", "SWE-2", "max")];
     const selection = initialModelSelection(); selection.enabledModels.push("swe-2-high", "swe-2-max");
     validateDiscoveredRoles(selection, models);
     const manifest = codexSelectionManifest(selection, adminModels(models, selection));
-    expect(manifest.models[1]).toMatchObject({ id: "swe-2", defaultReasoningEffort: "medium", routing: { medium: "swe-2-medium" }, upstreamDefaultEffort: "high" });
-    expect(manifest.models[1].supportedReasoningEfforts.map((row) => row.effort)).toEqual(["medium"]);
-    expect(manifest.excludedModels.map((row) => row.id)).toEqual(["swe-2-high", "swe-2-max"]);
-    expect(() => validateModelSelection({ ...selection, roles: { ...selection.roles, swe_worker: { modelId: "swe-2", effort: "high" } } })).toThrow();
+    expect(manifest.models[1]).toMatchObject({ id: "swe-2", defaultReasoningEffort: "medium", routing: { medium: "swe-2-medium", high: "swe-2-high", max: "swe-2-max" }, upstreamDefaultEffort: "high" });
+    expect(manifest.models[1].supportedReasoningEfforts.map((row) => row.effort)).toEqual(["medium", "high", "max"]);
+    expect(manifest.excludedModels).toEqual([]);
+    const high = validateModelSelection({ ...selection, roles: { ...selection.roles, swe_worker: { modelId: "swe-2", effort: "high" } } });
+    expect(() => validateDiscoveredRoles(high, models)).not.toThrow();
     expect(() => validateDiscoveredRoles(selection, [models[0], models[2]])).toThrow("unavailable");
   });
 });

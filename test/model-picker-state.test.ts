@@ -12,7 +12,7 @@ export function fixtureModel(id: string, displayName = id, available = true): Ad
   return { id, displayName, available, enabled: !!profile, ...(id === "swe-2-medium" ? { family: { id: "swe-2", displayName: "SWE-2", effort: "medium", provenance: "reviewed_fallback", upstreamDefaultEffort: null } } : {}), contextWindow: available ? 200_000 : null,
     maxOutputTokens: available ? 64_000 : null, supportsImages: available ? false : null, upstreamThinking: available ? true : null,
     metadataProvenance: available ? { id: "upstream" } : null,
-    codex: { status: profile ? "validated" : "unvalidated", profile, exportEligible: available && !!profile } };
+    codex: { status: profile ? "tested" : "cannot_export", profile, exportEligible: available && !!profile } };
 }
 export function fixtureModels() {
   return [fixtureModel("glm-5-3-flash-low", "GLM-5.3 Flash Low"), fixtureModel("swe-2-medium", "SWE-2 Medium"),

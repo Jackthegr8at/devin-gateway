@@ -106,6 +106,30 @@ export function resolveFamilyModelId(modelId: string, effort: unknown, families:
     if (Object.hasOwn(REVIEWED_FAMILY_ROUTES, modelId)) throw new FamilyRoutingError("Logical model family is unavailable; no model was substituted.");
     return modelId; // Existing concrete-ID behavior, including unknown direct IDs, is unchanged.
   }
+  if (effort === "none" && family.variants.off) effort = "off"; // Codex's None represents only a genuine upstream Off route.
   if (typeof effort !== "string" || !Object.hasOwn(family.variants, effort)) throw new FamilyRoutingError("An explicit supported reasoning effort is required for this logical model family.");
   return family.variants[effort as FamilyEffort]!;
+}
+
+/** Management projection isolates bad families instead of approving a first-wins route. */
+export function inspectModelFamilies(models: readonly DiscoveredModelMetadata[]) {
+  const groups = new Map<string, DiscoveredModelMetadata[]>();
+  const excluded = new Map<string, string>();
+  for (const model of models) {
+    try {
+      const value = descriptor(model);
+      if (value) groups.set(value.family.id, [...(groups.get(value.family.id) ?? []), model]);
+      else if (model.modelFamilyMetadata) excluded.set(model.id, "unsupported_family_metadata");
+    } catch { excluded.set(model.id, "ambiguous_family_metadata"); }
+  }
+  const families: ModelFamily[] = [];
+  for (const [id, group] of groups) {
+    try {
+      const family = projectModelFamilies(group)[0];
+      if (!family || models.some((model) => model.id === id && !Object.values(family.variants).includes(model.id))) throw new Error();
+      families.push(family);
+      for (const model of group) if (!Object.values(family.variants).includes(model.id)) excluded.set(model.id, "shadowed_family_route");
+    } catch { for (const model of group) excluded.set(model.id, "ambiguous_family_metadata"); }
+  }
+  return { families: families.sort((a, b) => a.id.localeCompare(b.id)), excluded };
 }

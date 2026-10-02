@@ -54,6 +54,10 @@ export interface ResponsesSafeDiagnosticRecord {
   timestamp: string;
   request_id: string;
   model_id?: string;
+  logical_model?: string;
+  requested_effort?: string;
+  resolved_model_id?: string;
+  terminal_status?: string;
   tool_count: number;
   tool_names: string[];
   tool_mappings: ToolMapping[];
@@ -89,6 +93,10 @@ export const RESPONSES_SAFE_DIAGNOSTIC_FIELDS = [
   "timestamp",
   "request_id",
   "model_id",
+  "logical_model",
+  "requested_effort",
+  "resolved_model_id",
+  "terminal_status",
   "tool_count",
   "tool_names",
   "tool_mappings",
@@ -264,6 +272,17 @@ export class ResponsesSafeDiagnostic {
     this.deferred = true;
   }
 
+  /** Metadata only: bounded identifiers, known efforts, and existing secret redaction. */
+  recordRouting(logicalModel: unknown, requestedEffort: unknown, resolvedModelId: unknown): void {
+    const logical = safeTraceId(logicalModel, this.secrets);
+    const concrete = safeTraceId(resolvedModelId, this.secrets);
+    if (!logical || !concrete || typeof requestedEffort !== "string" ||
+      !["none", "off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(requestedEffort)) return;
+    this.record.logical_model = logical;
+    this.record.requested_effort = requestedEffort;
+    this.record.resolved_model_id = concrete;
+  }
+
   recordUpstreamResponse(
     status: number,
     streamOpened: boolean,
@@ -382,6 +401,7 @@ export class ResponsesSafeDiagnostic {
     if (this.finalized) return false;
     this.finalized = true;
     this.record.elapsed_ms = Math.max(0, Date.now() - this.startedAt);
+    if (this.record.resolved_model_id) this.record.terminal_status = this.record.upstream_terminal_status;
     const safeRecord = Object.fromEntries(
       RESPONSES_SAFE_DIAGNOSTIC_FIELDS.map((field) => [field, this.record[field]]),
     );

@@ -121,7 +121,7 @@ test("reviewed GLM 1M logical projection is accepted without conflating the stan
   expect(generate(fixture).roles.default.concreteModelId).toBe("glm-5-3-flash-low");
   glm.id = "glm-5-3-flash";
   fixture.roles.default.modelId = glm.id;
-  expect(() => generate(fixture)).toThrow("no defaults");
+  expect(generate(fixture).roles.default.modelId).toBe("glm-5-3-flash");
 });
 
 const mutations: Record<string, (fixture: any) => void> = {
@@ -161,7 +161,7 @@ test("duplicate JSON fields and malformed JSON fail closed", () => {
 });
 test("unvalidated enabled models may be excluded but never routed", () => {
   const fixture = selectionFixture();
-  fixture.excludedModels.push({ id: "unreviewed-model", reason: "unvalidated_profile" });
+  fixture.excludedModels.push({ id: "unreviewed-model", reason: "missing_effort_metadata" });
   expect(validateSelection(fixture).models).toHaveLength(2);
   fixture.roles.default.modelId = "unreviewed-model";
   expect(() => validateSelection(fixture)).toThrow();

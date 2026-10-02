@@ -3,8 +3,7 @@ import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { isAbsolute } from "node:path";
 import { fileURLToPath } from "node:url";
-import { CODEX_PROFILE_VERSION, getCodexModelProfile } from "../../src/admin/codex-model-profiles.js";
-import { REVIEWED_FAMILY_ROUTES } from "../../src/model-families.js";
+import { CODEX_PROFILE_VERSION } from "../../src/admin/codex-model-profiles.js";
 
 const fail = (): never => { throw new Error("Invalid or unsupported Codex selection; no defaults were substituted."); };
 const object = (value: unknown): Record<string, unknown> => {
@@ -150,11 +149,6 @@ export function extractRuntimeInstructions(
   return matches[0];
 }
 
-// Already-reviewed Phase 2.5 GLM 1M projection. This adds no concrete model profile.
-const REVIEWED_CLIENT_ROUTES: Readonly<Record<string, Readonly<Record<string, string | undefined>>>> = {
-  ...REVIEWED_FAMILY_ROUTES,
-  "glm-5-3-flash-1m": { low: "glm-5-3-flash-low" },
-};
 interface Model {
   id: string; displayName: string; contextWindow: number; maxOutputTokens: number;
   inputModalities: string[]; defaultReasoningEffort: string;
@@ -174,7 +168,7 @@ export function validateSelection(input: unknown): Selection {
   if (root.schemaVersion !== 2 || root.compatibilityProfileVersion !== CODEX_PROFILE_VERSION || typeof root.includeFutureModels !== "boolean") fail();
   const revision = positive(root.revision);
   if (root.selectionETag !== `"model-selection-v2-${revision}"`) fail();
-  if (!Array.isArray(root.models) || !root.models.length || root.models.length > 100 || !Array.isArray(root.excludedModels)) fail();
+  if (!Array.isArray(root.models) || !root.models.length || root.models.length > 2048 || !Array.isArray(root.excludedModels)) fail();
   const seen = new Set<string>();
   const concreteSeen = new Set<string>();
   const models: Model[] = (root.models as unknown[]).map((entry) => {
@@ -184,22 +178,19 @@ export function validateSelection(input: unknown): Selection {
     if (seen.has(modelId)) fail();
     seen.add(modelId);
     const routing = object(row.routing);
-    const efforts = Object.keys(routing).sort();
+    const order = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
+    const efforts = Object.keys(routing).sort((a, b) => order.indexOf(a) - order.indexOf(b));
     if (!efforts.length || !Array.isArray(row.supportedReasoningEfforts) || row.supportedReasoningEfforts.length !== efforts.length) fail();
     const supported = efforts.map((effort) => {
       const concrete = id(routing[effort]);
-      const profile = getCodexModelProfile(concrete);
-      const route = REVIEWED_CLIENT_ROUTES[modelId];
-      if (!profile || concreteSeen.has(concrete) || (modelId !== concrete && (!route || route[effort] !== concrete))) fail();
-      if (modelId === "glm-5-3-flash-1m" && (row.familyProvenance !== "upstream_family_metadata" || positive(row.contextWindow) < 1_000_000)) fail();
+      if (!order.includes(effort) || concreteSeen.has(concrete)
+        || (modelId !== concrete && !["upstream_family_metadata", "reviewed_fallback"].includes(row.familyProvenance as string))) fail();
+      if (row.multiAgentVersion !== "v1" || row.shellType !== "shell_command") fail();
       concreteSeen.add(concrete);
-      const reviewed = profile!.supportedReasoningEfforts.find((item) => item.effort === effort);
-      if (!reviewed || row.multiAgentVersion !== profile!.multiAgentVersion || row.shellType !== profile!.shellType) fail();
       const supplied = (row.supportedReasoningEfforts as unknown[]).map(object).filter((item) => item.effort === effort);
       if (supplied.length !== 1) fail();
       keys(supplied[0], ["effort", "description"]);
-      if (supplied[0].description !== reviewed!.description) fail();
-      return { effort, description: reviewed!.description };
+      return { effort, description: text(supplied[0].description) };
     });
     if (!efforts.includes(row.defaultReasoningEffort as string)) fail();
     const provenance = object(row.metadataProvenance);
@@ -219,7 +210,7 @@ export function validateSelection(input: unknown): Selection {
     const excluded = object(entry);
     keys(excluded, ["id", "reason"]);
     const excludedId = id(excluded.id);
-    if (excludedSeen.has(excludedId) || concreteSeen.has(excludedId) || seen.has(excludedId) || !["unavailable", "unvalidated_profile", "incomplete_metadata"].includes(excluded.reason as string)) fail();
+    if (excludedSeen.has(excludedId) || concreteSeen.has(excludedId) || seen.has(excludedId) || !["unavailable", "incomplete_metadata", "missing_effort_metadata", "unsupported_family_metadata", "ambiguous_family_metadata", "shadowed_family_route"].includes(excluded.reason as string)) fail();
     excludedSeen.add(excludedId);
   }
   const rolesObject = object(root.roles);

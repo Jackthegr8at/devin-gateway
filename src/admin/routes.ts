@@ -1,6 +1,6 @@
 import type { DiscoveredModelMetadata } from "../devin.js";
 import { adminModels, codexSelectionManifest, validateDiscoveredRoles } from "./model-catalog.js";
-import { projectModelFamilies } from "../model-families.js";
+import { inspectModelFamilies } from "../model-families.js";
 import { MAX_SELECTION_BYTES, ModelSelectionError, selectionETag, validateModelSelection } from "./model-selection.js";
 import type { ModelSelectionStore } from "./model-selection-store.js";
 
@@ -67,7 +67,7 @@ export function createModelSelectionRoutes(options: ModelSelectionRoutesOptions)
       if (req.method === "GET" && path === "/admin/api/models") {
         const selection = await options.store.read();
         const discovered = await discover(req);
-        return json({ source: "remote", selectionRevision: selection.revision, models: adminModels(discovered, selection), families: projectModelFamilies(discovered) });
+        return json({ source: "remote", selectionRevision: selection.revision, models: adminModels(discovered, selection), families: inspectModelFamilies(discovered).families });
       }
       if (req.method === "PUT" && path === "/admin/api/model-selection") {
         if (req.headers.get("content-type")?.split(";")[0].trim().toLowerCase() !== "application/json") {

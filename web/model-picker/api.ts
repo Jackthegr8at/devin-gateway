@@ -37,7 +37,7 @@ export function createPickerApi(send: typeof fetch = fetch): PickerApi {
       }
       const models = catalog.body.models as AdminModel[];
       if (models.some((model) => !model || typeof model.id !== "string" || typeof model.displayName !== "string"
-        || typeof model.available !== "boolean" || !model.codex || !["validated", "unvalidated"].includes(model.codex.status))) {
+        || typeof model.available !== "boolean" || !model.codex || !["tested", "untested", "cannot_export"].includes(model.codex.status))) {
         throw new PickerApiError(0, "The gateway returned invalid model metadata. Reload after checking the gateway.");
       }
       return { ...selection, models };

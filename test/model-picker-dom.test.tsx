@@ -26,7 +26,7 @@ afterAll(async () => {
 function model(id: string, displayName = id, available = true): AdminModel {
   const profile = getCodexModelProfile(id) ?? null;
   return { id, displayName, available, enabled: !!profile, ...(id === "swe-2-medium" ? { family: { id: "swe-2", displayName: "SWE-2", effort: "medium", provenance: "reviewed_fallback", upstreamDefaultEffort: null } } : {}), contextWindow: 200_000, maxOutputTokens: 64_000, supportsImages: false,
-    upstreamThinking: true, metadataProvenance: { id: "upstream" }, codex: { status: profile ? "validated" : "unvalidated", profile, exportEligible: !!profile && available } };
+    upstreamThinking: true, metadataProvenance: { id: "upstream" }, codex: { status: profile ? "tested" : "cannot_export", profile, exportEligible: !!profile && available } };
 }
 function mockApi(conflict = false) {
   const models = [model("glm-5-3-flash-low", "GLM-5.3 Flash Low"), model("swe-2-medium", "SWE-2 Medium"),
@@ -65,6 +65,18 @@ function rows() { return [...document.querySelectorAll(".model-row")]; }
 async function checkModel(id: string) { await click(document.querySelector(`.model-row[data-model-id="${id}"] input`) as HTMLElement); }
 
 describe("rendered Cody-style model picker", () => {
+  test("structurally compatible untested High is a role option when enabled", async () => {
+    const selection = initialModelSelection();
+    const high = { ...model("swe-2-high"), family: { id: "swe-2", displayName: "SWE-2", effort: "high", provenance: "upstream_family_metadata", upstreamDefaultEffort: "high" },
+      codex: { status: "untested" as const, profile: { ...getCodexModelProfile("swe-2-medium")!, modelId: "swe-2-high", defaultReasoningEffort: "high" as const, supportedReasoningEfforts: [{ effort: "high" as const, description: "Synthetic upstream High" }] }, exportEligible: true } };
+    selection.enabledModels.push("swe-2-high");
+    await mount({ load: async () => ({ models: [model("glm-5-3-flash-low"), model("swe-2-medium"), high, model("swe-2-max")], selection, etag: '"model-selection-v2-1"' }),
+      save: async () => { throw new Error("No save expected"); } });
+    const row = document.querySelector('[data-model-id="swe-2-high"]')!;
+    expect(row.textContent).toContain("Untested");
+    expect(document.querySelector('[data-model-id="swe-2-max"]')!.textContent).toContain("Cannot export");
+    expect([...document.querySelectorAll('select option')].some((option) => (option as HTMLOptionElement).value === "high")).toBe(true);
+  });
   test("page fallback follows available height and releases its resize observer on unmount", async () => {
     const originalHeight = Object.getOwnPropertyDescriptor(dom.window, "innerHeight");
     const originalObserver = Object.getOwnPropertyDescriptor(globalThis, "ResizeObserver");
@@ -207,7 +219,7 @@ describe("rendered Cody-style model picker", () => {
     };
     await mount(base.api);
     expect(document.querySelectorAll('.model-family[aria-label="SWE-2 variants"]')).toHaveLength(1);
-    expect(document.querySelector('.model-row[data-model-id="swe-2-high"]')?.textContent).toContain("Metadata not validated");
+    expect(document.querySelector('.model-row[data-model-id="swe-2-high"]')?.textContent).toContain("Cannot export");
     expect(document.querySelector('.model-row[data-model-id="swe-2-max"]')?.textContent).toContain("Unavailable");
     const effort = document.querySelector('select[aria-label="swe_worker thinking"]') as HTMLSelectElement;
     expect([...effort.options].map((option) => option.value)).toEqual(["medium"]);
@@ -278,7 +290,7 @@ describe("rendered Cody-style model picker", () => {
   });
   test("unvalidated models remain visible/enablable; unavailable rows are explicit and not role options", async () => {
     const mock = mockApi(); await mount(mock.api); await checkModel("other-fixture-2");
-    expect(document.querySelector('.model-row[data-model-id="other-fixture-2"]')?.textContent).toContain("Metadata not validated");
+    expect(document.querySelector('.model-row[data-model-id="other-fixture-2"]')?.textContent).toContain("Cannot export");
     expect([...document.querySelectorAll('select[aria-label="swe_worker model"] option')].map((option) => option.getAttribute("value"))).toEqual(["glm-5-3-flash-low", "swe-2"]);
     await search("saved-removed"); expect(rows()[0].textContent).toContain("Unavailable"); await checkModel("saved-removed");
     expect(button("Save selection").disabled).toBe(false);

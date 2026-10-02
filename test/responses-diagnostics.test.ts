@@ -13,6 +13,24 @@ test("safe Responses diagnostics are explicitly opt-in", () => {
   expect(responsesSafeDiagnosticsEnabled("1")).toBe(true);
 });
 
+test("routing diagnostics retain safe model metadata and reject secret values", () => {
+  const directory = mkdtempSync(join(tmpdir(), "candidate-diagnostic-test-"));
+  try {
+    const path = join(directory, "safe.jsonl");
+    const diagnostic = new ResponsesSafeDiagnostic("synthetic-candidate", Date.now(), path);
+    diagnostic.recordRouting("SYNTHETIC_SECRET", "high", "swe-2-high");
+    diagnostic.recordRouting("swe-2", "max", "swe-2-max");
+    diagnostic.recordRouting("swe-2", "high", "SYNTHETIC_SECRET");
+    diagnostic.finalize();
+    const record = JSON.parse(readFileSync(path, "utf8"));
+    expect(record.logical_model).toBe("swe-2");
+    expect(record.requested_effort).toBe("max");
+    expect(record.resolved_model_id).toBe("swe-2-max");
+    expect(record).not.toHaveProperty("terminal_status");
+    expect(readFileSync(path, "utf8")).not.toContain("SYNTHETIC_SECRET");
+  } finally { rmSync(directory, { recursive: true, force: true }); }
+});
+
 test("diagnostic JSONL contains allowlisted hashes and normalized errors, never raw input or credentials", () => {
   const directory = mkdtempSync(join(tmpdir(), "devin-responses-diagnostic-test-"));
   const path = join(directory, "responses-safe-diagnostic.jsonl");

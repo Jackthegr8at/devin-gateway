@@ -6,7 +6,7 @@ export function RoleAssignments({ models, draft, disabled, onChange }: { models:
   const logicalId = (model: AdminModel) => Object.values(draft.roles).some((role) => role.modelId === model.id) ? model.id : model.family?.id ?? model.id;
   const effort = (model: AdminModel) => model.family?.effort ?? model.codex.profile!.defaultReasoningEffort;
   return <section className="roles" aria-labelledby="roles-title">
-    <div className="section-heading"><h2 id="roles-title">Model roles</h2><span>Enabled, reviewed models only</span></div>
+    <div className="section-heading"><h2 id="roles-title">Model roles</h2><span>Enabled, compatible models</span></div>
     <div className="role-grid">{ROLES.map((role) => {
       const label = role === "default" ? "Default / parent" : "swe_worker";
       const assignment = draft.roles[role];
@@ -27,6 +27,6 @@ export function RoleAssignments({ models, draft, disabled, onChange }: { models:
         </select></label>
       </div>;
     })}</div>
-    <p id="role-help" className="help">Only enabled, available, reviewed efforts can receive roles. Upstream defaults do not replace your saved effort.</p>
+    <p id="role-help" className="help">Enabled, available, structurally compatible efforts can receive roles even when untested. Upstream defaults do not replace your saved effort.</p>
   </section>;
 }
