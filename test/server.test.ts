@@ -1068,7 +1068,7 @@ describe("POST /v1/responses (non-streaming)", () => {
     }
   });
 
-  test("system collapse is opt-in in the endpoint and allowlisted only for GLM and SWE-2 Medium", async () => {
+  test("system collapse is opt-in and applies provider-wide in the Responses endpoint", async () => {
     const originalFlag = process.env.DEVIN_CODEX_DESKTOP_COLLAPSE_SYSTEM;
     process.env.DEVIN_CODEX_DESKTOP_COLLAPSE_SYSTEM = "1";
     const captured: Uint8Array[] = [];
@@ -1097,8 +1097,8 @@ describe("POST /v1/responses (non-streaming)", () => {
       expect(glm.prompts).toEqual([{ source: 1, prompt: `<system>\n${exactSystem}\n</system>\n\nUser task`, toolCalls: [] }]);
       expect(swe.prompt).toBe("");
       expect(swe.prompts[0].prompt).toBe(`<system>\n${exactSystem}\n</system>\n\nUser task`);
-      expect(unrelated.prompt).toBe(exactSystem);
-      expect(unrelated.prompts[0].prompt).toBe("User task");
+      expect(unrelated.prompt).toBe("");
+      expect(unrelated.prompts[0].prompt).toBe(`<system>\n${exactSystem}\n</system>\n\nUser task`);
     } finally {
       await cleanup();
       await upstream.stop();

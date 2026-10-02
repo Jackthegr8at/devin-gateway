@@ -2,6 +2,7 @@ import { appendFileSync, mkdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { AsyncLocalStorage } from "node:async_hooks";
+import { ProtoDecoder } from "./proto.js";
 
 export const RESPONSES_SAFE_DIAGNOSTICS_ENV = "DEVIN_RESPONSES_SAFE_DIAGNOSTICS";
 export const RESPONSES_SAFE_DIAGNOSTICS_PATH_ENV = "DEVIN_RESPONSES_SAFE_DIAGNOSTICS_PATH";
@@ -21,6 +22,7 @@ export function safeConnectCode(value: unknown): string {
 
 export type ResponsesFailureClassification =
   | "devin_policy_denial"
+  | "devin_upstream_model_provider_unavailable"
   | "devin_connect_error"
   | "devin_stream_error"
   | "gateway_conversion_error"
@@ -157,6 +159,7 @@ function safeTraceId(value: unknown, secrets: Set<string>): string | undefined {
 /** Persist only fixed category labels, never arbitrary upstream error prose. */
 export function normalizedErrorMessage(value: unknown): string {
   const message = String(value ?? "");
+  if (providerUnavailableMessage(message)) return "Third-party model provider unavailable";
   if (/mcp\s+configuration\s+issue/i.test(message)) return "MCP configuration issue";
   if (/content\s+policy/i.test(message)) return "Content policy denial";
   if (/rate[_\s-]?limit|quota/i.test(message)) return "Rate limit";
@@ -167,9 +170,38 @@ export function normalizedErrorMessage(value: unknown): string {
   return "Upstream error message redacted";
 }
 
-function connectClassification(code: string, message: string): ResponsesFailureClassification {
+const PROVIDER_UNAVAILABLE_REASONS = new Set(["MODEL_PROVIDER_UNAVAILABLE", "THIRD_PARTY_PROVIDER_UNAVAILABLE", "THIRD_PARTY_MODEL_PROVIDER_UNAVAILABLE"]);
+function providerUnavailableMessage(message: string): boolean {
+  return /third[ -]party\s+(?:model\s+)?provider/i.test(message)
+    && /(?:not|currently\s+not)\s+available|unavailable|experiencing\s+(?:issues|problems)/i.test(message);
+}
+/** Decode only the standard ErrorInfo reason; never retain its metadata or raw details. */
+function providerUnavailableReason(details: unknown): boolean {
+  if (!Array.isArray(details)) return false;
+  return details.slice(0, 16).some(detail => {
+    if (!detail || typeof detail !== "object") return false;
+    if (detail.type !== "google.rpc.ErrorInfo" && detail.type !== "type.googleapis.com/google.rpc.ErrorInfo"
+      && detail["@type"] !== "type.googleapis.com/google.rpc.ErrorInfo") return false;
+    if (PROVIDER_UNAVAILABLE_REASONS.has(detail.reason)) return true;
+    if (typeof detail.value !== "string" || detail.value.length > 8192 || !/^[A-Za-z0-9+/]*={0,2}$/.test(detail.value)) return false;
+    try {
+      const decoder = new ProtoDecoder(Buffer.from(detail.value, "base64"));
+      let reason: string | undefined;
+      while (!decoder.done) {
+        const { field, wire } = decoder.readTag();
+        if (field === 1 && wire === 2) { if (reason !== undefined) return false; reason = decoder.readString(); }
+        else decoder.skip(wire);
+      }
+      return reason !== undefined && PROVIDER_UNAVAILABLE_REASONS.has(reason);
+    } catch { return false; }
+  });
+}
+function connectClassification(code: string, message: string, details?: unknown): ResponsesFailureClassification {
   if (code === "permission_denied" && /content\s*policy|mcp configuration issue/i.test(message)) {
     return "devin_policy_denial";
+  }
+  if (providerUnavailableReason(details) || (["invalid_argument", "unavailable"].includes(code) && providerUnavailableMessage(message))) {
+    return "devin_upstream_model_provider_unavailable";
   }
   return "devin_connect_error";
 }
@@ -332,13 +364,14 @@ export class ResponsesSafeDiagnostic {
     }
   }
 
-  recordConnectError(options: { code?: unknown; message?: unknown; traceIds?: unknown[] }): void {
+  recordConnectError(options: { code?: unknown; message?: unknown; details?: unknown; traceIds?: unknown[] }): void {
     const code = safeConnectCode(options.code);
     const message = String(options.message ?? "");
     this.record.connect_error_code = code;
     this.record.upstream_error_code = code;
     this.record.connect_error_message = normalizedErrorMessage(message);
-    this.record.failure_classification = connectClassification(code, message);
+    this.record.failure_classification = connectClassification(code, message, options.details);
+    if (this.record.failure_classification === "devin_upstream_model_provider_unavailable") this.record.connect_error_message = "Third-party model provider unavailable";
     this.record.upstream_terminal_status = "connect_error";
     this.recordTraceIds(options.traceIds ?? []);
   }

@@ -19,21 +19,9 @@ const prompts: ChatMessagePrompt[] = [
   { messageId: "current-user", source: ChatMessageSource.USER, prompt: "Current user text" },
 ];
 
-test("system collapse is opt-in, request-shape checked, and limited to the two Devin variants", () => {
-  const base = {
-    featureFlag: "1",
-    modelId: "glm-5-3-flash-low",
-    topLevelInstructions: "Codex Desktop base instructions",
-    hasInputSystemDeveloperContext: true,
-  };
-  expect(isCodexDesktopSystemCollapseRequest(base)).toBe(true);
-  expect(isCodexDesktopSystemCollapseRequest({ ...base, modelId: "swe-2-medium" })).toBe(true);
-  expect(isCodexDesktopSystemCollapseRequest({ ...base, featureFlag: undefined })).toBe(false);
-  expect(isCodexDesktopSystemCollapseRequest({ ...base, featureFlag: "0" })).toBe(false);
-  expect(isCodexDesktopSystemCollapseRequest({ ...base, modelId: "swe-2-high" })).toBe(false);
-  expect(isCodexDesktopSystemCollapseRequest({ ...base, modelId: "other-model" })).toBe(false);
-  expect(isCodexDesktopSystemCollapseRequest({ ...base, topLevelInstructions: "" })).toBe(false);
-  expect(isCodexDesktopSystemCollapseRequest({ ...base, hasInputSystemDeveloperContext: false })).toBe(false);
+test("provider-wide collapse requires the explicit configuration flag only", () => {
+  expect(isCodexDesktopSystemCollapseRequest({ featureFlag: "1" })).toBe(true);
+  for (const featureFlag of [undefined, "0", "true", "", " 1"]) expect(isCodexDesktopSystemCollapseRequest({ featureFlag })).toBe(false);
   expect(CODEX_DESKTOP_SYSTEM_COLLAPSE_ENV).toBe("DEVIN_CODEX_DESKTOP_COLLAPSE_SYSTEM");
 });
 

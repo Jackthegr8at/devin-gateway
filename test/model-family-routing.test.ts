@@ -11,7 +11,7 @@ import { RESPONSES_SAFE_DIAGNOSTICS_ENV, RESPONSES_SAFE_DIAGNOSTICS_PATH_ENV } f
 
 test("Responses logical effort routes to exact wire UID; invalid efforts never generate chat", async () => {
   const models = [familyFixture("swe-2-medium", "SWE-2", "medium"), familyFixture("swe-2-high", "SWE-2", "high", {}, true), familyFixture("swe-2-max", "SWE-2", "max"),
-    familyFixture("sol-wire-low", "GPT-6.1 Sol", "low"), familyFixture("sol-wire-medium", "GPT-6.1 Sol", "medium")];
+    familyFixture("sol-wire-low", "GPT-6.1 Sol", "low"), familyFixture("sol-wire-medium", "GPT-6.1 Sol", "medium"), familyFixture("gpt-5-6-luna-max", "GPT-5.6 Luna", "max")];
   const calls: string[] = [];
   let discoveryAvailable = true;
   const upstream = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(req) {
@@ -57,14 +57,57 @@ test("Responses logical effort routes to exact wire UID; invalid efforts never g
     expect(calls).toHaveLength(5);
     expect((await send("synthetic-legacy-concrete", "off")).status).toBe(200);
     expect(calls.at(-1)).toBe("synthetic-legacy-concrete");
+    discoveryAvailable = true;
+    const highTest = await fetch(`http://127.0.0.1:${gateway.port}/v1/responses`, {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ model: "swe-2", reasoning: { effort: "high" },
+        instructions: "Synthetic offline developer fixture.", input: [
+          { role: "developer", content: "Synthetic Desktop developer leaf." },
+          { role: "user", content: "Synthetic offline routing fixture." },
+        ] }),
+    });
+    expect(highTest.status).toBe(200);
+    expect(calls.at(-1)).toBe("swe-2-high");
+    const providerWideCases = [
+      ["swe-2", "max", "swe-2-max"], ["swe-2-max", "max", "swe-2-max"],
+      ["gpt-6-1-sol", "medium", "sol-wire-medium"], ["sol-wire-medium", "medium", "sol-wire-medium"],
+      ["gpt-5-6-luna", "max", "gpt-5-6-luna-max"], ["gpt-5-6-luna-max", "max", "gpt-5-6-luna-max"],
+    ];
+    for (const [model, effort, concrete] of providerWideCases) {
+      const response = await fetch(`http://127.0.0.1:${gateway.port}/v1/responses`, {
+        method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ model, reasoning: { effort },
+          instructions: "Synthetic offline developer fixture.", input: [
+            { role: "developer", content: "Synthetic Desktop developer leaf." },
+            { role: "user", content: "Synthetic offline routing fixture." },
+          ] }),
+      });
+      expect(response.status).toBe(200);
+      expect(calls.at(-1)).toBe(concrete);
+    }
     const jsonl = await readFile(diagnosticPath, "utf8");
     const records = jsonl.trim().split("\n").map((line) => JSON.parse(line));
     const high = records.find((record) => record.requested_effort === "high");
-    expect(high).toMatchObject({ logical_model: "swe-2", requested_effort: "high", resolved_model_id: "swe-2-high", collapse_system_enabled: false, terminal_status: "completed" });
-    expect(records.filter((record) => record.resolved_model_id)).toHaveLength(6);
+    expect(high).toMatchObject({ logical_model: "swe-2", requested_effort: "high", resolved_model_id: "swe-2-high", collapse_system_enabled: true, terminal_status: "completed" });
+    expect(records.filter((record) => record.resolved_model_id)).toHaveLength(13);
+    const experimental = records.slice(-7);
+    expect(experimental[0]).toMatchObject({ logical_model: "swe-2", requested_effort: "high", resolved_model_id: "swe-2-high", collapse_system_enabled: true, terminal_status: "completed" });
+    for (const record of experimental) expect(record).toMatchObject({ collapse_system_enabled: true, upstream_terminal_status: "completed", terminal_status: "completed" });
+    for (let index = 0; index < providerWideCases.length; index++) {
+      const [model, effort, concrete] = providerWideCases[index];
+      expect(experimental[index + 1]).toMatchObject({ logical_model: model, requested_effort: effort, resolved_model_id: concrete });
+    }
     expect(jsonl).not.toContain("Synthetic offline developer fixture.");
     expect(jsonl).not.toContain("Synthetic offline routing fixture.");
     expect(jsonl).not.toContain("synthetic-wire-token");
+    process.env[CODEX_DESKTOP_SYSTEM_COLLAPSE_ENV] = "0";
+    for (const [model, effort] of [["swe-2", "medium"], ["swe-2", "high"], ["swe-2", "max"], ["gpt-6-1-sol", "medium"], ["gpt-5-6-luna-max", "max"]]) {
+      const response = await fetch(`http://127.0.0.1:${gateway.port}/v1/responses`, {
+        method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ model, reasoning: { effort },
+          instructions: "Synthetic offline developer fixture.", input: [{ role: "developer", content: "Synthetic Desktop developer leaf." }, { role: "user", content: "Synthetic offline routing fixture." }] }),
+      });
+      expect(response.status).toBe(200);
+    }
+    const disabled = (await readFile(diagnosticPath, "utf8")).trim().split("\n").slice(-5).map(line => JSON.parse(line));
+    for (const record of disabled) expect(record.collapse_system_enabled).toBe(false);
   } finally {
     await gateway.stop(); await upstream.stop(true);
     if (previousCollapse === undefined) delete process.env[CODEX_DESKTOP_SYSTEM_COLLAPSE_ENV]; else process.env[CODEX_DESKTOP_SYSTEM_COLLAPSE_ENV] = previousCollapse;

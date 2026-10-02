@@ -585,9 +585,6 @@ async function handleResponses(req: Request, reqId: string, trace: ErrorTrace): 
     return errorResponse(req, 400, err.message, "invalid_request_error");
   }
 
-  const hasInputSystemDeveloperContext = messages.some(
-    (message) => message.role === "system" || message.role === "developer",
-  );
   if (body.instructions) messages = [{ role: "developer", content: body.instructions }, ...messages];
 
   let modelUid: string;
@@ -602,9 +599,6 @@ async function handleResponses(req: Request, reqId: string, trace: ErrorTrace): 
   const originalSystemPrompt = extractSystemPrompt(messages);
   const collapseRequested = isCodexDesktopSystemCollapseRequest({
     featureFlag: process.env[CODEX_DESKTOP_SYSTEM_COLLAPSE_ENV],
-    modelId: modelUid,
-    topLevelInstructions: body.instructions,
-    hasInputSystemDeveloperContext,
   });
   const collapse = collapseRequested
     ? collapseSystemPromptIntoLatestUserMessage(originalSystemPrompt, originalPrompts)

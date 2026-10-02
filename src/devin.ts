@@ -392,6 +392,7 @@ export async function* streamChat(params: ChatParams): AsyncGenerator<ChatStream
               currentResponsesDiagnostic()?.recordConnectError({
                 code: parsed.error.code,
                 message: parsed.error.message,
+                details: parsed.error.details,
                 traceIds: [...safeTraceIdsFromHeaders(response.headers), ...safeTraceIdsFromConnectError(parsed)],
               });
               traceError(`[chat] upstream end-stream error: ${errMsg}`);

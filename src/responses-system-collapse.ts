@@ -1,25 +1,14 @@
 import { ChatMessageSource, type ChatMessagePrompt } from "./proto.js";
 
 export const CODEX_DESKTOP_SYSTEM_COLLAPSE_ENV = "DEVIN_CODEX_DESKTOP_COLLAPSE_SYSTEM";
-export const CODEX_DESKTOP_COLLAPSE_MODELS = [
-  "glm-5-3-flash-low",
-  "swe-2-medium",
-] as const;
 
 export interface CodexDesktopCollapseRequest {
   featureFlag: string | undefined;
-  modelId: unknown;
-  topLevelInstructions: unknown;
-  hasInputSystemDeveloperContext: boolean;
 }
 
-/** Keep this compatibility path opt-in and limited to the validated Desktop request shape. */
+/** Called only by the Devin Responses path. Content remains unchanged when disabled. */
 export function isCodexDesktopSystemCollapseRequest(options: CodexDesktopCollapseRequest): boolean {
-  return options.featureFlag === "1"
-    && CODEX_DESKTOP_COLLAPSE_MODELS.some((modelId) => options.modelId === modelId)
-    && typeof options.topLevelInstructions === "string"
-    && options.topLevelInstructions.length > 0
-    && options.hasInputSystemDeveloperContext;
+  return options.featureFlag === "1";
 }
 
 export interface CollapsedResponsesSystem {

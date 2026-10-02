@@ -2,6 +2,7 @@ import { expect, test } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { ProtoEncoder } from "../src/proto.ts";
 import {
   ResponsesSafeDiagnostic,
   responsesSafeDiagnosticsEnabled,
@@ -11,6 +12,40 @@ test("safe Responses diagnostics are explicitly opt-in", () => {
   expect(responsesSafeDiagnosticsEnabled(undefined)).toBe(false);
   expect(responsesSafeDiagnosticsEnabled("true")).toBe(false);
   expect(responsesSafeDiagnosticsEnabled("1")).toBe(true);
+});
+
+test("provider outages, policy denial, generic Connect errors and stream failures remain distinct and redacted", () => {
+  const root = mkdtempSync(join(tmpdir(), "provider-classification-test-"));
+  const info = new ProtoEncoder(); info.string(1, "MODEL_PROVIDER_UNAVAILABLE"); info.string(2, "synthetic-private-domain");
+  const cases = [
+    { code: "invalid_argument", message: "The third-party model provider is experiencing issues and is currently not available. Please try this model again later.", expected: "devin_upstream_model_provider_unavailable" },
+    { code: "unavailable", message: "Third party provider unavailable", expected: "devin_upstream_model_provider_unavailable" },
+    { code: "invalid_argument", message: "synthetic-private-message", details: [{ type: "google.rpc.ErrorInfo", value: Buffer.from(info.finish()).toString("base64") }], expected: "devin_upstream_model_provider_unavailable" },
+    { code: "invalid_argument", message: "Bad argument", expected: "devin_connect_error" },
+    { code: "permission_denied", message: "Content policy denial", expected: "devin_policy_denial" },
+    { code: "unavailable", message: "Network service unavailable", expected: "devin_connect_error" },
+  ];
+  try {
+    for (const [index, row] of cases.entries()) {
+      const path = join(root, `${index}.jsonl`);
+      const diagnostic = new ResponsesSafeDiagnostic(`synthetic-${index}`, Date.now(), path);
+      diagnostic.recordRouting("synthetic-model", "medium", "synthetic-wire-model");
+      diagnostic.recordUpstreamResponse(200, true);
+      diagnostic.recordConnectError(row);
+      diagnostic.finalize();
+      const json = readFileSync(path, "utf8"); const record = JSON.parse(json);
+      expect(record.failure_classification).toBe(row.expected);
+      expect(record.upstream_http_status).toBe(200);
+      expect(record.upstream_error_code).toBe(row.code);
+      expect(json).not.toContain("synthetic-private");
+      expect(record).not.toHaveProperty("details");
+    }
+    const path = join(root, "stream.jsonl");
+    const diagnostic = new ResponsesSafeDiagnostic("synthetic-stream", Date.now(), path);
+    diagnostic.recordUpstreamError({ terminalStatus: "chat_stream_error", message: "synthetic-private-stream" });
+    diagnostic.finalize();
+    expect(JSON.parse(readFileSync(path, "utf8")).failure_classification).toBe("devin_stream_error");
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
 test("routing diagnostics retain safe model metadata and reject secret values", () => {
