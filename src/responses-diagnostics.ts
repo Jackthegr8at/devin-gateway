@@ -3,6 +3,7 @@ import { dirname, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { ProtoDecoder } from "./proto.js";
+import type { OpenAIMessage } from "./convert.js";
 
 export const RESPONSES_SAFE_DIAGNOSTICS_ENV = "DEVIN_RESPONSES_SAFE_DIAGNOSTICS";
 export const RESPONSES_SAFE_DIAGNOSTICS_PATH_ENV = "DEVIN_RESPONSES_SAFE_DIAGNOSTICS_PATH";
@@ -217,6 +218,9 @@ export interface ToolValidationEvidence {
 export class ResponsesSafeDiagnostic {
   private readonly record: ResponsesSafeDiagnosticRecord;
   private readonly secrets = new Set<string>();
+  // Credentials stay protected even in validated structured bridge fields.
+  // Prompt/schema occurrences of an ID are not themselves credentials.
+  private readonly credentials = new Set<string>();
   private readonly startedAt: number;
   private finalized = false;
   private deferred = false;
@@ -252,6 +256,53 @@ export class ResponsesSafeDiagnostic {
     for (const value of values) {
       if (typeof value === "string" && value.length >= 4) this.secrets.add(value);
     }
+  }
+
+  addCredentialValues(values: unknown[]): void {
+    this.addSensitiveValues(values);
+    for (const value of values) {
+      if (typeof value === "string" && value.length >= 4) this.credentials.add(value);
+    }
+  }
+
+  private structuredIdentifier(value: unknown): string | undefined {
+    // No trimming/coercion: only exact validated bridge identifiers qualify.
+    if (typeof value !== "string" || !IDENTIFIER.test(value)) return undefined;
+    return safeTraceId(value, this.credentials);
+  }
+
+  /** Call only after the request's model/effort has passed gateway resolution. */
+  recordResolvedRouting(route: { logicalModel: string; requestedEffort: unknown; resolvedModelId: string }): void {
+    const logical = this.structuredIdentifier(route.logicalModel);
+    const concrete = this.structuredIdentifier(route.resolvedModelId);
+    if (!logical || !concrete) return;
+    this.record.model_id = logical;
+    this.record.logical_model = logical;
+    this.record.resolved_model_id = concrete;
+    if (typeof route.requestedEffort === "string" && ["none", "off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(route.requestedEffort)) {
+      this.record.requested_effort = route.requestedEffort;
+    }
+  }
+
+  /** Completed accumulator output, not unvalidated deltas or assistant history. */
+  recordNormalizedEmittedToolCall(call: { id: string; name: string }): void {
+    const id = this.structuredIdentifier(call.id);
+    const name = this.structuredIdentifier(call.name);
+    if (!id || !name || this.evidence.emitted.length >= 16) return;
+    this.record.had_tool_call = true;
+    this.evidence.emitted.push({ id, name });
+    if (!this.record.tool_calls.some(entry => entry.call_id === id) && this.record.tool_calls.length < 16) {
+      this.record.tool_calls.push({ name, call_id: id });
+    }
+  }
+
+  /** Validated Responses converter output; never inspect raw input/history text. */
+  recordNormalizedFunctionCallOutput(message: OpenAIMessage, success: boolean): void {
+    if (message.role !== "tool") return;
+    const id = this.structuredIdentifier(message.tool_call_id);
+    if (!id || this.evidence.returned.length >= 16) return;
+    this.record.had_function_call_output = true;
+    this.evidence.returned.push({ id, success });
   }
 
   setRequestSummary(options: {
@@ -466,14 +517,16 @@ export class ResponsesSafeDiagnostic {
     );
     const line = `${JSON.stringify(safeRecord)}\n`;
     try { this.observer?.(this.record, this.evidence); } catch { /* Observability never changes inference. */ }
-    if (!this.writeLog) { this.secrets.clear(); return true; }
+    if (!this.writeLog) { this.secrets.clear(); this.credentials.clear(); return true; }
     try {
       mkdirSync(dirname(this.outputPath), { recursive: true });
       appendFileSync(this.outputPath, line, { encoding: "utf8" });
       this.secrets.clear();
+      this.credentials.clear();
       return true;
     } catch {
       this.secrets.clear();
+      this.credentials.clear();
       return false;
     }
   }

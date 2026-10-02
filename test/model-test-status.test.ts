@@ -47,23 +47,51 @@ test("concurrent writers preserve variants; corrupt status never reseeds", async
 
 test("correlated completed tool round-trip promotes; text/history/failures/wrong credential or effort/replay do not", async () => fixture(async store => {
   let now = 1000; const tracker = new ModelValidationTracker(store, () => now);
-  function finish({ call, returned, failed, scope = "synthetic-credential-hash", effort = "high" }: { call?: string; returned?: string; failed?: boolean; scope?: string; effort?: string }) {
+  function finish({ call, returned, failed, scope = "synthetic-credential-hash", effort = "high", model = "swe-2-high" }: { call?: string; returned?: string; failed?: boolean; scope?: string; effort?: string; model?: string }) {
     const d = new ResponsesSafeDiagnostic("synthetic", Date.now(), undefined, (r, e) => tracker.observe(scope, r, e), false);
-    d.recordRouting("swe-2", effort, "swe-2-high"); d.recordUpstreamResponse(200, true); d.recordUpstreamComplete();
+    d.addSensitiveValues([`Synthetic Desktop history: swe-2 swe-2-high swe-2-max new-call history-call ${call ?? ""} ${returned ?? ""}`]);
+    d.recordResolvedRouting({ logicalModel: "swe-2", requestedEffort: effort, resolvedModelId: model }); d.recordUpstreamResponse(200, true); d.recordUpstreamComplete();
     // History deliberately does not become emitted-call evidence.
     d.recordToolCall("exec_command", "history-call");
-    if (call) d.recordEmittedToolCall("exec_command", call);
-    if (returned) d.recordFunctionCallOutput(returned, true);
+    if (call) d.recordNormalizedEmittedToolCall({ name: "exec_command", id: call });
+    if (returned) d.recordNormalizedFunctionCallOutput({ role: "tool", tool_call_id: returned, content: "Synthetic private output" }, true);
     if (failed) d.recordFailure({ source: "synthetic", classification: "devin_upstream_model_provider_unavailable" }); else d.recordSuccessfulCompletion();
     d.finalize();
   }
   finish({}); finish({ returned: "history-call" }); await tracker.drain(); expect((await store.read()).variants).toEqual({});
   finish({ call: "new-call" }); finish({ returned: "new-call", scope: "another-credential" }); finish({ returned: "new-call", effort: "max" });
+  finish({ returned: "new-call", model: "swe-2-max" }); finish({ returned: "unrelated-call" });
   finish({ returned: "new-call", failed: true }); await tracker.drain(); expect((await store.read()).variants).toEqual({});
   finish({ returned: "new-call" }); await tracker.drain(); const saved = await store.read();
   expect(effectiveTestStatus(saved, "swe-2-high")).toMatchObject({ status: "tested", source: "automatic" });
   finish({ returned: "new-call" }); finish({ failed: true }); await tracker.drain(); expect(await store.read()).toEqual(saved);
   finish({ call: "expired-call" }); now += 3600001; finish({ returned: "expired-call" }); await tracker.drain(); expect(await store.read()).toEqual(saved);
+  await store.markManual("swe-2-high", "untested", testStatusETag(saved));
+  finish({ call: "manual-call" }); finish({ returned: "manual-call" }); await tracker.drain();
+  expect(effectiveTestStatus(await store.read(), "swe-2-high")).toMatchObject({ status: "untested", source: "manual" });
+}));
+
+test("only normalized structured fields retain history-mentioned IDs; credential overlap and arbitrary text remain redacted", async () => fixture(async (_store, root) => {
+  const path = join(root, "structured-safe.jsonl"); const d = new ResponsesSafeDiagnostic("synthetic-structured", Date.now(), path);
+  const privateText = "Synthetic Desktop history mentions swe-2 swe-2-max synthetic-issued-call private-looking-id";
+  const credential = "synthetic-sensitive-value-4917";
+  d.addCredentialValues([credential, `Bearer ${credential}`, "synthetic-cookie-value-9251"]);
+  d.addSensitiveValues([privateText, "private-looking-id"]);
+  d.recordRouting("private-looking-id", "max", "private-looking-id");
+  d.recordEmittedToolCall("exec_command", "private-looking-id");
+  d.recordFunctionCallOutput("private-looking-id", true);
+  d.recordResolvedRouting({ logicalModel: "swe-2", requestedEffort: "max", resolvedModelId: "swe-2-max" });
+  d.recordNormalizedEmittedToolCall({ name: "exec_command", id: "synthetic-issued-call" });
+  d.recordNormalizedFunctionCallOutput({ role: "tool", tool_call_id: "synthetic-issued-call", content: privateText }, true);
+  d.recordNormalizedFunctionCallOutput({ role: "user", tool_call_id: "arbitrary-user-id", content: privateText }, true);
+  d.recordNormalizedEmittedToolCall({ name: "exec_command", id: " arbitrary text " });
+  d.recordResolvedRouting({ logicalModel: credential, requestedEffort: "max", resolvedModelId: "swe-2-max" });
+  d.recordNormalizedEmittedToolCall({ name: "exec_command", id: credential });
+  d.recordNormalizedFunctionCallOutput({ role: "tool", tool_call_id: credential, content: privateText }, true);
+  d.recordSuccessfulCompletion(); d.finalize(); const json = await readFile(path, "utf8"); const r = JSON.parse(json);
+  expect(r).toMatchObject({ logical_model: "swe-2", requested_effort: "max", resolved_model_id: "swe-2-max", had_tool_call: true, had_function_call_output: true });
+  expect(r.tool_calls).toEqual([{ name: "exec_command", call_id: "synthetic-issued-call" }]);
+  for (const raw of [privateText, credential, "private-looking-id", "arbitrary-user-id", "arbitrary text", "synthetic-cookie-value-9251"]) expect(json).not.toContain(raw);
 }));
 
 test("new booleans and routing are allowlisted; raw tool/prompt/token content is absent", async () => fixture(async (_store, root) => {

@@ -10,6 +10,8 @@ Responses has no universal local tool success flag. Only an explicit zero exit c
 
 Safe JSONL retains existing routing fields and adds had_tool_call and had_function_call_output booleans. The first describes validated emitted calls, not history. The second describes current request output items. All existing error classifications remain diagnostic-only. In-process status collection works without enabling JSONL and suppresses raw Responses tracing.
 
+Routing identifiers come from completed gateway model resolution. Emitted calls come from the same finished, validated accumulator used by the Responses bridge; returned calls come from the Responses converter's normalized tool messages. These structured paths reject credentials and malformed identifiers, but do not discard a valid ID merely because Desktop history or a tool schema mentions it. Arbitrary trace/error fields retain the stricter sensitive-text substring check. Matching uses the exact credential scope, call ID, resolved variant and requested effort across separate requests; the two evidence booleans need not both be true on one request.
+
 ## Manual marks and persistence
 
 Use Mark tested / Mark untested on the exact variant row (for example SWE-2 Medium, High and Max). Marks save immediately; Save/Cancel applies only to selection drafts. The buttons never change enabled state or roles. The compact status badge tooltip reports manual/automatic provenance and the last automatic success timestamp when available.

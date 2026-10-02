@@ -626,9 +626,9 @@ async function handleResponses(req: Request, reqId: string, trace: ErrorTrace): 
     collapsedUserPayload: collapse.collapsedUserPayload,
     sensitiveValues: [token],
   });
-  diagnostic?.recordRouting(body.model, body.reasoning?.effort, modelUid);
-  if (Array.isArray(body.input)) for (const item of body.input) {
-    if (item?.type === "function_call_output") diagnostic?.recordFunctionCallOutput(item.call_id, returnedToolSucceeded(item.output));
+  diagnostic?.recordResolvedRouting({ logicalModel: body.model, requestedEffort: body.reasoning?.effort, resolvedModelId: modelUid });
+  for (const message of conversationMessages) {
+    if (message.role === "tool") diagnostic?.recordNormalizedFunctionCallOutput(message, returnedToolSucceeded(message.content));
   }
   if (diagnostic) recordResponsesHistoryCalls(diagnostic, messages);
   const responseId = `resp_${crypto.randomUUID().replace(/-/g, "").slice(0, 24)}`;
@@ -667,7 +667,7 @@ async function handleResponses(req: Request, reqId: string, trace: ErrorTrace): 
     diagnostic?.recordUpstreamComplete();
 
     const toolCalls = finishResponsesToolCalls(toolCallState, declaredTools);
-    for (const call of toolCalls.values()) diagnostic?.recordEmittedToolCall(call.name, call.id);
+    for (const call of toolCalls.values()) diagnostic?.recordNormalizedEmittedToolCall(call);
     const output: Record<string, unknown>[] = [];
     if (text || toolCalls.size === 0) {
       output.push({
@@ -827,7 +827,7 @@ function streamOpenAIResponses(
         diagnostic?.recordUpstreamComplete();
         slog(`done — upstream chunks: ${upstreamChunks}`);
         const toolCalls = finishResponsesToolCalls(toolCallState, declaredTools);
-        for (const call of toolCalls.values()) diagnostic?.recordEmittedToolCall(call.name, call.id);
+        for (const call of toolCalls.values()) diagnostic?.recordNormalizedEmittedToolCall(call);
 
         if (reasoningStarted) {
           send("response.output_item.done", {
@@ -1330,7 +1330,7 @@ export async function startServer(options: ServerOptions = {}): Promise<ServerHa
       // Error trace: collects request context silently, flushed only on failure.
       const trace = new ErrorTrace(id, method, path);
       if (diagnostic) {
-        diagnostic.addSensitiveValues([
+        diagnostic.addCredentialValues([
           extractToken(req),
           req.headers.get("authorization"),
           req.headers.get("x-api-key"),
