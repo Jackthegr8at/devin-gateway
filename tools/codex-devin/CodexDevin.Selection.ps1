@@ -20,7 +20,7 @@ function Invoke-CodexDevinSelectionProcess {
         $write = $process.StandardInput.BaseStream.WriteAsync($inputBytes, 0, $inputBytes.Length)
         if (-not $write.Wait(3000)) { throw 'Selection input exceeded its bounded deadline.' }
         $process.StandardInput.Close()
-        if (-not $process.WaitForExit(10000)) { throw 'Selection/runtime validation exceeded ten seconds.' }
+        if (-not $process.WaitForExit(45000)) { throw 'Selection/runtime validation exceeded 45 seconds.' }
         if ($process.ExitCode -ne 0) { throw 'Selection/runtime validation failed; no defaults were substituted.' }
         if (-not $output.Wait(1000) -or -not $errors.Wait(1000)) { throw 'Selection process output exceeded its bounded deadline.' }
         return $output.Result
@@ -43,10 +43,9 @@ function Get-CodexDevinDesktopRuntime {
     Assert-CodexDevinNoReparsePoint -Path (Split-Path -Parent $path)
     Assert-CodexDevinNoReparsePoint -Path $path
     $version = (Invoke-CodexDevinSelectionProcess -Executable $path -Arguments @('--version')).Trim()
-    $reviewedVersions = @('0.159.2', '0.159.0-alpha.12.1')
     $runtimeVersion = $version -creplace '^codex-cli ', ''
-    if ($version -cne ('codex-cli ' + $runtimeVersion) -or $reviewedVersions -cnotcontains $runtimeVersion) { throw 'The installed Desktop backend has no reviewed catalog adapter. No Codex files were changed.' }
-    return [pscustomobject]@{ Path = $path; Version = $runtimeVersion }
+    if ($version -cne ('codex-cli ' + $runtimeVersion) -or $runtimeVersion -cnotmatch '^\d+\.\d+\.\d+(?:-[A-Za-z0-9.-]+)?$') { throw 'The installed Desktop backend version provenance is invalid. No Codex files were changed.' }
+    return [pscustomobject]@{ Path = $path; Version = $runtimeVersion; ExecutableSha256 = Get-CodexDevinSha256 -Path $path }
 }
 
 function Get-CodexDevinPreparedSelection {
@@ -77,14 +76,15 @@ function Get-CodexDevinPreparedSelection {
     }
     $preparedJson = Invoke-CodexDevinSelectionProcess -Executable $bun -Arguments @('--no-env-file', 'run', $helper, $runtime.Version, $runtime.Path) -InputText ([string]$response.Content)
     $prepared = ConvertFrom-Json -InputObject $preparedJson -ErrorAction Stop
-    if ($prepared.schemaVersion -ne 1 -or $prepared.runtimeVersion -cne $runtime.Version) { throw 'Local selection preparation returned an invalid result.' }
-    $reviewedAdapter = Get-Content -LiteralPath (Join-Path $PSScriptRoot ('templates\codex-' + $runtime.Version + '.json')) -Raw | ConvertFrom-Json -ErrorAction Stop
+    if ($prepared.schemaVersion -ne 1 -or $prepared.runtimeVersion -cne $runtime.Version -or $prepared.compatibilityContractVersion -ne 1 -or $prepared.runtimeExecutablePath -cne $runtime.Path -or $prepared.runtimeExecutableSha256 -cne $runtime.ExecutableSha256) { throw 'Local selection preparation returned invalid compatibility/provenance metadata.' }
+    $reviewedAdapter = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'templates\codex-contract-1.json') -Raw | ConvertFrom-Json -ErrorAction Stop
     if ($prepared.instructionSha256 -cne $reviewedAdapter.expectedInstructionSha256 -or $prepared.instructionUtf8ByteLength -ne $reviewedAdapter.expectedInstructionUtf8ByteLength) {
         throw 'Locally sourced Codex instructions do not match the reviewed provenance record.'
     }
     $hash = Get-CodexDevinBytesSha256 -Bytes ([Text.UTF8Encoding]::new($false).GetBytes($prepared.catalogText))
     if ($hash -cne $prepared.catalogSha256) { throw 'Generated catalog bytes do not match their recorded hash.' }
     Write-Host ('Fetched selection revision: ' + $prepared.revision)
+    Write-Host ('Backend version: ' + $runtime.Version + '; compatibility contract: ' + $prepared.compatibilityContractVersion + ' passed')
     $catalogSummary = ConvertFrom-Json -InputObject $prepared.catalogText -ErrorAction Stop
     Write-Host 'Generated logical models / efforts:'
     foreach ($model in $catalogSummary.models) {

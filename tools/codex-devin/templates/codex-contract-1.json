@@ -1,5 +1,5 @@
 {
-  "runtimeVersion": "0.159.0-alpha.12.1",
+  "compatibilityContractVersion": 1,
   "source": "codex_debug_models_bundled",
   "instructionField": "base_instructions",
   "expectedInstructionSha256": "B707476816BFE5E571A1BD2179F130FFF2B132DA5AB8E61063ACDB7FD24DAF12",

@@ -1,4 +1,6 @@
 import { expect, test } from "bun:test";
+import { readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { adminModels, codexSelectionManifest } from "../src/admin/model-catalog.js";
 import { initialModelSelection } from "../src/admin/model-selection.js";
 import type { DiscoveredModelMetadata } from "../src/devin.js";
@@ -10,10 +12,10 @@ import {
   parseSelectionJson,
   REVIEWED_RUNTIME_INSTRUCTIONS,
   sha256,
-  SUPPORTED_RUNTIME,
-  REVIEWED_RUNTIME_FILES,
+  COMPATIBILITY_CONTRACT_VERSION,
   loadRuntimeInstructionRecord,
   validateSelection,
+  probeGeneratedCatalog,
   type RuntimeCatalogRunner,
 } from "../tools/codex-devin/CodexSelection.js";
 
@@ -33,8 +35,14 @@ const fixtureRuntimeRecord = {
   expectedInstructionUtf8ByteLength: Buffer.byteLength(fixtureInstructions, "utf8"),
 };
 const runtimePath = process.platform === "win32" ? "C:\\codex\\codex.exe" : "/codex/codex";
+const SUPPORTED_RUNTIME = "0.159.2"; // Historical fixture, not a production version policy.
 const runtimeOutput = (instructions = fixtureInstructions) => Buffer.from(JSON.stringify({ models: [{ base_instructions: instructions }] }), "utf8");
-const fixtureRuntimeRunner: RuntimeCatalogRunner = (_path, _args) => ({ status: 0, stdout: runtimeOutput() });
+const fixtureRuntimeRunner: RuntimeCatalogRunner = (_path, _args, home) => {
+  if (_args.includes("--bundled")) return { status: 0, stdout: runtimeOutput() };
+  const catalog = JSON.parse(readFileSync(join(home, "catalog.json"), "utf8"));
+  for (const model of catalog.models) if (model.shell_type === "shell_command") model.shell_type = "unified_exec";
+  return { status: 0, stdout: JSON.stringify(catalog) };
+};
 const generate = (input: unknown, runtimeVersion = SUPPORTED_RUNTIME) => generateSelection(input, runtimeVersion, runtimePath, {
   runRuntime: fixtureRuntimeRunner,
   runtimeRecord: fixtureRuntimeRecord,
@@ -42,16 +50,15 @@ const generate = (input: unknown, runtimeVersion = SUPPORTED_RUNTIME) => generat
 
 test("reviewed runtime instruction provenance pins only a hash and UTF-8 byte length", () => {
   expect(SUPPORTED_RUNTIME).toBe("0.159.2");
-  expect(REVIEWED_RUNTIME_INSTRUCTIONS.runtimeVersion).toBe("0.159.2");
+  expect(REVIEWED_RUNTIME_INSTRUCTIONS.compatibilityContractVersion).toBe(1);
   expect(EXPECTED_INSTRUCTION_SHA256).toBe("B707476816BFE5E571A1BD2179F130FFF2B132DA5AB8E61063ACDB7FD24DAF12");
   expect(EXPECTED_INSTRUCTION_UTF8_BYTE_LENGTH).toBe(18043);
 });
 
-test("exact reviewed alpha adapter preserves Devin metadata and rejects unknown versions", () => {
+test("version-independent contract preserves Devin metadata for known and unknown versions", () => {
   const version = "0.159.0-alpha.12.1";
-  const record = loadRuntimeInstructionRecord(version);
-  expect(Object.keys(REVIEWED_RUNTIME_FILES).sort()).toEqual([version, "0.159.2"]);
-  expect(record.runtimeVersion).toBe(version);
+  const record = loadRuntimeInstructionRecord();
+  expect(COMPATIBILITY_CONTRACT_VERSION).toBe(1);
   expect(record.expectedInstructionSha256).toBe(EXPECTED_INSTRUCTION_SHA256);
   expect(record.expectedInstructionUtf8ByteLength).toBe(18043);
   expect(record.modelMetadata).toEqual(REVIEWED_RUNTIME_INSTRUCTIONS.modelMetadata);
@@ -62,9 +69,8 @@ test("exact reviewed alpha adapter preserves Devin metadata and rejects unknown 
     expect(model.multi_agent_version).toBe("v1");
     expect(model.shell_type).toBe("shell_command");
   }
-  expect(() => loadRuntimeInstructionRecord("0.159.0-alpha.12.2")).toThrow("No reviewed");
-  expect(() => loadRuntimeInstructionRecord("__proto__")).toThrow("No reviewed");
-  expect(() => extractRuntimeInstructions(version, runtimePath, fixtureRuntimeRunner, fixtureRuntimeRecord)).toThrow("No reviewed");
+  expect(generate(selectionFixture(), "99.42.7").runtimeVersion).toBe("99.42.7");
+  expect(() => extractRuntimeInstructions("__proto__", runtimePath, fixtureRuntimeRunner, fixtureRuntimeRecord)).toThrow("provenance");
   for (const output of [
     { models: [{ base_instructions: "wrong fixture" }] },
     { models: [] },
@@ -98,13 +104,61 @@ test("bundled runtime extraction rejects a missing instruction template", () => 
     .toThrow("reviewed SHA-256 and UTF-8 length");
 });
 
-test("unknown runtimes fail before the local catalog command runs", () => {
+test("unknown compatible runtimes pass instruction provenance", () => {
   let called = false;
-  expect(() => extractRuntimeInstructions("0.159.3", runtimePath, () => {
+  expect(extractRuntimeInstructions("99.42.7", runtimePath, () => {
     called = true;
     return { status: 0, stdout: runtimeOutput() };
-  }, fixtureRuntimeRecord)).toThrow("No reviewed Codex catalog adapter");
-  expect(called).toBe(false);
+  }, fixtureRuntimeRecord)).toBe(fixtureInstructions);
+  expect(called).toBe(true);
+});
+
+test("instruction source categories, malformed structures and output bounds fail closed", () => {
+  const extract = (stdout: string | Uint8Array) => extractRuntimeInstructions("99.42.7", runtimePath, () => ({ status: 0, stdout }), fixtureRuntimeRecord);
+  expect(() => extract(JSON.stringify({ models: [] }))).toThrow("instruction_source_unrecognized");
+  expect(() => extract(JSON.stringify({ models: [{ base_instructions: fixtureInstructions }, { base_instructions: fixtureInstructions }] }))).toThrow("instruction_source_ambiguous");
+  for (const root of [{}, { models: {} }, { models: [null] }, { models: [{ base_instructions: 42 }] }]) expect(() => extract(JSON.stringify(root))).toThrow();
+  expect(() => extract(Buffer.from([0xff]))).toThrow();
+  expect(() => extract(" ".repeat(2 * 1024 * 1024 + 1))).toThrow();
+});
+
+test("contract rejects backend rejection, field/effort/model/V1 changes and unknown shell normalization", () => {
+  const result = generate(selectionFixture());
+  const models = JSON.parse(result.catalogText).models;
+  const mutations = [
+    (c: any) => { c.models = []; },
+    (c: any) => { c.models[0].slug = "different-model"; },
+    (c: any) => { c.models[0].default_reasoning_level = "high"; },
+    (c: any) => { c.models[0].supported_reasoning_levels = []; },
+    (c: any) => { c.models[0].multi_agent_version = "v2"; },
+    (c: any) => { c.models[0].supported_in_api = "true"; },
+    (c: any) => { c.models[0].shell_type = "unknown"; },
+    (c: any) => { delete c.models[0].context_window; },
+  ];
+  for (const mutate of mutations) {
+    expect(() => probeGeneratedCatalog(runtimePath, models, result.roles, (path, args, home) => {
+      const r = fixtureRuntimeRunner(path, args, home);
+      const c = JSON.parse(r.stdout as string); mutate(c);
+      return { status: 0, stdout: JSON.stringify(c) };
+    })).toThrow();
+  }
+  expect(() => probeGeneratedCatalog(runtimePath, models, result.roles, () => ({ status: 1, stdout: null }))).toThrow("generated_catalog_rejected");
+  for (const file of ["config.toml", "worker.toml"]) expect(() => probeGeneratedCatalog(runtimePath, models, result.roles, (path, args, home) => {
+    const r = fixtureRuntimeRunner(path, args, home);
+    writeFileSync(join(home!, file), "synthetic incompatible mutation");
+    return r;
+  })).toThrow("provider_security_or_role_mutation");
+});
+
+test("contract proves complete shell alias equality and disabled stays disabled", () => {
+  const result = generate(selectionFixture(), "99.42.7");
+  expect(result.compatibilityContractVersion).toBe(1);
+  expect(() => probeGeneratedCatalog(runtimePath, JSON.parse(result.catalogText).models, result.roles, (path, args, home) => {
+    const r = fixtureRuntimeRunner(path, args, home);
+    const c = JSON.parse(r.stdout as string);
+    if (c.models[0].shell_type === "disabled") c.models[0].shell_type = "unified_exec";
+    return { status: 0, stdout: JSON.stringify(c) };
+  })).toThrow("unsupported_shell_normalization");
 });
 
 test("generated catalog receives the locally sourced instructions", () => {
@@ -178,8 +232,8 @@ for (const [name, mutate] of Object.entries(mutations)) test(`selection fails cl
   mutate(fixture);
   expect(() => validateSelection(fixture)).toThrow("no defaults");
 });
-test("unsupported runtime does not generate a catalog", () => {
-  expect(() => generate(selectionFixture(), "0.159.3")).toThrow("No reviewed");
+test("malformed runtime provenance does not generate a catalog", () => {
+  expect(() => generate(selectionFixture(), "not-a-version")).toThrow("provenance");
 });
 test("duplicate JSON fields and malformed JSON fail closed", () => {
   expect(() => parseSelectionJson('{"schemaVersion":1,"schemaVersion":2}')).toThrow();

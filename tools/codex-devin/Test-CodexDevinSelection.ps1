@@ -83,6 +83,7 @@ try {
         $state = Get-Content (Join-Path $run.FullName 'state.json') -Raw | ConvertFrom-Json
         $runtime = Get-CodexDevinDesktopRuntime
         Assert-Selection ((Get-CodexDevinSha256 $state.catalogPath) -ceq $state.catalogSha256 -and $state.selectionRevision -eq 1 -and $state.runtimeVersion -ceq $runtime.Version -and $state.instructionSha256 -ceq 'B707476816BFE5E571A1BD2179F130FFF2B132DA5AB8E61063ACDB7FD24DAF12' -and $state.instructionUtf8ByteLength -eq 18043) 'recovery records catalog integrity and runtime/instruction provenance'
+        Assert-Selection ($state.compatibilityContractVersion -eq 1 -and $state.runtimeExecutablePath -ceq $runtime.Path -and $state.runtimeExecutableSha256 -ceq $runtime.ExecutableSha256) 'recovery records passed contract and exact managed executable fingerprint'
         $hashes += $state.catalogSha256
         if ($mode -eq 'Local') {
             $runtime = Get-CodexDevinDesktopRuntime
@@ -125,6 +126,24 @@ try {
         else { Assert-Selection (-not (Test-Path $workerPath)) 'managed worker removed after restore' }
     }
     Assert-Selection (@($hashes | Select-Object -Unique).Count -eq 1) 'local and remote selection generate identical catalog hashes'
+    # Seven synthetic discovered variants, actual local runtime; no network or inference.
+    $fullFixtureCode = 'import {familyFixture as f} from "./test/fixtures/model-families.ts"; import {adminModels,codexSelectionManifest} from "./src/admin/model-catalog.ts"; import {initialModelSelection} from "./src/admin/model-selection.ts"; const rows=[f("swe-2-medium","SWE-2","medium"),f("swe-2-high","SWE-2","high"),f("swe-2-max","SWE-2","max"),f("gpt-5-6-luna-max","GPT-5.6 Luna","max"),f("gpt-6-1-sol-low","GPT-6.1 Sol","low"),f("gpt-6-1-sol-medium","GPT-6.1 Sol","medium"),f("glm-5-3-flash-low","GLM-5.3 Flash","low",{context1m:true})]; const state={...initialModelSelection(),enabledModels:rows.map(m=>m.id)}; console.log(JSON.stringify(codexSelectionManifest(state,adminModels(rows,state))));'
+    $fullManifest = Invoke-CodexDevinSelectionProcess -Executable $bun -Arguments @('--no-env-file', '-e', $fullFixtureCode)
+    $runtime = Get-CodexDevinDesktopRuntime
+    $preparedJson = Invoke-CodexDevinSelectionProcess -Executable $bun -Arguments @('--no-env-file','run',(Join-Path $PSScriptRoot 'CodexSelection.ts'),$runtime.Version,$runtime.Path) -InputText $fullManifest
+    $fullPrepared = ConvertFrom-Json $preparedJson
+    $fullCatalog = ConvertFrom-Json $fullPrepared.catalogText
+    Assert-Selection ($fullPrepared.compatibilityContractVersion -eq 1 -and $fullPrepared.runtimeVersion -ceq $runtime.Version) 'installed backend passes contract without version membership'
+    $expected = @{
+        'glm-5-3-flash-1m' = @('low','low')
+        'gpt-5-6-luna' = @('max','max')
+        'gpt-6-1-sol' = @('low','low,medium')
+        'swe-2' = @('medium','medium,high,max')
+    }
+    Assert-Selection ($fullCatalog.models.Count -eq $expected.Count) 'full logical model set accepted by installed backend'
+    foreach ($model in $fullCatalog.models) {
+        Assert-Selection ($expected.ContainsKey($model.slug) -and $model.default_reasoning_level -ceq $expected[$model.slug][0] -and (($model.supported_reasoning_levels | ForEach-Object effort) -join ',') -ceq $expected[$model.slug][1]) ('exact logical efforts preserved: ' + $model.slug)
+    }
 } finally {
     Remove-Variable -Name CodexDevinSelectionTestContext -Scope Global -ErrorAction SilentlyContinue
     if ($null -eq $originalHome) { Remove-Item Env:CODEX_HOME -ErrorAction SilentlyContinue } else { $env:CODEX_HOME = $originalHome }

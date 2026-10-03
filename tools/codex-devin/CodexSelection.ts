@@ -1,7 +1,9 @@
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { readFileSync } from "node:fs";
-import { isAbsolute } from "node:path";
+import { readFileSync, writeFileSync, mkdtempSync, rmSync } from "node:fs";
+import { isAbsolute, join } from "node:path";
+import { tmpdir } from "node:os";
+import { isDeepStrictEqual } from "node:util";
 import { fileURLToPath } from "node:url";
 import { CODEX_PROFILE_VERSION } from "../../src/admin/codex-model-profiles.js";
 
@@ -26,11 +28,7 @@ const text = (value: unknown): string => {
   return value;
 };
 export const sha256 = (bytes: string | Uint8Array) => createHash("sha256").update(bytes).digest("hex").toUpperCase();
-export const SUPPORTED_RUNTIME = "0.159.2";
-export const REVIEWED_RUNTIME_FILES: Readonly<Record<string, string>> = Object.freeze({
-  "0.159.2": "codex-0.159.2.json",
-  "0.159.0-alpha.12.1": "codex-0.159.0-alpha.12.1.json",
-});
+export const COMPATIBILITY_CONTRACT_VERSION = 1;
 export interface RuntimeModelMetadata {
   multi_agent_version: string;
   shell_type: string;
@@ -41,7 +39,7 @@ export interface RuntimeModelMetadata {
   experimental_supported_tools: unknown[];
 }
 export interface RuntimeInstructionRecord {
-  runtimeVersion: string;
+  compatibilityContractVersion: number;
   source: string;
   instructionField: string;
   expectedInstructionSha256: string;
@@ -52,23 +50,22 @@ export interface RuntimeCatalogRunnerResult {
   status: number | null;
   stdout: Uint8Array | string | null;
 }
-export type RuntimeCatalogRunner = (runtimePath: string, args: string[]) => RuntimeCatalogRunnerResult;
+export type RuntimeCatalogRunner = (runtimePath: string, args: string[], home?: string) => RuntimeCatalogRunnerResult;
 export interface RuntimeSelectionDependencies {
   runRuntime?: RuntimeCatalogRunner;
   runtimeRecord?: RuntimeInstructionRecord;
 }
 
-export const loadRuntimeInstructionRecord = (runtimeVersion = SUPPORTED_RUNTIME): RuntimeInstructionRecord => {
-  if (!Object.hasOwn(REVIEWED_RUNTIME_FILES, runtimeVersion)) throw new Error("No reviewed Codex catalog adapter for the installed Desktop runtime.");
+export const loadRuntimeInstructionRecord = (): RuntimeInstructionRecord => {
   let parsed: unknown;
   try {
-    parsed = JSON.parse(readFileSync(new URL(`./templates/${REVIEWED_RUNTIME_FILES[runtimeVersion]}`, import.meta.url), "utf8"));
+    parsed = JSON.parse(readFileSync(new URL("./templates/codex-contract-1.json", import.meta.url), "utf8"));
   } catch {
     throw new Error("Reviewed Codex runtime metadata could not be loaded.");
   }
   const root = object(parsed);
-  keys(root, ["runtimeVersion", "source", "instructionField", "expectedInstructionSha256", "expectedInstructionUtf8ByteLength", "modelMetadata"]);
-  if (root.runtimeVersion !== runtimeVersion || root.source !== "codex_debug_models_bundled" || root.instructionField !== "base_instructions") fail();
+  keys(root, ["compatibilityContractVersion", "source", "instructionField", "expectedInstructionSha256", "expectedInstructionUtf8ByteLength", "modelMetadata"]);
+  if (root.compatibilityContractVersion !== COMPATIBILITY_CONTRACT_VERSION || root.source !== "codex_debug_models_bundled" || root.instructionField !== "base_instructions") fail();
   const expectedInstructionSha256 = root.expectedInstructionSha256;
   if (typeof expectedInstructionSha256 !== "string" || !/^[A-Fa-f0-9]{64}$/.test(expectedInstructionSha256)) fail();
   const expectedInstructionUtf8ByteLength = positive(root.expectedInstructionUtf8ByteLength);
@@ -90,7 +87,7 @@ export const loadRuntimeInstructionRecord = (runtimeVersion = SUPPORTED_RUNTIME)
     experimental_supported_tools: [],
   };
   return {
-    runtimeVersion,
+    compatibilityContractVersion: COMPATIBILITY_CONTRACT_VERSION,
     source: "codex_debug_models_bundled",
     instructionField: "base_instructions",
     expectedInstructionSha256: (expectedInstructionSha256 as string).toUpperCase(),
@@ -102,32 +99,87 @@ export const REVIEWED_RUNTIME_INSTRUCTIONS = loadRuntimeInstructionRecord();
 export const EXPECTED_INSTRUCTION_SHA256 = REVIEWED_RUNTIME_INSTRUCTIONS.expectedInstructionSha256;
 export const EXPECTED_INSTRUCTION_UTF8_BYTE_LENGTH = REVIEWED_RUNTIME_INSTRUCTIONS.expectedInstructionUtf8ByteLength;
 
-const runBundledRuntimeCatalog: RuntimeCatalogRunner = (runtimePath, args) => {
+const runBundledRuntimeCatalog: RuntimeCatalogRunner = (runtimePath, args, home) => {
   const result = spawnSync(runtimePath, args, {
     windowsHide: true,
     timeout: 10_000,
     maxBuffer: 2 * 1024 * 1024,
+    ...(home ? { env: { ...process.env, CODEX_HOME: home }, cwd: home } : {}),
   });
   return { status: result.status, stdout: result.stdout };
 };
+
+/** Backend acceptance is tested only in a disposable home, never the active home. */
+export function probeGeneratedCatalog(runtimePath: string, models: Record<string, unknown>[], roles: Selection["roles"], runner: RuntimeCatalogRunner): void {
+  const home = mkdtempSync(join(tmpdir(), "codex-contract-"));
+  const catalogPath = join(home, "catalog.json");
+  const configPath = join(home, "config.toml");
+  const workerPath = join(home, "worker.toml");
+  const toml = (s: string) => JSON.stringify(s.replaceAll("\\", "/"));
+  const config = `model = ${toml(roles.default.modelId)}\nmodel_reasoning_effort = ${toml(roles.default.reasoningEffort)}\nmodel_provider = "devin_gateway"\nmodel_catalog_json = ${toml(catalogPath)}\nmulti_agent_version = "v1"\nsandbox_mode = "workspace-write"\napproval_policy = "never"\n[model_providers.devin_gateway]\nname = "Offline contract probe"\nbase_url = "http://127.0.0.1:1/v1"\nwire_api = "responses"\nrequires_openai_auth = false\nrequest_max_retries = 0\nstream_max_retries = 0\n[agents.swe_worker]\nconfig_file = ${toml(workerPath)}\n`;
+  const worker = `model = ${toml(roles.swe_worker.modelId)}\nmodel_reasoning_effort = ${toml(roles.swe_worker.reasoningEffort)}\n`;
+  const load = (shell: string): Record<string, unknown> => {
+    writeFileSync(catalogPath, JSON.stringify({ models: models.map(m => ({ ...m, shell_type: shell })) }), { mode: 0o600 });
+    const result = runner(runtimePath, ["debug", "models"], home);
+    if (result.status !== 0 || result.stdout === null) throw new Error("generated_catalog_rejected");
+    let parsed: unknown;
+    try {
+      const bytes = typeof result.stdout === "string" ? Buffer.from(result.stdout) : result.stdout;
+      if (bytes.length > 2 * 1024 * 1024) throw new Error();
+      parsed = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
+    } catch { throw new Error("effective_catalog_invalid"); }
+    const root = object(parsed);
+    if (!Array.isArray(root.models) || root.models.length !== models.length) throw new Error("effective_model_set_changed");
+    const seen = new Set<string>();
+    for (const raw of root.models) {
+      const row = object(raw);
+      const expected = models.find(m => m.slug === row.slug);
+      if (!expected || seen.has(row.slug as string)) throw new Error("effective_model_set_changed");
+      seen.add(row.slug as string);
+      for (const key of Object.keys(expected)) {
+        if (key === "shell_type") continue;
+        if (!isDeepStrictEqual(row[key], expected[key])) throw new Error("effective_model_contract_changed");
+      }
+      const allowed = shell === "disabled" ? ["disabled"] : shell === "unified_exec" ? ["unified_exec"] : ["shell_command", "unified_exec"];
+      if (!allowed.includes(row.shell_type as string)) throw new Error("unsupported_shell_normalization");
+    }
+    if (readFileSync(configPath, "utf8") !== config || readFileSync(workerPath, "utf8") !== worker) throw new Error("provider_security_or_role_mutation");
+    return root;
+  };
+  try {
+    writeFileSync(configPath, config, { mode: 0o600 });
+    writeFileSync(workerPath, worker, { mode: 0o600 });
+    const legacy = load("shell_command");
+    const canonical = load("unified_exec");
+    // Require complete effective equality, not merely a permissive shell label.
+    if (!isDeepStrictEqual(legacy, canonical)) throw new Error("shell_alias_not_equivalent");
+    load("disabled");
+  } finally {
+    // Only this invocation's freshly allocated disposable directory is removed.
+    rmSync(home, { recursive: true, force: true });
+  }
+}
 
 /** Capture the installed runtime's bundled catalog in memory; never forward its output to diagnostics. */
 export function extractRuntimeInstructions(
   runtimeVersion: string,
   runtimePath: string,
   runner: RuntimeCatalogRunner = runBundledRuntimeCatalog,
-  record: RuntimeInstructionRecord = loadRuntimeInstructionRecord(runtimeVersion),
+  record: RuntimeInstructionRecord = loadRuntimeInstructionRecord(),
 ): string {
-  if (!Object.hasOwn(REVIEWED_RUNTIME_FILES, runtimeVersion) || record.runtimeVersion !== runtimeVersion
+  if (!/^[0-9]+\.[0-9]+\.[0-9]+(?:-[A-Za-z0-9.-]+)?$/.test(runtimeVersion) || record.compatibilityContractVersion !== COMPATIBILITY_CONTRACT_VERSION
     || record.instructionField !== "base_instructions" || record.source !== "codex_debug_models_bundled") {
-    throw new Error("No reviewed Codex catalog adapter for the installed Desktop runtime.");
+    throw new Error("Invalid compatibility contract or backend version provenance.");
   }
   if (typeof runtimePath !== "string" || !isAbsolute(runtimePath)) throw new Error("The installed Desktop runtime path is invalid.");
   let result: RuntimeCatalogRunnerResult;
+  const probeHome = mkdtempSync(join(tmpdir(), "codex-instruction-probe-"));
   try {
-    result = runner(runtimePath, ["debug", "models", "--bundled"]);
+    result = runner(runtimePath, ["debug", "models", "--bundled"], probeHome);
   } catch {
     throw new Error("The installed Desktop bundled catalog could not be read.");
+  } finally {
+    rmSync(probeHome, { recursive: true, force: true });
   }
   if (result.status !== 0 || result.stdout === null) throw new Error("The installed Desktop bundled catalog could not be read.");
   let catalog: unknown;
@@ -135,6 +187,7 @@ export function extractRuntimeInstructions(
     const output = typeof result.stdout === "string"
       ? result.stdout
       : new TextDecoder("utf-8", { fatal: true }).decode(result.stdout);
+    if (Buffer.byteLength(output, "utf8") > 2 * 1024 * 1024) throw new Error();
     catalog = JSON.parse(output);
   } catch {
     throw new Error("The installed Desktop bundled catalog was invalid.");
@@ -143,14 +196,16 @@ export function extractRuntimeInstructions(
   if (!Array.isArray(root.models) || root.models.length > 1000) throw new Error("The installed Desktop bundled catalog was invalid.");
   const matches: string[] = [];
   for (const entry of root.models) {
-    if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) throw new Error("The installed Desktop bundled catalog was invalid.");
     const instructions = (entry as Record<string, unknown>)[record.instructionField];
+    if (instructions !== undefined && typeof instructions !== "string") throw new Error("The installed Desktop bundled catalog was invalid.");
     if (typeof instructions !== "string") continue;
     const bytes = Buffer.from(instructions, "utf8");
     if (bytes.length === record.expectedInstructionUtf8ByteLength
       && sha256(bytes) === record.expectedInstructionSha256.toUpperCase()) matches.push(instructions);
   }
-  if (matches.length !== 1) throw new Error("Installed Desktop instructions did not match the reviewed SHA-256 and UTF-8 length.");
+  if (matches.length === 0) throw new Error("instruction_source_unrecognized: reviewed SHA-256 and UTF-8 length absent.");
+  if (matches.length !== 1) throw new Error("instruction_source_ambiguous: reviewed SHA-256 and UTF-8 length duplicated.");
   return matches[0];
 }
 
@@ -232,9 +287,8 @@ export function validateSelection(input: unknown): Selection {
 }
 
 export function generateSelection(input: unknown, runtimeVersion: string, runtimePath: string, dependencies: RuntimeSelectionDependencies = {}) {
-  if (!Object.hasOwn(REVIEWED_RUNTIME_FILES, runtimeVersion)) throw new Error("No reviewed Codex catalog adapter for the installed Desktop runtime.");
   const selection = validateSelection(input);
-  const record = dependencies.runtimeRecord ?? loadRuntimeInstructionRecord(runtimeVersion);
+  const record = dependencies.runtimeRecord ?? loadRuntimeInstructionRecord();
   const instructions = extractRuntimeInstructions(runtimeVersion, runtimePath, dependencies.runRuntime, record);
   const metadata = record.modelMetadata;
   const models = selection.models.map((model, index) => ({
@@ -256,7 +310,11 @@ export function generateSelection(input: unknown, runtimeVersion: string, runtim
     base_instructions: instructions,
   }));
   const catalogText = JSON.stringify({ models }, null, 2) + "\n";
-  return { schemaVersion: 1, runtimeVersion, revision: selection.revision, selectionETag: selection.selectionETag,
+  probeGeneratedCatalog(runtimePath, models, selection.roles, dependencies.runRuntime ?? runBundledRuntimeCatalog);
+  return { schemaVersion: 1, runtimeVersion, compatibilityContractVersion: COMPATIBILITY_CONTRACT_VERSION,
+    runtimeExecutablePath: runtimePath,
+    runtimeExecutableSha256: dependencies.runRuntime ? undefined : sha256(readFileSync(runtimePath)),
+    revision: selection.revision, selectionETag: selection.selectionETag,
     instructionSha256: record.expectedInstructionSha256.toUpperCase(), instructionUtf8ByteLength: record.expectedInstructionUtf8ByteLength,
     catalogSha256: sha256(catalogText), catalogText, roles: selection.roles };
 }
@@ -286,7 +344,7 @@ export function parseSelectionJson(json: string): unknown {
   return parsed;
 }
 
-// The CLI reads a bounded manifest from stdin; it performs no network or file writes.
+// Bounded stdin; only disposable offline probe files are written, never active files.
 if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
   try {
     const input = readFileSync(0);

@@ -130,6 +130,9 @@ try {
         selectionRevision = $selection.revision
         selectionETag = $selection.selectionETag
         runtimeVersion = $selection.runtimeVersion
+        compatibilityContractVersion = $selection.compatibilityContractVersion
+        runtimeExecutableSha256 = $selection.runtimeExecutableSha256
+        runtimeExecutablePath = $selection.runtimeExecutablePath
         instructionSha256 = $selection.instructionSha256
         instructionUtf8ByteLength = $selection.instructionUtf8ByteLength
     }

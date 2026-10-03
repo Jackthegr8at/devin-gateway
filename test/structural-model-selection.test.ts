@@ -1,4 +1,6 @@
 import { expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { familyFixture } from "./fixtures/model-families.ts";
 import { adminModels, codexSelectionManifest, validateDiscoveredRoles } from "../src/admin/model-catalog.ts";
 import { initialModelSelection } from "../src/admin/model-selection.ts";
@@ -31,7 +33,12 @@ test("seven enabled variants export four logical models without tested gating", 
   expect(manifest.models.find(m => m.id === "swe-2")!.defaultReasoningEffort).toBe("medium");
   const synthetic = "synthetic local runtime fixture";
   const dependencies = {
-    runRuntime: () => ({ status: 0, stdout: JSON.stringify({ models: [{ base_instructions: synthetic }] }) }),
+    runRuntime: (_path: string, args: string[], home?: string) => {
+      if (args.includes("--bundled")) return { status: 0, stdout: JSON.stringify({ models: [{ base_instructions: synthetic }] }) };
+      const catalog = JSON.parse(readFileSync(join(home!, "catalog.json"), "utf8"));
+      for (const model of catalog.models) if (model.shell_type === "shell_command") model.shell_type = "unified_exec";
+      return { status: 0, stdout: JSON.stringify(catalog) };
+    },
     runtimeRecord: { ...REVIEWED_RUNTIME_INSTRUCTIONS, expectedInstructionSha256: sha256(synthetic), expectedInstructionUtf8ByteLength: Buffer.byteLength(synthetic) },
   };
   const runtime = process.platform === "win32" ? "C:\\synthetic-runtime\\codex.exe" : "/synthetic-runtime/codex";
