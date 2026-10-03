@@ -99,6 +99,54 @@ test("only normalized structured fields retain history-mentioned IDs; credential
   for (const raw of [privateText, credential, "private-looking-id", "arbitrary-user-id", "arbitrary text", "synthetic-cookie-value-9251"]) expect(json).not.toContain(raw);
 }));
 
+test("sequential evidence isolates same-name calls, consumes replay and retains failed pending calls until expiry", async () => fixture(async store => {
+  let now = 1;
+  const tracker = new ModelValidationTracker(store, () => now);
+  function finish(emitted: string[], returned: string[], failed = false) {
+    let outcomes: unknown;
+    const d = new ResponsesSafeDiagnostic("synthetic-sequential", now, undefined, (r, e) => { tracker.observe("synthetic-scope", r, e); outcomes = r.correlation_results; }, false);
+    d.recordResolvedRouting({ logicalModel: "swe-2", requestedEffort: "high", resolvedModelId: "swe-2-high" });
+    d.recordUpstreamResponse(200, true);
+    for (const id of emitted) d.recordNormalizedEmittedToolCall({ id, name: "exec_command" });
+    for (const id of returned) d.recordNormalizedFunctionCallOutput({ role: "tool", tool_call_id: id, content: "Synthetic output" }, true);
+    if (failed) d.recordFailure({ source: "synthetic", classification: "devin_stream_error" }); else d.recordSuccessfulCompletion();
+    d.finalize(); return outcomes;
+  }
+  finish(["synthetic-A"], []);
+  expect(finish([], ["synthetic-B"])).toEqual({ no_issued_call: 1 });
+  expect(finish(["synthetic-B"], ["synthetic-A"])).toEqual({ matched_success: 1, issued_call_recorded: 1 });
+  await tracker.drain(); const first = await store.read();
+  expect(first.revision).toBe(2);
+  expect(finish([], ["synthetic-A"])).toEqual({ no_issued_call: 1 });
+  await tracker.drain(); expect(await store.read()).toEqual(first);
+  expect(finish([], ["synthetic-B"], true)).toEqual({ request_ineligible: 1 });
+  await tracker.drain(); expect(await store.read()).toEqual(first);
+  expect(finish([], ["synthetic-A", "synthetic-B"])).toEqual({ no_issued_call: 1, matched_success: 1 });
+  await tracker.drain(); expect((await store.read()).revision).toBe(3);
+  expect(finish([], ["synthetic-B"])).toEqual({ no_issued_call: 1 });
+  finish(["synthetic-expiring"], []); finish([], ["synthetic-expiring"], true);
+  now += 3600001;
+  expect(finish([], ["synthetic-expiring"])).toEqual({ expired_pending: 1, no_issued_call: 1 });
+  await tracker.drain(); expect((await store.read()).revision).toBe(3);
+}));
+
+test("returned evidence considers the first 16 outputs while converter preserves all 17 history items", async () => fixture(async (_store, root) => {
+  const { responsesInputToOpenAIMessages, openaiToInternal, toDevinPrompts } = await import("../src/convert.ts");
+  const input = Array.from({ length: 17 }, (_, i) => ({ type: "function_call_output", call_id: `synthetic-cap-${i}`, output: `Synthetic output ${i}` }));
+  const messages = responsesInputToOpenAIMessages(input);
+  expect(toDevinPrompts(openaiToInternal(messages), "synthetic-cascade").map(item => item.toolCallId)).toEqual(input.map(item => item.call_id));
+  let captured: string[] = [];
+  const path = join(root, "cap-safe.jsonl");
+  const d = new ResponsesSafeDiagnostic("synthetic-cap", Date.now(), path, (_record, evidence) => { captured = evidence.returned.map(item => item.id); });
+  for (const message of messages) d.recordNormalizedFunctionCallOutput(message, true);
+  d.recordSuccessfulCompletion(); d.finalize();
+  expect(captured).toEqual(input.slice(0, 16).map(item => item.call_id));
+  const safe = await readFile(path, "utf8"); const record = JSON.parse(safe);
+  expect(record.tool_evidence_returned_count).toBe(16);
+  expect(record.bridge_outcomes.evidence_limit).toBe(1);
+  expect(safe).not.toContain("synthetic-cap-"); expect(safe).not.toContain("Synthetic output");
+}));
+
 test("new booleans and routing are allowlisted; raw tool/prompt/token content is absent", async () => fixture(async (_store, root) => {
   const path = join(root, "synthetic-safe.jsonl"); const d = new ResponsesSafeDiagnostic("synthetic", Date.now(), path);
   d.addSensitiveValues(["synthetic-private-token"]); d.recordRouting("swe-2", "high", "swe-2-high");

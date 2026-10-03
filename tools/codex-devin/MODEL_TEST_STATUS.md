@@ -28,6 +28,61 @@ Follow the counters in order: `upstream_toolcall_event_count` → `normalized_to
 
 The existing bridge and diagnostic identifier validators have different limits. A synthetically long nonempty call ID can be emitted to Responses while rejected for evidence as invalid_format. The new counters identify that boundary; this is not proof that live SWE IDs have that shape. Production tool forcing, routing and automatic promotion rules are unchanged.
 
+## Sequential tool-loop acceptance boundaries
+
+The Responses bridge is structurally iterative across requests and regression-tested
+through two and three sequential tool cycles in both JSON and SSE modes. This is
+not a claim of unlimited tested conversation length. One distinct tool call per
+model response remains intentional; upstream parallel tool calls remain disabled.
+
+The client supplies the entire ordered history on every continuation. There is no
+server-side `previous_response_id` history store. The final request after two
+cycles contains user, assistant call A, result A, assistant call B, result B.
+Call IDs retain exact spelling; arguments preserve JSON semantics rather than
+whitespace/key formatting. Every tool-call response is itself `completed`; it is
+not the conversation's final text response.
+
+Issued-call evidence is memory-only and effectively keyed by credential scope,
+exact opaque call ID, concrete model and effort. There is **no independent Codex
+thread ID**. Distinct provider IDs isolate ordinary conversations, but two threads
+sharing the complete tuple are not formally isolated by a separate thread boundary.
+Do not invent a thread identifier from prompts or request-local IDs.
+
+A completed successful round trip may establish Tested. A different completed
+call may refresh status/revision. Replaying a consumed output cannot promote it
+again. Failed requests do not consume pending evidence or clear prior success;
+pending calls expire after one hour. Existing model/effort/credential mismatch
+checks remain required.
+
+Returned evidence considers the **first 16 valid returned calls**, in input order,
+per request (not the last 16). Full normalized history still goes to Devin; the
+cap affects only automatic Tested evidence. An output beyond this cap cannot be
+claimed as covered by automatic evidence. This does not limit the planned two-
+and three-cycle acceptance test.
+
+Tool frames are consolidated until upstream completion. For the supported
+`text -> toolcall -> text` fixture, Responses emits combined text followed by the
+completed function call, not literal tool/text interleaving. Reasoning before
+text/tool is covered by existing SSE index tests. Re-entrant reasoning **after**
+text remains outside validated ordering: the current single message/reasoning
+state can reuse item identities/indexes if reasoning starts again. Do not claim
+that arbitrary alternation is supported or change it without a separate review.
+
+Offline HTTP-abort coverage waits for the first real downstream text delta,
+aborts the client, and checks that the mock upstream HTTP request is aborted.
+This validates server signal propagation, not every Desktop cancellation UI path.
+
+### Manual sequential acceptance (not run by offline tests)
+
+Use the existing guarded workflow and a new thread with a Tested model/effort.
+Ask for exactly two dependent local commands: first hostname, then (only after
+its result) current date; finally report both. Do not spawn workers or run tools
+in parallel. Verify three completed Responses requests: call A, result A plus
+distinct call B, then results A/B plus final text. Safe diagnostics must show
+the expected emitted/returned counts and successful correlation without raw
+IDs, arguments, results, credentials or prompt text. Only after this passes,
+repeat with a third sequential read-only command for the PowerShell version.
+
 ## Manual marks and persistence
 
 Use Mark tested / Mark untested on the exact variant row (for example SWE-2 Medium, High and Max). Marks save immediately; Save/Cancel applies only to selection drafts. The buttons never change enabled state or roles. The compact status badge tooltip reports manual/automatic provenance and the last automatic success timestamp when available.

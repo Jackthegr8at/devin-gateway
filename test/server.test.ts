@@ -1211,6 +1211,157 @@ test("long bridge-emitted call retains evidence without altering Responses ident
   } finally { await gateway.cleanup(); await upstream.stop(); rmSync(directory, { recursive: true, force: true }); if (oldFlag === undefined) delete process.env.DEVIN_RESPONSES_SAFE_DIAGNOSTICS; else process.env.DEVIN_RESPONSES_SAFE_DIAGNOSTICS = oldFlag; if (oldPath === undefined) delete process.env.DEVIN_RESPONSES_SAFE_DIAGNOSTICS_PATH; else process.env.DEVIN_RESPONSES_SAFE_DIAGNOSTICS_PATH = oldPath; }
 });
 
+// Synthetic full-history fixtures: no commands are executed by these tests.
+describe("sequential Responses tool loops", () => {
+  const tools = [{ type: "function", name: "exec_command", parameters: { type: "object" } }];
+  test("downstream HTTP abort propagates to the active upstream request", async () => {
+    let aborted = false;
+    const upstream = Bun.serve({ hostname: HOST, port: 0, fetch(req) {
+      if (new URL(req.url).pathname === DEVIN_AUTH_PATH) return new Response(Uint8Array.from(encodeString(1, "synthetic-jwt")));
+      req.signal.addEventListener("abort", () => { aborted = true; }, { once: true });
+      return new Response(new ReadableStream({ start(controller) { controller.enqueue(dataFrame({ text: "Synthetic first delta" })); } }));
+    } });
+    const gateway = await startGateway(upstream.url.origin, "synthetic-key");
+    const client = new AbortController();
+    try {
+      const response = await fetch(`${gateway.url}/v1/responses`, { method: "POST", signal: client.signal, headers: { "content-type": "application/json" }, body: JSON.stringify({ model: "swe-2-medium", input: "Synthetic", stream: true }) });
+      const reader = response.body!.getReader();
+      let received = "";
+      const deadline = Date.now() + 2000;
+      while (!received.includes("response.output_text.delta") && Date.now() < deadline) {
+        let timeout: ReturnType<typeof setTimeout> | undefined;
+        const chunk = await Promise.race([
+          reader.read(),
+          new Promise<never>((_resolve, reject) => { timeout = setTimeout(() => reject(new Error("Synthetic first delta deadline")), Math.max(1, deadline - Date.now())); }),
+        ]).finally(() => clearTimeout(timeout));
+        if (chunk.done) break;
+        received += new TextDecoder().decode(chunk.value);
+      }
+      expect(received).toContain("response.output_text.delta");
+      client.abort();
+      await reader.cancel().catch(() => {}); reader.releaseLock();
+      const abortDeadline = Date.now() + 2000;
+      while (!aborted && Date.now() < abortDeadline) await Bun.sleep(5);
+      expect(aborted).toBe(true);
+    } finally { client.abort(); await upstream.stop(true); await gateway.cleanup(); }
+  }, 6000);
+  async function sequence(stream: boolean, cycles: number, failAt?: number) {
+    const directory = mkdtempSync(join(tmpdir(), "synthetic-sequential-"));
+    const oldFlag = process.env.DEVIN_RESPONSES_SAFE_DIAGNOSTICS;
+    const oldPath = process.env.DEVIN_RESPONSES_SAFE_DIAGNOSTICS_PATH;
+    const diagnosticPath = join(directory, "safe.jsonl");
+    process.env.DEVIN_RESPONSES_SAFE_DIAGNOSTICS = "1";
+    process.env.DEVIN_RESPONSES_SAFE_DIAGNOSTICS_PATH = diagnosticPath;
+    const captured: ReturnType<typeof decodeChatRequest>[] = [];
+    let request = 0;
+    const upstream = startUpstream({
+      captureChatRequest: bytes => captured.push(decodeChatRequest(bytes)),
+      chatBody: () => {
+        const index = request++;
+        if (index === failAt) return framesBody([], { error: { code: "internal", message: "synthetic failure" } });
+        return index < cycles
+          ? framesBody([dataFrame({ toolCalls: [{ id: `synthetic-cycle-${index}`, name: "exec_command", argumentsJson: JSON.stringify({ cmd: `synthetic-step-${index}` }) }], stopReason: 10 })])
+          : framesBody([dataFrame({ text: "SYNTHETIC_FINAL" })]);
+      },
+    });
+    const gateway = await startGateway(upstream.url.origin, "synthetic-sequential-credential", { directory });
+    const history: Record<string, unknown>[] = [{ role: "user", content: "Synthetic sequential task" }];
+    const expected: ReturnType<typeof decodeChatRequest>["prompts"] = [{ source: 1, prompt: "Synthetic sequential task", toolCalls: [] }];
+    let previousRevision = 1;
+    try {
+      for (let index = 0; index <= cycles; index++) {
+        const response = await fetch(`${gateway.url}/v1/responses`, {
+          method: "POST", headers: { "content-type": "application/json" },
+          body: JSON.stringify({ model: "swe-2-high", reasoning: { effort: "high" }, stream, input: history, tools, parallel_tool_calls: true }),
+        });
+        const wire = await response.text();
+        const events = stream ? parseSse(wire).map(event => JSON.parse(event.data)) : [];
+        expect(captured[index].prompts).toEqual(expected);
+        expect(captured[index].disableParallelToolCalls).toBe(true);
+        const records = readFileSync(diagnosticPath, "utf8").trim().split("\n").map(line => JSON.parse(line));
+        const diagnostic = records.at(-1);
+        if (index === failAt) {
+          if (stream) {
+            expect(events.filter(event => event.type === "response.failed")).toHaveLength(1);
+            expect(events.some(event => event.type === "response.completed")).toBe(false);
+          } else {
+            expect(response.status).toBe(502);
+            expect(JSON.parse(wire).error).toBeDefined();
+          }
+          expect(diagnostic.correlation_results).toEqual({ request_ineligible: 1 });
+          const saved = JSON.parse(readFileSync(join(directory, "model-test-status.json"), "utf8"));
+          expect(saved.revision).toBe(previousRevision);
+          if (index > 1) expect(saved.variants["swe-2-high"].automatic.effort).toBe("high");
+          break;
+        }
+        expect(response.status).toBe(200);
+        expect(events.some(event => event.type === "response.failed")).toBe(false);
+        const completed = stream ? events.find(event => event.type === "response.completed").response : JSON.parse(wire);
+        expect(completed.status).toBe("completed");
+        if (index < cycles) {
+          expect(completed.output).toHaveLength(1);
+          const call = completed.output[0];
+          expect(call).toMatchObject({ type: "function_call", call_id: `synthetic-cycle-${index}`, name: "exec_command" });
+          expect(JSON.parse(call.arguments)).toEqual({ cmd: `synthetic-step-${index}` });
+          history.push(call, { type: "function_call_output", call_id: call.call_id, output: `Exit code: 0\nOutput:\nSynthetic result ${index}` });
+          expected.push(
+            { source: 2, toolCalls: [{ id: call.call_id, name: call.name, argumentsJson: JSON.stringify(JSON.parse(call.arguments)) }] },
+            { source: 4, prompt: `Exit code: 0\nOutput:\nSynthetic result ${index}`, toolCallId: call.call_id, toolCalls: [] },
+          );
+          expect(diagnostic.correlation_results.issued_call_recorded).toBe(1);
+        } else {
+          expect(completed.output).toHaveLength(1);
+          expect(completed.output[0].content[0].text).toBe("SYNTHETIC_FINAL");
+        }
+        if (index > 0) {
+          expect(diagnostic.correlation_results.matched_success).toBe(1);
+          if (index > 1) expect(diagnostic.correlation_results.no_issued_call).toBe(index - 1);
+        }
+        // Wait for the scheduled private status write, not an arbitrary sleep.
+        const expectedRevision = index + 1;
+        const deadline = Date.now() + 2000;
+        while (JSON.parse(readFileSync(join(directory, "model-test-status.json"), "utf8")).revision !== expectedRevision && Date.now() < deadline) {
+          await Bun.sleep(5);
+        }
+        const saved = JSON.parse(readFileSync(join(directory, "model-test-status.json"), "utf8"));
+        expect(saved.revision).toBe(expectedRevision);
+        previousRevision = expectedRevision;
+      }
+      const safe = readFileSync(diagnosticPath, "utf8");
+      for (const secret of ["synthetic-cycle-", "synthetic-step-", "Synthetic result", "synthetic-sequential-credential", "Synthetic sequential task"]) expect(safe).not.toContain(secret);
+      expect(captured.length).toBe((failAt ?? cycles) + 1);
+    } finally {
+      await gateway.cleanup(); await upstream.stop();
+      rmSync(directory, { recursive: true, force: true });
+      if (oldFlag === undefined) delete process.env.DEVIN_RESPONSES_SAFE_DIAGNOSTICS; else process.env.DEVIN_RESPONSES_SAFE_DIAGNOSTICS = oldFlag;
+      if (oldPath === undefined) delete process.env.DEVIN_RESPONSES_SAFE_DIAGNOSTICS_PATH; else process.env.DEVIN_RESPONSES_SAFE_DIAGNOSTICS_PATH = oldPath;
+    }
+  }
+  for (const stream of [false, true]) {
+    for (const cycles of [2, 3]) test(`${cycles} sequential cycles preserve complete history, distinct identities and final completion (${stream ? "SSE" : "JSON"})`, () => sequence(stream, cycles));
+    for (const failAt of [1, 2]) test(`continuation ${failAt} failure never fabricates success or clears prior Tested (${stream ? "SSE" : "JSON"})`, () => sequence(stream, 2, failAt));
+  }
+
+  test("text around a tool frame is combined before the completed function call", async () => {
+    const upstream = startUpstream({ chatBody: () => framesBody([
+      dataFrame({ text: "Synthetic before." }),
+      dataFrame({ toolCalls: [{ id: "synthetic-mixed", name: "exec_command", argumentsJson: "{}" }] }),
+      dataFrame({ text: "Synthetic after." }),
+    ]) });
+    const gateway = await startGateway(upstream.url.origin, "synthetic-key");
+    try {
+      for (const stream of [false, true]) {
+        const response = await fetch(`${gateway.url}/v1/responses`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ model: "swe-2-medium", input: "Synthetic", tools, stream }) });
+        const wire = await response.text();
+        const output = stream ? parseSse(wire).map(e => JSON.parse(e.data)).find(e => e.type === "response.completed").response.output : JSON.parse(wire).output;
+        expect(output.map((item: { type: string }) => item.type)).toEqual(["message", "function_call"]);
+        expect(output[0].content[0].text).toBe("Synthetic before.Synthetic after.");
+        expect(output[1].call_id).toBe("synthetic-mixed");
+      }
+    } finally { await gateway.cleanup(); await upstream.stop(); }
+  });
+});
+
 // ─── POST /v1/messages (Anthropic, non-streaming) ────────────────────────────
 
 test("runtime status persists only after an issued tool and its successful Responses continuation, streaming or JSON", async () => {
