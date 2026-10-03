@@ -5,7 +5,7 @@ import { randomUUID } from "node:crypto";
 import { log } from "../log.js";
 import { defaultSettingsDirectory, ModelSelectionStore } from "./model-selection-store.js";
 import { isModelId, ModelSelectionError } from "./model-selection.js";
-import type { ResponsesSafeDiagnosticRecord, ToolValidationEvidence } from "../responses-diagnostics.js";
+import type { ResponsesSafeDiagnosticRecord, ToolValidationEvidence, CorrelationOutcome } from "../responses-diagnostics.js";
 
 const EFFORTS = new Set(["none", "off", "minimal", "low", "medium", "high", "xhigh", "max"]);
 type Status = "tested" | "untested";
@@ -119,20 +119,25 @@ export class ModelValidationTracker {
   private writes = new Set<Promise<void>>();
   constructor(private readonly store: ModelTestStatusStore, private readonly now = Date.now) {}
   observe(scope: string, r: ResponsesSafeDiagnosticRecord, evidence: ToolValidationEvidence): void {
+    const note = (outcome: CorrelationOutcome) => { const counts = r.correlation_results ??= {}; counts[outcome] = Math.min(1_000_000, (counts[outcome] ?? 0) + 1); };
     if (!r.resolved_model_id || !r.logical_model || !r.requested_effort || r.upstream_http_status !== 200
-      || r.upstream_terminal_status !== "completed" || r.response_failed_source !== "none" || r.failure_classification) return;
-    for (const [key, entry] of this.pending) if (entry.expires < this.now()) this.pending.delete(key);
+      || r.upstream_terminal_status !== "completed" || r.response_failed_source !== "none" || r.failure_classification) { note("request_ineligible"); return; }
+    for (const [key, entry] of this.pending) if (entry.expires < this.now()) { this.pending.delete(key); note("expired_pending"); }
     for (const returned of evidence.returned) {
       const key = `${scope}:${returned.id}`; const issued = this.pending.get(key);
-      if (!issued || issued.model !== r.resolved_model_id || issued.effort !== r.requested_effort) continue;
+      if (!issued) { note([...this.pending.keys()].some(k => k.endsWith(`:${returned.id}`)) ? "scope_mismatch" : "no_issued_call"); continue; }
+      if (issued.model !== r.resolved_model_id) { note("model_mismatch"); continue; }
+      if (issued.effort !== r.requested_effort) { note("effort_mismatch"); continue; }
       this.pending.delete(key);
-      if (!returned.success) continue;
+      if (!returned.success) { note("tool_result_not_successful"); continue; }
+      note("matched_success");
       const write = this.store.markAutomatic(r.resolved_model_id, r.logical_model, r.requested_effort).catch(() => { log.warn("[model-test-status] Automatic evidence could not be persisted (details redacted)."); });
       this.writes.add(write); void write.finally(() => this.writes.delete(write));
     }
     for (const call of evidence.emitted) {
       if (this.pending.size >= 1024) this.pending.delete(this.pending.keys().next().value!);
       this.pending.set(`${scope}:${call.id}`, { model: r.resolved_model_id, effort: r.requested_effort, expires: this.now() + 3600000 });
+      note("issued_call_recorded");
     }
   }
   async drain(): Promise<void> { await Promise.all(this.writes); }

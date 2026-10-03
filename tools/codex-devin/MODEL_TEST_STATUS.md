@@ -12,6 +12,18 @@ Safe JSONL retains existing routing fields and adds had_tool_call and had_functi
 
 Routing identifiers come from completed gateway model resolution. Emitted calls come from the same finished, validated accumulator used by the Responses bridge; returned calls come from the Responses converter's normalized tool messages. These structured paths reject credentials and malformed identifiers, but do not discard a valid ID merely because Desktop history or a tool schema mentions it. Arbitrary trace/error fields retain the stricter sensitive-text substring check. Matching uses the exact credential scope, call ID, resolved variant and requested effort across separate requests; the two evidence booleans need not both be true on one request.
 
+### Recognition-stage diagnostics
+
+Safe JSONL now reports `tool_choice_mode` (including omitted), `requested_specific_tool` only from validated declared tool identity, `upstream_tool_choice_mode`, client/upstream parallel booleans, and fixed `normalized_input_type_counts`. No input text is retained.
+
+Follow the counters in order: `upstream_toolcall_event_count` → `normalized_tool_call_object_count` → `bridge_completed_tool_call_count` → `responses_tool_call_emitted_count` and `tool_evidence_emitted_count`. Decoded object counts include follow-up deltas; completed/emitted counts refer to consolidated calls. Responses emission describes an item handed to the existing output path, not proof that the client executed it.
+
+`identifier_checks` is bounded to 64 records with fixed stage, field, accepted/rejected state, reason and `sensitive_text_overlap` boolean. Reasons are missing, invalid_format, secret_like or redaction_collision. Missing can be an expected unkeyed follow-up delta. No rejected value is logged. Sensitive overlap is observable even for accepted structured IDs, but it does not mean a credential collision. `bridge_outcomes` counts existing accumulator/argument failures and same-ID deltas without changing their handling.
+
+`function_call_output_input_count` and `tool_evidence_returned_count` distinguish normalized input from accepted correlation evidence. `correlation_results` records existing outcomes: request_ineligible, expired_pending, no_issued_call, scope_mismatch, model_mismatch, effort_mismatch, tool_result_not_successful, matched_success or issued_call_recorded. matched_success means the existing tuple and completion checks passed and persistence was scheduled; it is not an extra success criterion. These counters are serialized after the in-process observer runs. No credential scope/hash or tool result is exported.
+
+The existing bridge and diagnostic identifier validators have different limits. A synthetically long nonempty call ID can be emitted to Responses while rejected for evidence as invalid_format. The new counters identify that boundary; this is not proof that live SWE IDs have that shape. Production tool forcing, routing and automatic promotion rules are unchanged.
+
 ## Manual marks and persistence
 
 Use Mark tested / Mark untested on the exact variant row (for example SWE-2 Medium, High and Max). Marks save immediately; Save/Cancel applies only to selection drafts. The buttons never change enabled state or roles. The compact status badge tooltip reports manual/automatic provenance and the last automatic success timestamp when available.

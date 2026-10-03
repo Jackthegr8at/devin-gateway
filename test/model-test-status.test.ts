@@ -47,8 +47,9 @@ test("concurrent writers preserve variants; corrupt status never reseeds", async
 
 test("correlated completed tool round-trip promotes; text/history/failures/wrong credential or effort/replay do not", async () => fixture(async store => {
   let now = 1000; const tracker = new ModelValidationTracker(store, () => now);
+  const outcomes: Array<Record<string, number>> = [];
   function finish({ call, returned, failed, scope = "synthetic-credential-hash", effort = "high", model = "swe-2-high" }: { call?: string; returned?: string; failed?: boolean; scope?: string; effort?: string; model?: string }) {
-    const d = new ResponsesSafeDiagnostic("synthetic", Date.now(), undefined, (r, e) => tracker.observe(scope, r, e), false);
+    const d = new ResponsesSafeDiagnostic("synthetic", Date.now(), undefined, (r, e) => { tracker.observe(scope, r, e); outcomes.push({ ...r.correlation_results }); }, false);
     d.addSensitiveValues([`Synthetic Desktop history: swe-2 swe-2-high swe-2-max new-call history-call ${call ?? ""} ${returned ?? ""}`]);
     d.recordResolvedRouting({ logicalModel: "swe-2", requestedEffort: effort, resolvedModelId: model }); d.recordUpstreamResponse(200, true); d.recordUpstreamComplete();
     // History deliberately does not become emitted-call evidence.
@@ -57,11 +58,15 @@ test("correlated completed tool round-trip promotes; text/history/failures/wrong
     if (returned) d.recordNormalizedFunctionCallOutput({ role: "tool", tool_call_id: returned, content: "Synthetic private output" }, true);
     if (failed) d.recordFailure({ source: "synthetic", classification: "devin_upstream_model_provider_unavailable" }); else d.recordSuccessfulCompletion();
     d.finalize();
+    return outcomes.at(-1);
   }
   finish({}); finish({ returned: "history-call" }); await tracker.drain(); expect((await store.read()).variants).toEqual({});
-  finish({ call: "new-call" }); finish({ returned: "new-call", scope: "another-credential" }); finish({ returned: "new-call", effort: "max" });
-  finish({ returned: "new-call", model: "swe-2-max" }); finish({ returned: "unrelated-call" });
-  finish({ returned: "new-call", failed: true }); await tracker.drain(); expect((await store.read()).variants).toEqual({});
+  expect(finish({ call: "new-call" })).toEqual({ issued_call_recorded: 1 });
+  expect(finish({ returned: "new-call", scope: "another-credential" })).toEqual({ scope_mismatch: 1 });
+  expect(finish({ returned: "new-call", effort: "max" })).toEqual({ effort_mismatch: 1 });
+  expect(finish({ returned: "new-call", model: "swe-2-max" })).toEqual({ model_mismatch: 1 });
+  expect(finish({ returned: "unrelated-call" })).toEqual({ no_issued_call: 1 });
+  expect(finish({ returned: "new-call", failed: true })).toEqual({ request_ineligible: 1 }); await tracker.drain(); expect((await store.read()).variants).toEqual({});
   finish({ returned: "new-call" }); await tracker.drain(); const saved = await store.read();
   expect(effectiveTestStatus(saved, "swe-2-high")).toMatchObject({ status: "tested", source: "automatic" });
   finish({ returned: "new-call" }); finish({ failed: true }); await tracker.drain(); expect(await store.read()).toEqual(saved);

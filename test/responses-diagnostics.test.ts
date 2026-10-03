@@ -14,6 +14,25 @@ test("safe Responses diagnostics are explicitly opt-in", () => {
   expect(responsesSafeDiagnosticsEnabled("1")).toBe(true);
 });
 
+test("stage diagnostics contain fixed rejection reasons and normalized counts, never rejected values or input text", () => {
+  const root = mkdtempSync(join(tmpdir(), "synthetic-stage-diagnostics-")); const path = join(root, "safe.jsonl");
+  try {
+    const d = new ResponsesSafeDiagnostic("synthetic-stage", Date.now(), path);
+    const privateValue = "synthetic-sensitive-4917";
+    d.addCredentialValues([privateValue]); d.addSensitiveValues(["Synthetic history references valid-call exec_command", "private-looking-id"]);
+    d.recordRequestStructure([{ role: "developer", content: "Synthetic private developer" }, { role: "tool", tool_call_id: "valid-call", content: "Synthetic private tool output" }], { type: "function", name: "exec_command" }, { toolName: "exec_command" }, true);
+    d.recordUpstreamEvent("toolcall");
+    for (const id of ["", "synthetic invalid value", privateValue, "synthetic-token-value", "valid-call"]) d.recordNormalizedUpstreamToolCall({ id, name: "exec_command" });
+    d.recordToolCall("exec_command", "private-looking-id");
+    d.recordNormalizedEmittedToolCall({ id: "valid-call", name: "exec_command" }); d.recordResponsesToolCallEmitted(); d.finalize();
+    const json = readFileSync(path, "utf8"); const r = JSON.parse(json);
+    expect(r).toMatchObject({ tool_choice_mode: "specific", requested_specific_tool: "exec_command", upstream_tool_choice_mode: "specific", client_parallel_tool_calls: true, upstream_parallel_tool_calls: false, normalized_input_type_counts: { developer: 1, function_call_output: 1 }, function_call_output_input_count: 1, upstream_toolcall_event_count: 1, normalized_tool_call_object_count: 5 });
+    expect(r.identifier_checks.filter((c: any) => c.field === "call_id" && c.state === "rejected").map((c: any) => c.reason)).toEqual(["missing", "invalid_format", "redaction_collision", "secret_like", "redaction_collision"]);
+    expect(r.identifier_checks).toContainEqual({ stage: "emitted_evidence", field: "call_id", state: "accepted", reason: "none", sensitive_text_overlap: true });
+    for (const value of [privateValue, "synthetic invalid value", "synthetic-token-value", "private-looking-id", "Synthetic private", "Synthetic history"]) expect(json).not.toContain(value);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
 test("provider outages, policy denial, generic Connect errors and stream failures remain distinct and redacted", () => {
   const root = mkdtempSync(join(tmpdir(), "provider-classification-test-"));
   const info = new ProtoEncoder(); info.string(1, "MODEL_PROVIDER_UNAVAILABLE"); info.string(2, "synthetic-private-domain");

@@ -63,6 +63,22 @@ export interface ResponsesSafeDiagnosticRecord {
   terminal_status?: string;
   had_tool_call: boolean;
   had_function_call_output: boolean;
+  tool_choice_mode?: "omitted" | "auto" | "none" | "required" | "specific";
+  requested_specific_tool?: string;
+  upstream_tool_choice_mode?: "auto" | "none" | "required" | "specific";
+  client_parallel_tool_calls?: boolean;
+  upstream_parallel_tool_calls?: boolean;
+  normalized_input_type_counts: Partial<Record<NormalizedInputType, number>>;
+  upstream_toolcall_event_count: number;
+  normalized_tool_call_object_count: number;
+  bridge_completed_tool_call_count: number;
+  responses_tool_call_emitted_count: number;
+  tool_evidence_emitted_count: number;
+  tool_evidence_returned_count: number;
+  function_call_output_input_count: number;
+  identifier_checks: Array<{ stage: IdentifierStage; field: "call_id" | "tool_name" | "model_id"; state: "accepted" | "rejected"; reason: IdentifierReason | "none"; sensitive_text_overlap: boolean }>;
+  bridge_outcomes: Partial<Record<BridgeOutcome, number>>;
+  correlation_results: Partial<Record<CorrelationOutcome, number>>;
   tool_count: number;
   tool_names: string[];
   tool_mappings: ToolMapping[];
@@ -104,6 +120,11 @@ export const RESPONSES_SAFE_DIAGNOSTIC_FIELDS = [
   "terminal_status",
   "had_tool_call",
   "had_function_call_output",
+  "tool_choice_mode", "requested_specific_tool", "upstream_tool_choice_mode",
+  "client_parallel_tool_calls", "upstream_parallel_tool_calls", "normalized_input_type_counts",
+  "upstream_toolcall_event_count", "normalized_tool_call_object_count", "bridge_completed_tool_call_count",
+  "responses_tool_call_emitted_count", "tool_evidence_emitted_count", "tool_evidence_returned_count",
+  "function_call_output_input_count", "identifier_checks", "bridge_outcomes", "correlation_results",
   "tool_count",
   "tool_names",
   "tool_mappings",
@@ -215,6 +236,14 @@ export interface ToolValidationEvidence {
   emitted: Array<{ id: string; name: string }>;
   returned: Array<{ id: string; success: boolean }>;
 }
+type NormalizedInputType = "system" | "developer" | "user" | "assistant" | "assistant_function_call" | "assistant_reasoning" | "function_call_output";
+type IdentifierStage = "routing" | "upstream_object" | "emitted_evidence" | "returned_evidence" | "history" | "tool_choice";
+type IdentifierReason = "missing" | "invalid_format" | "secret_like" | "redaction_collision";
+type BridgeOutcome = "unidentified_delta" | "same_id_delta" | "multiple_call_conflict" | "missing_name" | "undeclared_name" | "invalid_arguments_json" | "arguments_not_object" | "evidence_limit";
+export type CorrelationOutcome = "request_ineligible" | "expired_pending" | "no_issued_call" | "scope_mismatch" | "model_mismatch" | "effort_mismatch" | "tool_result_not_successful" | "matched_success" | "issued_call_recorded";
+function increment<T extends string>(counts: Partial<Record<T, number>>, key: T): void {
+  counts[key] = Math.min(1_000_000, (counts[key] ?? 0) + 1);
+}
 export class ResponsesSafeDiagnostic {
   private readonly record: ResponsesSafeDiagnosticRecord;
   private readonly secrets = new Set<string>();
@@ -240,6 +269,17 @@ export class ResponsesSafeDiagnostic {
       tool_count: 0,
       had_tool_call: false,
       had_function_call_output: false,
+      normalized_input_type_counts: {},
+      upstream_toolcall_event_count: 0,
+      normalized_tool_call_object_count: 0,
+      bridge_completed_tool_call_count: 0,
+      responses_tool_call_emitted_count: 0,
+      tool_evidence_emitted_count: 0,
+      tool_evidence_returned_count: 0,
+      function_call_output_input_count: 0,
+      identifier_checks: [],
+      bridge_outcomes: {},
+      correlation_results: {},
       tool_names: [],
       tool_mappings: [],
       forwarded_tool_fingerprints: [],
@@ -265,11 +305,44 @@ export class ResponsesSafeDiagnostic {
     }
   }
 
-  private structuredIdentifier(value: unknown): string | undefined {
-    // No trimming/coercion: only exact validated bridge identifiers qualify.
-    if (typeof value !== "string" || !IDENTIFIER.test(value)) return undefined;
-    return safeTraceId(value, this.credentials);
+  private checkedIdentifier(value: unknown, stage: IdentifierStage, field: "call_id" | "tool_name" | "model_id", structured: boolean): string | undefined {
+    const candidate = typeof value === "string" ? (structured ? value : value.trim()) : "";
+    const sensitive = structured ? this.credentials : this.secrets;
+    const collision = (values: Set<string>) => [...values].some(v => v.length >= 4 && candidate.length > 0 && (candidate.includes(v) || v.includes(candidate)));
+    let reason: IdentifierReason | undefined;
+    if (!candidate.trim()) reason = "missing";
+    else if (!IDENTIFIER.test(structured ? candidate : candidate.trim())) reason = "invalid_format";
+    else if (/(?:token|secret|api.?key|bearer)/i.test(candidate)) reason = "secret_like";
+    else if (collision(sensitive)) reason = "redaction_collision";
+    if (this.record.identifier_checks.length < 64) this.record.identifier_checks.push({ stage, field, state: reason ? "rejected" : "accepted", reason: reason ?? "none", sensitive_text_overlap: collision(this.secrets) });
+    return reason ? undefined : safeTraceId(value, sensitive);
   }
+
+  private structuredIdentifier(value: unknown, stage: IdentifierStage = "routing", field: "call_id" | "tool_name" | "model_id" = "model_id"): string | undefined {
+    // No trimming/coercion: only exact validated bridge identifiers qualify.
+    return this.checkedIdentifier(value, stage, field, true);
+  }
+
+  recordRequestStructure(messages: OpenAIMessage[], requestedChoice: unknown, choice: { optionName?: string; toolName?: string } | undefined, parallel: unknown): void {
+    this.record.tool_choice_mode = requestedChoice === undefined ? "omitted" : choice?.toolName ? "specific" : requestedChoice === "required" ? "required" : requestedChoice === "none" ? "none" : "auto";
+    this.record.upstream_tool_choice_mode = choice?.toolName ? "specific" : choice?.optionName === "any" ? "required" : choice?.optionName === "none" ? "none" : "auto";
+    if (choice?.toolName) this.record.requested_specific_tool = this.structuredIdentifier(choice.toolName, "tool_choice", "tool_name");
+    if (typeof parallel === "boolean") this.record.client_parallel_tool_calls = parallel;
+    this.record.upstream_parallel_tool_calls = false; // Existing Devin request contract.
+    for (const message of messages) {
+      const type = message.role === "tool" ? "function_call_output" : message.tool_calls?.length ? "assistant_function_call" : message.reasoning_content ? "assistant_reasoning" : message.role;
+      if (["system", "developer", "user", "assistant", "assistant_function_call", "assistant_reasoning", "function_call_output"].includes(type)) increment(this.record.normalized_input_type_counts, type as NormalizedInputType);
+    }
+    this.record.function_call_output_input_count = this.record.normalized_input_type_counts.function_call_output ?? 0;
+  }
+
+  recordNormalizedUpstreamToolCall(call: { id: string; name: string }): void {
+    this.record.normalized_tool_call_object_count++;
+    this.structuredIdentifier(call.id, "upstream_object", "call_id");
+    this.structuredIdentifier(call.name, "upstream_object", "tool_name");
+  }
+  recordBridgeOutcome(outcome: BridgeOutcome): void { increment(this.record.bridge_outcomes, outcome); }
+  recordResponsesToolCallEmitted(): void { this.record.responses_tool_call_emitted_count++; }
 
   /** Call only after the request's model/effort has passed gateway resolution. */
   recordResolvedRouting(route: { logicalModel: string; requestedEffort: unknown; resolvedModelId: string }): void {
@@ -286,11 +359,14 @@ export class ResponsesSafeDiagnostic {
 
   /** Completed accumulator output, not unvalidated deltas or assistant history. */
   recordNormalizedEmittedToolCall(call: { id: string; name: string }): void {
-    const id = this.structuredIdentifier(call.id);
-    const name = this.structuredIdentifier(call.name);
-    if (!id || !name || this.evidence.emitted.length >= 16) return;
+    this.record.bridge_completed_tool_call_count++;
+    const id = this.structuredIdentifier(call.id, "emitted_evidence", "call_id");
+    const name = this.structuredIdentifier(call.name, "emitted_evidence", "tool_name");
+    if (!id || !name) return;
+    if (this.evidence.emitted.length >= 16) { this.recordBridgeOutcome("evidence_limit"); return; }
     this.record.had_tool_call = true;
     this.evidence.emitted.push({ id, name });
+    this.record.tool_evidence_emitted_count++;
     if (!this.record.tool_calls.some(entry => entry.call_id === id) && this.record.tool_calls.length < 16) {
       this.record.tool_calls.push({ name, call_id: id });
     }
@@ -299,10 +375,12 @@ export class ResponsesSafeDiagnostic {
   /** Validated Responses converter output; never inspect raw input/history text. */
   recordNormalizedFunctionCallOutput(message: OpenAIMessage, success: boolean): void {
     if (message.role !== "tool") return;
-    const id = this.structuredIdentifier(message.tool_call_id);
-    if (!id || this.evidence.returned.length >= 16) return;
+    const id = this.structuredIdentifier(message.tool_call_id, "returned_evidence", "call_id");
+    if (!id) return;
+    if (this.evidence.returned.length >= 16) { this.recordBridgeOutcome("evidence_limit"); return; }
     this.record.had_function_call_output = true;
     this.evidence.returned.push({ id, success });
+    this.record.tool_evidence_returned_count++;
   }
 
   setRequestSummary(options: {
@@ -408,6 +486,7 @@ export class ResponsesSafeDiagnostic {
     if (!UPSTREAM_EVENT_TYPES.has(type)) return;
     const safeType = type;
     this.record.upstream_event_count += 1;
+    if (type === "toolcall") this.record.upstream_toolcall_event_count++;
     if (!this.record.first_upstream_event_type) this.record.first_upstream_event_type = safeType;
     if (!this.record.upstream_event_types.includes(safeType) && this.record.upstream_event_types.length < 16) {
       this.record.upstream_event_types.push(safeType);
@@ -420,7 +499,7 @@ export class ResponsesSafeDiagnostic {
 
   recordToolCall(name: unknown, callId: unknown): void {
     const safeName = identifier(name);
-    const safeCallId = safeTraceId(callId, this.secrets);
+    const safeCallId = this.checkedIdentifier(callId, "history", "call_id", false);
     if (!safeName || !safeCallId || this.record.tool_calls.length >= 16) return;
     if (!this.record.tool_calls.some((call) => call.call_id === safeCallId)) {
       this.record.tool_calls.push({ name: safeName, call_id: safeCallId });
@@ -512,11 +591,12 @@ export class ResponsesSafeDiagnostic {
     this.finalized = true;
     this.record.elapsed_ms = Math.max(0, Date.now() - this.startedAt);
     if (this.record.resolved_model_id) this.record.terminal_status = this.record.upstream_terminal_status;
+    // Correlation annotates fixed outcome counters before serialization.
+    try { this.observer?.(this.record, this.evidence); } catch { /* Observability never changes inference. */ }
     const safeRecord = Object.fromEntries(
       RESPONSES_SAFE_DIAGNOSTIC_FIELDS.map((field) => [field, this.record[field]]),
     );
     const line = `${JSON.stringify(safeRecord)}\n`;
-    try { this.observer?.(this.record, this.evidence); } catch { /* Observability never changes inference. */ }
     if (!this.writeLog) { this.secrets.clear(); this.credentials.clear(); return true; }
     try {
       mkdirSync(dirname(this.outputPath), { recursive: true });

@@ -168,6 +168,7 @@ function decodeChatRequestToolChoice(body: Uint8Array): { optionName?: string; t
 function decodeChatRequest(body: Uint8Array): {
   prompt: string;
   modelUid: string;
+  disableParallelToolCalls?: boolean;
   prompts: Array<{ source?: number; prompt?: string; toolCallId?: string; toolCalls: Array<{ id: string; name: string; argumentsJson: string }> }>;
   tools: Array<{ name: string; description: string; schema: string; strict: boolean }>;
 } {
@@ -179,7 +180,8 @@ function decodeChatRequest(body: Uint8Array): {
   const result = { prompt: "", modelUid: "", prompts: [], tools: [] } as ReturnType<typeof decodeChatRequest>;
   while (!d.done) {
     const { field, wire } = d.readTag();
-    if (field === 2 && wire === 2) result.prompt = d.readString();
+    if (field === 11 && wire === 0) result.disableParallelToolCalls = d.readVarint() !== 0n;
+    else if (field === 2 && wire === 2) result.prompt = d.readString();
     else if (field === 3 && wire === 2) {
       result.prompts.push(d.readMessage((sub) => {
         const item: ReturnType<typeof decodeChatRequest>["prompts"][number] = { toolCalls: [] };
@@ -1151,6 +1153,8 @@ test("Desktop logical Max A/B flow retains history-mentioned routing/call IDs an
       for (const r of records) expect(r).toMatchObject({ logical_model: "swe-2", requested_effort: "max", resolved_model_id: "swe-2-max", upstream_terminal_status: "completed", response_failed_source: "none" });
       expect(records[0]).toMatchObject({ had_tool_call: true, had_function_call_output: false, upstream_event_types: ["usage", "thinking", "toolcall", "done"] });
       expect(records[1]).toMatchObject({ had_tool_call: false, had_function_call_output: true, upstream_event_types: ["usage", "thinking", "text", "done"] });
+      expect(records[0]).toMatchObject({ upstream_toolcall_event_count: 1, normalized_tool_call_object_count: 1, bridge_completed_tool_call_count: 1, responses_tool_call_emitted_count: 1, tool_evidence_emitted_count: 1, correlation_results: { issued_call_recorded: 1 } });
+      expect(records[1]).toMatchObject({ function_call_output_input_count: 1, tool_evidence_returned_count: 1, normalized_input_type_counts: { function_call_output: 1, assistant_function_call: 1 }, correlation_results: { matched_success: 1 } });
       expect(JSON.parse(readFileSync(join(directory, "model-test-status.json"), "utf8")).variants["swe-2-max"].automatic).toMatchObject({ logicalModel: "swe-2", effort: "max" });
       const jsonl = readFileSync(path, "utf8");
       for (const raw of [privatePrompt, "synthetic-private-key", "synthetic-private-command", "Synthetic private hostname", "Synthetic private thinking"]) expect(jsonl).not.toContain(raw);
@@ -1161,6 +1165,50 @@ test("Desktop logical Max A/B flow retains history-mentioned routing/call IDs an
       }
     }
   }
+});
+
+test("logical GLM Low and SWE High retain equivalent auto/required/specific Responses tool-choice contracts", async () => {
+  const models = familyPayload([familyFixture("glm-5-3-flash-low", "GLM-5.3 Flash", "low", { context1m: true }), familyFixture("swe-2-high", "SWE-2", "high")]);
+  const captured: Uint8Array[] = [];
+  const upstream = startUpstream({ modelsBody: models, captureChatRequest: body => captured.push(body) });
+  const gateway = await startGateway(upstream.url.origin, "synthetic-choice-key");
+  try {
+    for (const stream of [false, true]) for (const choice of ["auto", "required", { type: "function", name: "exec_command" }]) {
+      captured.length = 0;
+      for (const [model, effort] of [["glm-5-3-flash-1m", "low"], ["swe-2", "high"]]) {
+        const response = await fetch(`${gateway.url}/v1/responses`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({
+          model, reasoning: { effort }, stream, tool_choice: choice, parallel_tool_calls: true, input: "Synthetic identical acceptance instruction",
+          tools: [{ type: "function", name: "exec_command", description: "Synthetic command tool", parameters: { type: "object", properties: { cmd: { type: "string" } } } }],
+        }) }); expect(response.status).toBe(200); await response.text();
+      }
+      expect(captured).toHaveLength(2);
+      const decoded = captured.map(decodeChatRequest);
+      expect(decoded.map(r => r.modelUid)).toEqual(["glm-5-3-flash-low", "swe-2-high"]);
+      expect(decoded[0].tools).toEqual(decoded[1].tools);
+      expect(decoded.map(r => r.disableParallelToolCalls)).toEqual([true, true]);
+      const expected = choice === "auto" ? { optionName: "auto" } : choice === "required" ? { optionName: "any" } : { toolName: "exec_command" };
+      for (const body of captured) expect(decodeChatRequestToolChoice(body)).toEqual(expected);
+    }
+  } finally { await gateway.cleanup(); await upstream.stop(); }
+});
+
+test("diagnostics locate a bridge-emitted call rejected only by diagnostic identifier format, without altering the Responses call", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "synthetic-id-boundary-"));
+  const path = join(directory, "safe.jsonl"); const oldFlag = process.env.DEVIN_RESPONSES_SAFE_DIAGNOSTICS; const oldPath = process.env.DEVIN_RESPONSES_SAFE_DIAGNOSTICS_PATH;
+  process.env.DEVIN_RESPONSES_SAFE_DIAGNOSTICS = "1"; process.env.DEVIN_RESPONSES_SAFE_DIAGNOSTICS_PATH = path;
+  // Existing protobuf call shape, with a nonempty ID beyond the diagnostic limit.
+  // This characterizes a real validation boundary, not a claim about live SWE IDs.
+  const id = "synthetic-long-call-" + "x".repeat(140);
+  const upstream = startUpstream({ chatBody: () => framesBody([dataFrame({ usage: { inputTokens: 1, outputTokens: 1 } }), dataFrame({ thinking: "Synthetic private thinking" }), dataFrame({ toolCalls: [{ id, name: "exec_command", argumentsJson: "{}" }] })]) });
+  const gateway = await startGateway(upstream.url.origin, "synthetic-boundary-key");
+  try {
+    const response = await fetch(`${gateway.url}/v1/responses`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ model: "swe-2-high", reasoning: { effort: "high" }, input: "Synthetic private prompt", tools: [{ type: "function", name: "exec_command", parameters: { type: "object" } }] }) });
+    expect(response.status).toBe(200); expect((await response.json()).output[0].call_id).toBe(id);
+    const r = JSON.parse(readFileSync(path, "utf8"));
+    expect(r).toMatchObject({ upstream_toolcall_event_count: 1, normalized_tool_call_object_count: 1, bridge_completed_tool_call_count: 1, responses_tool_call_emitted_count: 1, tool_evidence_emitted_count: 0, had_tool_call: false });
+    expect(r.identifier_checks).toContainEqual({ stage: "emitted_evidence", field: "call_id", state: "rejected", reason: "invalid_format", sensitive_text_overlap: false });
+    expect(readFileSync(path, "utf8")).not.toContain(id);
+  } finally { await gateway.cleanup(); await upstream.stop(); rmSync(directory, { recursive: true, force: true }); if (oldFlag === undefined) delete process.env.DEVIN_RESPONSES_SAFE_DIAGNOSTICS; else process.env.DEVIN_RESPONSES_SAFE_DIAGNOSTICS = oldFlag; if (oldPath === undefined) delete process.env.DEVIN_RESPONSES_SAFE_DIAGNOSTICS_PATH; else process.env.DEVIN_RESPONSES_SAFE_DIAGNOSTICS_PATH = oldPath; }
 });
 
 // ─── POST /v1/messages (Anthropic, non-streaming) ────────────────────────────

@@ -467,17 +467,21 @@ interface ResponsesToolCallAccumulator {
 function collectResponsesToolCall(
   state: ResponsesToolCallAccumulator,
   call: { id: string; name: string; argumentsJson: string },
+  diagnostic?: ResponsesSafeDiagnostic,
 ): void {
+  diagnostic?.recordNormalizedUpstreamToolCall(call);
   // Follow-up Devin deltas may omit the ID. Correlate them to the most recent
   // real ID; ignore unkeyed deltas until an ID arrives, as OMP does.
   const id = call.id.trim() ? call.id : state.activeCallId;
   if (!id) {
+    diagnostic?.recordBridgeOutcome("unidentified_delta");
     state.sawUnidentifiedDelta = true;
     return;
   }
 
   const existing = state.calls.get(id);
   if (existing) {
+    diagnostic?.recordBridgeOutcome("same_id_delta");
     if (call.name.trim()) existing.name = call.name;
     // Devin can send either a cumulative snapshot or the next argument fragment.
     if (call.argumentsJson) {
@@ -489,6 +493,7 @@ function collectResponsesToolCall(
     return;
   }
   if (state.calls.size > 0) {
+    diagnostic?.recordBridgeOutcome("multiple_call_conflict");
     throw new Error("Devin returned multiple function calls; this gateway supports one call per model response.");
   }
   state.calls.set(id, { id, name: call.name, arguments: call.argumentsJson });
@@ -498,13 +503,14 @@ function collectResponsesToolCall(
 function finishResponsesToolCalls(
   state: ResponsesToolCallAccumulator,
   declaredTools: ReadonlyMap<string, { name: string; namespace?: string }>,
+  diagnostic?: ResponsesSafeDiagnostic,
 ): Map<string, ResponsesToolCall> {
   if (state.calls.size === 0 && state.sawUnidentifiedDelta) {
     throw new Error("Devin returned function-call deltas but never supplied a call ID.");
   }
   for (const call of state.calls.values()) {
-    if (!call.name.trim()) throw new Error("Devin returned a function call without a name.");
-    if (!declaredTools.has(call.name)) throw new Error(`Devin returned undeclared function '${call.name}'.`);
+    if (!call.name.trim()) { diagnostic?.recordBridgeOutcome("missing_name"); throw new Error("Devin returned a function call without a name."); }
+    if (!declaredTools.has(call.name)) { diagnostic?.recordBridgeOutcome("undeclared_name"); throw new Error(`Devin returned undeclared function '${call.name}'.`); }
   }
   return state.calls;
 }
@@ -512,15 +518,18 @@ function finishResponsesToolCalls(
 function responsesFunctionCallItem(
   call: ResponsesToolCall,
   declaredTools: ReadonlyMap<string, { name: string; namespace?: string }>,
+  diagnostic?: ResponsesSafeDiagnostic,
 ): Record<string, unknown> {
   const args = call.arguments || "{}";
   let parsed: unknown;
   try {
     parsed = JSON.parse(args);
   } catch {
+    diagnostic?.recordBridgeOutcome("invalid_arguments_json");
     throw new Error(`Devin returned invalid JSON arguments for function '${call.name}'.`);
   }
   if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    diagnostic?.recordBridgeOutcome("arguments_not_object");
     throw new Error(`Devin returned non-object JSON arguments for function '${call.name}'.`);
   }
   const identity = declaredTools.get(call.name);
@@ -627,6 +636,7 @@ async function handleResponses(req: Request, reqId: string, trace: ErrorTrace): 
     sensitiveValues: [token],
   });
   diagnostic?.recordResolvedRouting({ logicalModel: body.model, requestedEffort: body.reasoning?.effort, resolvedModelId: modelUid });
+  diagnostic?.recordRequestStructure(messages, body.tool_choice, toolChoice, body.parallel_tool_calls);
   for (const message of conversationMessages) {
     if (message.role === "tool") diagnostic?.recordNormalizedFunctionCallOutput(message, returnedToolSucceeded(message.content));
   }
@@ -658,7 +668,7 @@ async function handleResponses(req: Request, reqId: string, trace: ErrorTrace): 
       else if (ev.type === "toolcall" && ev.toolCalls) {
         for (const call of ev.toolCalls) {
           diagnostic?.recordToolCall(call.name, call.id);
-          collectResponsesToolCall(toolCallState, call);
+          collectResponsesToolCall(toolCallState, call, diagnostic);
         }
       }
       else if (ev.type === "usage" && ev.usage) usage = ev.usage;
@@ -666,7 +676,7 @@ async function handleResponses(req: Request, reqId: string, trace: ErrorTrace): 
     }
     diagnostic?.recordUpstreamComplete();
 
-    const toolCalls = finishResponsesToolCalls(toolCallState, declaredTools);
+    const toolCalls = finishResponsesToolCalls(toolCallState, declaredTools, diagnostic);
     for (const call of toolCalls.values()) diagnostic?.recordNormalizedEmittedToolCall(call);
     const output: Record<string, unknown>[] = [];
     if (text || toolCalls.size === 0) {
@@ -678,7 +688,10 @@ async function handleResponses(req: Request, reqId: string, trace: ErrorTrace): 
         content: [{ type: "output_text", text }],
       });
     }
-    for (const call of toolCalls.values()) output.push(responsesFunctionCallItem(call, declaredTools));
+    for (const call of toolCalls.values()) {
+      output.push(responsesFunctionCallItem(call, declaredTools, diagnostic));
+      diagnostic?.recordResponsesToolCallEmitted();
+    }
 
     return jsonResponse(req, {
       id: responseId,
@@ -818,7 +831,7 @@ function streamOpenAIResponses(
           } else if (ev.type === "toolcall" && ev.toolCalls) {
             for (const call of ev.toolCalls) {
               diagnostic?.recordToolCall(call.name, call.id);
-              collectResponsesToolCall(toolCallState, call);
+              collectResponsesToolCall(toolCallState, call, diagnostic);
             }
           } else if (ev.type === "error") {
             throw Object.assign(new Error(ev.error), { code: ev.code });
@@ -826,7 +839,7 @@ function streamOpenAIResponses(
         }
         diagnostic?.recordUpstreamComplete();
         slog(`done — upstream chunks: ${upstreamChunks}`);
-        const toolCalls = finishResponsesToolCalls(toolCallState, declaredTools);
+        const toolCalls = finishResponsesToolCalls(toolCallState, declaredTools, diagnostic);
         for (const call of toolCalls.values()) diagnostic?.recordNormalizedEmittedToolCall(call);
 
         if (reasoningStarted) {
@@ -855,7 +868,7 @@ function streamOpenAIResponses(
         }
 
         for (const call of toolCalls.values()) {
-          const completedItem = responsesFunctionCallItem(call, declaredTools);
+          const completedItem = responsesFunctionCallItem(call, declaredTools, diagnostic);
           const outputIndexForCall = outputIndex++;
           send("response.output_item.added", {
             type: "response.output_item.added",
@@ -880,6 +893,7 @@ function streamOpenAIResponses(
             item: completedItem,
           });
           outputItems.push(completedItem);
+          diagnostic?.recordResponsesToolCallEmitted();
         }
 
         send("response.completed", {
