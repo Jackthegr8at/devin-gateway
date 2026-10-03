@@ -81,13 +81,34 @@ try {
         Assert-Selection ($worker.Contains('model = "swe-2"') -and $worker.Contains('model_reasoning_effort = "medium"') -and -not $worker.Contains('model_provider')) 'worker uses logical model, explicit medium and inherited provider'
         $run = @(Get-ChildItem (Join-Path $fixtureHome 'devin-desktop-switch-backups') -Directory)[0]
         $state = Get-Content (Join-Path $run.FullName 'state.json') -Raw | ConvertFrom-Json
-        Assert-Selection ((Get-CodexDevinSha256 $state.catalogPath) -ceq $state.catalogSha256 -and $state.selectionRevision -eq 1 -and $state.runtimeVersion -ceq '0.159.2' -and $state.instructionSha256 -ceq 'B707476816BFE5E571A1BD2179F130FFF2B132DA5AB8E61063ACDB7FD24DAF12' -and $state.instructionUtf8ByteLength -eq 18043) 'recovery records catalog integrity and runtime/instruction provenance'
+        $runtime = Get-CodexDevinDesktopRuntime
+        Assert-Selection ((Get-CodexDevinSha256 $state.catalogPath) -ceq $state.catalogSha256 -and $state.selectionRevision -eq 1 -and $state.runtimeVersion -ceq $runtime.Version -and $state.instructionSha256 -ceq 'B707476816BFE5E571A1BD2179F130FFF2B132DA5AB8E61063ACDB7FD24DAF12' -and $state.instructionUtf8ByteLength -eq 18043) 'recovery records catalog integrity and runtime/instruction provenance'
         $hashes += $state.catalogSha256
         if ($mode -eq 'Local') {
             $runtime = Get-CodexDevinDesktopRuntime
             $effective = Invoke-CodexDevinSelectionProcess -Executable $runtime.Path -Arguments @('debug', 'models') | ConvertFrom-Json
             $loaded = @($effective.models)
-            Assert-Selection ($loaded.Count -eq 2) '0.159.2 loads only the generated reviewed models offline'
+            Assert-Selection ($loaded.Count -eq 2) 'installed reviewed runtime loads only the generated reviewed models offline'
+            $generated = Get-Content -LiteralPath $state.catalogPath -Raw | ConvertFrom-Json
+            Assert-Selection (@($generated.models | Where-Object { $_.multi_agent_version -cne 'v1' -or $_.shell_type -cne 'shell_command' }).Count -eq 0) 'generated catalog preserves reviewed V1 and shell metadata'
+            Assert-Selection (@($loaded | Where-Object { $_.multi_agent_version -cne 'v1' }).Count -eq 0) 'effective runtime preserves reviewed V1 metadata'
+            Write-Host ('Effective runtime shell metadata: ' + (($loaded | ForEach-Object { $_.slug + ':' + $_.shell_type + ':' + $_.multi_agent_version }) -join ', '))
+            # All mutations below are confined to this disposable fixture catalog.
+            # Compare complete effective structures in memory; never print instructions.
+            $catalogBytes = [IO.File]::ReadAllBytes($state.catalogPath)
+            $configHashBeforeAliasProbe = Get-CodexDevinSha256 $configPath
+            try {
+                foreach ($model in $generated.models) { $model.shell_type = 'unified_exec' }
+                [IO.File]::WriteAllText($state.catalogPath, ($generated | ConvertTo-Json -Depth 100), [Text.UTF8Encoding]::new($false))
+                $canonical = Invoke-CodexDevinSelectionProcess -Executable $runtime.Path -Arguments @('debug', 'models') | ConvertFrom-Json
+                Assert-Selection (($effective | ConvertTo-Json -Depth 100 -Compress) -ceq ($canonical | ConvertTo-Json -Depth 100 -Compress)) 'legacy shell_command and canonical unified_exec yield identical complete effective catalogs'
+                foreach ($model in $generated.models) { $model.shell_type = 'disabled' }
+                [IO.File]::WriteAllText($state.catalogPath, ($generated | ConvertTo-Json -Depth 100), [Text.UTF8Encoding]::new($false))
+                $disabled = Invoke-CodexDevinSelectionProcess -Executable $runtime.Path -Arguments @('debug', 'models') | ConvertFrom-Json
+                Assert-Selection (@($disabled.models | Where-Object { $_.shell_type -cne 'disabled' }).Count -eq 0) 'disabled remains disabled: shell normalization is not an unconditional capability override'
+            } finally { [IO.File]::WriteAllBytes($state.catalogPath, $catalogBytes) }
+            Assert-Selection ((Get-CodexDevinSha256 $state.catalogPath) -ceq $state.catalogSha256) 'alias probe restores original generated catalog hash'
+            Assert-Selection ((Get-CodexDevinSha256 $configPath) -ceq $configHashBeforeAliasProbe) 'alias probe leaves provider and security configuration unchanged'
             $glm = @($loaded | Where-Object slug -CEQ 'glm-5-3-flash-low')[0]
             $swe = @($loaded | Where-Object slug -CEQ 'swe-2')[0]
             Assert-Selection ($glm.default_reasoning_level -ceq 'low' -and $swe.default_reasoning_level -ceq 'medium') 'runtime catalog reports exact baseline default efforts'

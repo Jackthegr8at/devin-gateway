@@ -27,6 +27,10 @@ const text = (value: unknown): string => {
 };
 export const sha256 = (bytes: string | Uint8Array) => createHash("sha256").update(bytes).digest("hex").toUpperCase();
 export const SUPPORTED_RUNTIME = "0.159.2";
+export const REVIEWED_RUNTIME_FILES: Readonly<Record<string, string>> = Object.freeze({
+  "0.159.2": "codex-0.159.2.json",
+  "0.159.0-alpha.12.1": "codex-0.159.0-alpha.12.1.json",
+});
 export interface RuntimeModelMetadata {
   multi_agent_version: string;
   shell_type: string;
@@ -54,16 +58,17 @@ export interface RuntimeSelectionDependencies {
   runtimeRecord?: RuntimeInstructionRecord;
 }
 
-const loadRuntimeInstructionRecord = (): RuntimeInstructionRecord => {
+export const loadRuntimeInstructionRecord = (runtimeVersion = SUPPORTED_RUNTIME): RuntimeInstructionRecord => {
+  if (!Object.hasOwn(REVIEWED_RUNTIME_FILES, runtimeVersion)) throw new Error("No reviewed Codex catalog adapter for the installed Desktop runtime.");
   let parsed: unknown;
   try {
-    parsed = JSON.parse(readFileSync(new URL("./templates/codex-0.159.2.json", import.meta.url), "utf8"));
+    parsed = JSON.parse(readFileSync(new URL(`./templates/${REVIEWED_RUNTIME_FILES[runtimeVersion]}`, import.meta.url), "utf8"));
   } catch {
     throw new Error("Reviewed Codex runtime metadata could not be loaded.");
   }
   const root = object(parsed);
   keys(root, ["runtimeVersion", "source", "instructionField", "expectedInstructionSha256", "expectedInstructionUtf8ByteLength", "modelMetadata"]);
-  if (root.runtimeVersion !== SUPPORTED_RUNTIME || root.source !== "codex_debug_models_bundled" || root.instructionField !== "base_instructions") fail();
+  if (root.runtimeVersion !== runtimeVersion || root.source !== "codex_debug_models_bundled" || root.instructionField !== "base_instructions") fail();
   const expectedInstructionSha256 = root.expectedInstructionSha256;
   if (typeof expectedInstructionSha256 !== "string" || !/^[A-Fa-f0-9]{64}$/.test(expectedInstructionSha256)) fail();
   const expectedInstructionUtf8ByteLength = positive(root.expectedInstructionUtf8ByteLength);
@@ -85,7 +90,7 @@ const loadRuntimeInstructionRecord = (): RuntimeInstructionRecord => {
     experimental_supported_tools: [],
   };
   return {
-    runtimeVersion: SUPPORTED_RUNTIME,
+    runtimeVersion,
     source: "codex_debug_models_bundled",
     instructionField: "base_instructions",
     expectedInstructionSha256: (expectedInstructionSha256 as string).toUpperCase(),
@@ -111,9 +116,9 @@ export function extractRuntimeInstructions(
   runtimeVersion: string,
   runtimePath: string,
   runner: RuntimeCatalogRunner = runBundledRuntimeCatalog,
-  record: RuntimeInstructionRecord = REVIEWED_RUNTIME_INSTRUCTIONS,
+  record: RuntimeInstructionRecord = loadRuntimeInstructionRecord(runtimeVersion),
 ): string {
-  if (runtimeVersion !== SUPPORTED_RUNTIME || record.runtimeVersion !== SUPPORTED_RUNTIME
+  if (!Object.hasOwn(REVIEWED_RUNTIME_FILES, runtimeVersion) || record.runtimeVersion !== runtimeVersion
     || record.instructionField !== "base_instructions" || record.source !== "codex_debug_models_bundled") {
     throw new Error("No reviewed Codex catalog adapter for the installed Desktop runtime.");
   }
@@ -227,9 +232,9 @@ export function validateSelection(input: unknown): Selection {
 }
 
 export function generateSelection(input: unknown, runtimeVersion: string, runtimePath: string, dependencies: RuntimeSelectionDependencies = {}) {
-  if (runtimeVersion !== SUPPORTED_RUNTIME) throw new Error("No reviewed Codex catalog adapter for the installed Desktop runtime.");
+  if (!Object.hasOwn(REVIEWED_RUNTIME_FILES, runtimeVersion)) throw new Error("No reviewed Codex catalog adapter for the installed Desktop runtime.");
   const selection = validateSelection(input);
-  const record = dependencies.runtimeRecord ?? REVIEWED_RUNTIME_INSTRUCTIONS;
+  const record = dependencies.runtimeRecord ?? loadRuntimeInstructionRecord(runtimeVersion);
   const instructions = extractRuntimeInstructions(runtimeVersion, runtimePath, dependencies.runRuntime, record);
   const metadata = record.modelMetadata;
   const models = selection.models.map((model, index) => ({

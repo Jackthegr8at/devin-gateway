@@ -11,6 +11,8 @@ import {
   REVIEWED_RUNTIME_INSTRUCTIONS,
   sha256,
   SUPPORTED_RUNTIME,
+  REVIEWED_RUNTIME_FILES,
+  loadRuntimeInstructionRecord,
   validateSelection,
   type RuntimeCatalogRunner,
 } from "../tools/codex-devin/CodexSelection.js";
@@ -43,6 +45,32 @@ test("reviewed runtime instruction provenance pins only a hash and UTF-8 byte le
   expect(REVIEWED_RUNTIME_INSTRUCTIONS.runtimeVersion).toBe("0.159.2");
   expect(EXPECTED_INSTRUCTION_SHA256).toBe("B707476816BFE5E571A1BD2179F130FFF2B132DA5AB8E61063ACDB7FD24DAF12");
   expect(EXPECTED_INSTRUCTION_UTF8_BYTE_LENGTH).toBe(18043);
+});
+
+test("exact reviewed alpha adapter preserves Devin metadata and rejects unknown versions", () => {
+  const version = "0.159.0-alpha.12.1";
+  const record = loadRuntimeInstructionRecord(version);
+  expect(Object.keys(REVIEWED_RUNTIME_FILES).sort()).toEqual([version, "0.159.2"]);
+  expect(record.runtimeVersion).toBe(version);
+  expect(record.expectedInstructionSha256).toBe(EXPECTED_INSTRUCTION_SHA256);
+  expect(record.expectedInstructionUtf8ByteLength).toBe(18043);
+  expect(record.modelMetadata).toEqual(REVIEWED_RUNTIME_INSTRUCTIONS.modelMetadata);
+  const fixture = { ...record, expectedInstructionSha256: sha256(fixtureInstructions), expectedInstructionUtf8ByteLength: Buffer.byteLength(fixtureInstructions) };
+  const result = generateSelection(selectionFixture(), version, runtimePath, { runtimeRecord: fixture, runRuntime: fixtureRuntimeRunner });
+  expect(result.runtimeVersion).toBe(version);
+  for (const model of JSON.parse(result.catalogText).models) {
+    expect(model.multi_agent_version).toBe("v1");
+    expect(model.shell_type).toBe("shell_command");
+  }
+  expect(() => loadRuntimeInstructionRecord("0.159.0-alpha.12.2")).toThrow("No reviewed");
+  expect(() => loadRuntimeInstructionRecord("__proto__")).toThrow("No reviewed");
+  expect(() => extractRuntimeInstructions(version, runtimePath, fixtureRuntimeRunner, fixtureRuntimeRecord)).toThrow("No reviewed");
+  for (const output of [
+    { models: [{ base_instructions: "wrong fixture" }] },
+    { models: [] },
+    { models: [{ base_instructions: fixtureInstructions }, { base_instructions: fixtureInstructions }] },
+  ]) expect(() => extractRuntimeInstructions(version, runtimePath, () => ({ status: 0, stdout: JSON.stringify(output) }), fixture)).toThrow("reviewed SHA-256 and UTF-8 length");
+  expect(() => extractRuntimeInstructions(version, runtimePath, () => ({ status: 0, stdout: JSON.stringify({ models: {} }) }), fixture)).toThrow("bundled catalog was invalid");
 });
 
 test("bundled runtime extraction selects the locally sourced instruction value", () => {

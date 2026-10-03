@@ -43,8 +43,10 @@ function Get-CodexDevinDesktopRuntime {
     Assert-CodexDevinNoReparsePoint -Path (Split-Path -Parent $path)
     Assert-CodexDevinNoReparsePoint -Path $path
     $version = (Invoke-CodexDevinSelectionProcess -Executable $path -Arguments @('--version')).Trim()
-    if ($version -cne 'codex-cli 0.159.2') { throw 'The installed Desktop backend has no reviewed catalog adapter. No Codex files were changed.' }
-    return [pscustomobject]@{ Path = $path; Version = '0.159.2' }
+    $reviewedVersions = @('0.159.2', '0.159.0-alpha.12.1')
+    $runtimeVersion = $version -creplace '^codex-cli ', ''
+    if ($version -cne ('codex-cli ' + $runtimeVersion) -or $reviewedVersions -cnotcontains $runtimeVersion) { throw 'The installed Desktop backend has no reviewed catalog adapter. No Codex files were changed.' }
+    return [pscustomobject]@{ Path = $path; Version = $runtimeVersion }
 }
 
 function Get-CodexDevinPreparedSelection {
@@ -76,7 +78,7 @@ function Get-CodexDevinPreparedSelection {
     $preparedJson = Invoke-CodexDevinSelectionProcess -Executable $bun -Arguments @('--no-env-file', 'run', $helper, $runtime.Version, $runtime.Path) -InputText ([string]$response.Content)
     $prepared = ConvertFrom-Json -InputObject $preparedJson -ErrorAction Stop
     if ($prepared.schemaVersion -ne 1 -or $prepared.runtimeVersion -cne $runtime.Version) { throw 'Local selection preparation returned an invalid result.' }
-    $reviewedAdapter = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'templates\codex-0.159.2.json') -Raw | ConvertFrom-Json -ErrorAction Stop
+    $reviewedAdapter = Get-Content -LiteralPath (Join-Path $PSScriptRoot ('templates\codex-' + $runtime.Version + '.json')) -Raw | ConvertFrom-Json -ErrorAction Stop
     if ($prepared.instructionSha256 -cne $reviewedAdapter.expectedInstructionSha256 -or $prepared.instructionUtf8ByteLength -ne $reviewedAdapter.expectedInstructionUtf8ByteLength) {
         throw 'Locally sourced Codex instructions do not match the reviewed provenance record.'
     }
