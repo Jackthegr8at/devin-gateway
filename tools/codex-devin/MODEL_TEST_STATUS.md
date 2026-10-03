@@ -4,6 +4,10 @@ The picker records status for exact concrete variants, independently of enabled 
 
 ## Automatic evidence
 
+Completed normalized call IDs are exact opaque internal identities, not display/log identifiers. A separate validator permits provider punctuation and IDs longer than 128 characters, with no trimming, case changes or prefix requirement. The operational limit is 4,096 UTF-8 bytes: at most 1,024 pending calls bound ID payload near 4 MiB, plus runtime overhead. Empty/blank, invalid Unicode, C0/C1 control characters and Unicode line separators reject. Registered credentials and secret-like markers remain separate privacy rejections. IDs above this budget fail closed for evidence without changing bridge emission.
+
+Raw call IDs never enter safe JSONL. `tool_calls` now summarizes names only; fixed identifier stage/reason records, counts and correlation outcomes remain. Internal evidence retains the exact identity, and promotion still requires a previously emitted matching call, credential scope, concrete model, effort and completed successful continuation. Arbitrary user messages cannot establish evidence. The shared display/log identifier regex remains unchanged.
+
 The gateway correlates a completed, validated emitted tool call with a later function_call_output in memory. Correlation requires the same hashed credential scope, concrete model, requested effort and call ID. The continuation must have upstream HTTP 200, upstream completion, response completion and no failure classification. Replayed assistant history cannot establish an issued call. Pending IDs expire after one hour and are limited to 1,024; restart discards pending evidence, not saved status.
 
 Responses has no universal local tool success flag. Only an explicit zero exit code in a structured result or the native Codex terminal command envelope, or a structured success status without an error, qualifies. Opaque output, nonzero exit, running sessions and text-only responses remain Untested. No tool arguments or output are retained. This proves reported client-side success, not independent execution by the gateway; the gateway still executes no commands.

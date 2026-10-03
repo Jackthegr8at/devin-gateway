@@ -9,6 +9,17 @@ export const RESPONSES_SAFE_DIAGNOSTICS_ENV = "DEVIN_RESPONSES_SAFE_DIAGNOSTICS"
 export const RESPONSES_SAFE_DIAGNOSTICS_PATH_ENV = "DEVIN_RESPONSES_SAFE_DIAGNOSTICS_PATH";
 const DEFAULT_LOG_PATH = resolve(process.cwd(), "logs", "responses-safe-diagnostic.jsonl");
 const IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9_.:/-]{0,127}$/;
+// Responses/protobuf call IDs are opaque strings, not display identifiers.
+// Operational budget, not a provider/schema limit: 1024 pending IDs * 4096
+// UTF-8 bytes bounds ID payload near 4 MiB (plus JS/map overhead).
+export const MAX_CORRELATION_CALL_ID_BYTES = 4096;
+export function opaqueCallId(value: unknown): string | undefined {
+  if (typeof value !== "string" || !value.trim() || value.length > MAX_CORRELATION_CALL_ID_BYTES
+    || Buffer.byteLength(value, "utf8") > MAX_CORRELATION_CALL_ID_BYTES
+    || /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/u.test(value)
+    || !value.isWellFormed()) return undefined;
+  return value;
+}
 const CONNECT_CODES = new Set([
   "cancelled", "unknown", "invalid_argument", "deadline_exceeded", "not_found", "already_exists",
   "permission_denied", "resource_exhausted", "failed_precondition", "aborted", "out_of_range",
@@ -98,7 +109,7 @@ export interface ResponsesSafeDiagnosticRecord {
   first_upstream_event_type?: string;
   upstream_event_count: number;
   upstream_event_types: string[];
-  tool_calls: Array<{ name: string; call_id: string }>;
+  tool_calls: Array<{ name: string }>;
   upstream_terminal_status?: string;
   upstream_error_code?: string;
   connect_error_code?: string;
@@ -323,6 +334,19 @@ export class ResponsesSafeDiagnostic {
     return this.checkedIdentifier(value, stage, field, true);
   }
 
+  private correlationIdentifier(value: unknown, stage: IdentifierStage, structured = true): string | undefined {
+    const candidate = opaqueCallId(value);
+    const collision = (values: Set<string>) => typeof value === "string" && [...values].some(v => v.length >= 4 && (value.includes(v) || v.includes(value)));
+    // Privacy is separate from syntax. Trusted bridge identities may occur in
+    // prompts/history, but never bypass registered credentials or secret markers.
+    const reason: IdentifierReason | undefined = typeof value !== "string" || !value.trim() ? "missing"
+      : !candidate ? "invalid_format"
+      : /(?:token|secret|api.?key|bearer)/i.test(candidate) ? "secret_like"
+      : collision(structured ? this.credentials : this.secrets) ? "redaction_collision" : undefined;
+    if (this.record.identifier_checks.length < 64) this.record.identifier_checks.push({ stage, field: "call_id", state: reason ? "rejected" : "accepted", reason: reason ?? "none", sensitive_text_overlap: collision(this.secrets) });
+    return reason ? undefined : candidate;
+  }
+
   recordRequestStructure(messages: OpenAIMessage[], requestedChoice: unknown, choice: { optionName?: string; toolName?: string } | undefined, parallel: unknown): void {
     this.record.tool_choice_mode = requestedChoice === undefined ? "omitted" : choice?.toolName ? "specific" : requestedChoice === "required" ? "required" : requestedChoice === "none" ? "none" : "auto";
     this.record.upstream_tool_choice_mode = choice?.toolName ? "specific" : choice?.optionName === "any" ? "required" : choice?.optionName === "none" ? "none" : "auto";
@@ -338,7 +362,7 @@ export class ResponsesSafeDiagnostic {
 
   recordNormalizedUpstreamToolCall(call: { id: string; name: string }): void {
     this.record.normalized_tool_call_object_count++;
-    this.structuredIdentifier(call.id, "upstream_object", "call_id");
+    this.correlationIdentifier(call.id, "upstream_object");
     this.structuredIdentifier(call.name, "upstream_object", "tool_name");
   }
   recordBridgeOutcome(outcome: BridgeOutcome): void { increment(this.record.bridge_outcomes, outcome); }
@@ -360,22 +384,22 @@ export class ResponsesSafeDiagnostic {
   /** Completed accumulator output, not unvalidated deltas or assistant history. */
   recordNormalizedEmittedToolCall(call: { id: string; name: string }): void {
     this.record.bridge_completed_tool_call_count++;
-    const id = this.structuredIdentifier(call.id, "emitted_evidence", "call_id");
+    const id = this.correlationIdentifier(call.id, "emitted_evidence");
     const name = this.structuredIdentifier(call.name, "emitted_evidence", "tool_name");
     if (!id || !name) return;
     if (this.evidence.emitted.length >= 16) { this.recordBridgeOutcome("evidence_limit"); return; }
     this.record.had_tool_call = true;
     this.evidence.emitted.push({ id, name });
     this.record.tool_evidence_emitted_count++;
-    if (!this.record.tool_calls.some(entry => entry.call_id === id) && this.record.tool_calls.length < 16) {
-      this.record.tool_calls.push({ name, call_id: id });
+    if (!this.record.tool_calls.some(entry => entry.name === name) && this.record.tool_calls.length < 16) {
+      this.record.tool_calls.push({ name });
     }
   }
 
   /** Validated Responses converter output; never inspect raw input/history text. */
   recordNormalizedFunctionCallOutput(message: OpenAIMessage, success: boolean): void {
     if (message.role !== "tool") return;
-    const id = this.structuredIdentifier(message.tool_call_id, "returned_evidence", "call_id");
+    const id = this.correlationIdentifier(message.tool_call_id, "returned_evidence");
     if (!id) return;
     if (this.evidence.returned.length >= 16) { this.recordBridgeOutcome("evidence_limit"); return; }
     this.record.had_function_call_output = true;
@@ -499,10 +523,10 @@ export class ResponsesSafeDiagnostic {
 
   recordToolCall(name: unknown, callId: unknown): void {
     const safeName = identifier(name);
-    const safeCallId = this.checkedIdentifier(callId, "history", "call_id", false);
+    const safeCallId = this.correlationIdentifier(callId, "history", false);
     if (!safeName || !safeCallId || this.record.tool_calls.length >= 16) return;
-    if (!this.record.tool_calls.some((call) => call.call_id === safeCallId)) {
-      this.record.tool_calls.push({ name: safeName, call_id: safeCallId });
+    if (!this.record.tool_calls.some((call) => call.name === safeName)) {
+      this.record.tool_calls.push({ name: safeName });
     }
   }
 

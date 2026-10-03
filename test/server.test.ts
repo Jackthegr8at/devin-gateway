@@ -1115,7 +1115,7 @@ describe("POST /v1/responses (non-streaming)", () => {
 
 });
 
-test("Desktop logical Max A/B flow retains history-mentioned routing/call IDs and promotes only after normalized continuation", async () => {
+test("Desktop logical High A/B flow retains opaque bridge IDs and promotes only after normalized continuation", async () => {
   for (const stream of [false, true]) {
     const directory = mkdtempSync(join(tmpdir(), "synthetic-desktop-status-"));
     const path = join(directory, "safe.jsonl");
@@ -1125,10 +1125,10 @@ test("Desktop logical Max A/B flow retains history-mentioned routing/call IDs an
     process.env.DEVIN_RESPONSES_SAFE_DIAGNOSTICS = "1";
     process.env.DEVIN_RESPONSES_SAFE_DIAGNOSTICS_PATH = path;
     process.env.DEVIN_CODEX_DESKTOP_COLLAPSE_SYSTEM = "1";
-    const id = "synthetic-desktop-issued-call";
+    const id = "synthetic-provider[call]=+" + "x".repeat(160);
     const privatePrompt = `Synthetic Desktop history references swe-2 swe-2-max ${id}; do not persist this text`;
     let calls = 0;
-    const upstream = startUpstream({ modelsBody: familyPayload([familyFixture("swe-2-max", "SWE-2", "max")]), chatBody: () => framesBody([
+    const upstream = startUpstream({ modelsBody: familyPayload([familyFixture("swe-2-high", "SWE-2", "high")]), chatBody: () => framesBody([
       dataFrame({ usage: { inputTokens: 10, outputTokens: 5 } }),
       dataFrame({ thinking: "Synthetic private thinking" }),
       ++calls === 1 ? dataFrame({ toolCalls: [{ id, name: "exec_command", argumentsJson: '{"cmd":"synthetic-private-command"}' }] }) : dataFrame({ text: "Synthetic private result" }),
@@ -1138,7 +1138,7 @@ test("Desktop logical Max A/B flow retains history-mentioned routing/call IDs an
     try {
       const send = async (items: unknown[]) => {
         const response = await fetch(`${gateway.url}/v1/responses`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({
-          model: "swe-2", reasoning: { effort: "max" }, stream, instructions: privatePrompt,
+          model: "swe-2", reasoning: { effort: "high" }, stream, instructions: privatePrompt,
           input: [{ role: "developer", content: privatePrompt }, { role: "user", content: privatePrompt }, ...items],
           tools: [{ type: "function", name: "exec_command", description: privatePrompt, parameters: { type: "object", description: privatePrompt } }],
         }) }); expect(response.status).toBe(200); return response.text();
@@ -1150,14 +1150,14 @@ test("Desktop logical Max A/B flow retains history-mentioned routing/call IDs an
       await gateway.cleanup();
       const records = readFileSync(path, "utf8").trim().split("\n").map(line => JSON.parse(line));
       expect(records).toHaveLength(2);
-      for (const r of records) expect(r).toMatchObject({ logical_model: "swe-2", requested_effort: "max", resolved_model_id: "swe-2-max", upstream_terminal_status: "completed", response_failed_source: "none" });
+      for (const r of records) expect(r).toMatchObject({ logical_model: "swe-2", requested_effort: "high", resolved_model_id: "swe-2-high", upstream_terminal_status: "completed", response_failed_source: "none" });
       expect(records[0]).toMatchObject({ had_tool_call: true, had_function_call_output: false, upstream_event_types: ["usage", "thinking", "toolcall", "done"] });
       expect(records[1]).toMatchObject({ had_tool_call: false, had_function_call_output: true, upstream_event_types: ["usage", "thinking", "text", "done"] });
       expect(records[0]).toMatchObject({ upstream_toolcall_event_count: 1, normalized_tool_call_object_count: 1, bridge_completed_tool_call_count: 1, responses_tool_call_emitted_count: 1, tool_evidence_emitted_count: 1, correlation_results: { issued_call_recorded: 1 } });
       expect(records[1]).toMatchObject({ function_call_output_input_count: 1, tool_evidence_returned_count: 1, normalized_input_type_counts: { function_call_output: 1, assistant_function_call: 1 }, correlation_results: { matched_success: 1 } });
-      expect(JSON.parse(readFileSync(join(directory, "model-test-status.json"), "utf8")).variants["swe-2-max"].automatic).toMatchObject({ logicalModel: "swe-2", effort: "max" });
+      expect(JSON.parse(readFileSync(join(directory, "model-test-status.json"), "utf8")).variants["swe-2-high"].automatic).toMatchObject({ logicalModel: "swe-2", effort: "high" });
       const jsonl = readFileSync(path, "utf8");
-      for (const raw of [privatePrompt, "synthetic-private-key", "synthetic-private-command", "Synthetic private hostname", "Synthetic private thinking"]) expect(jsonl).not.toContain(raw);
+      for (const raw of [id, privatePrompt, "synthetic-private-key", "synthetic-private-command", "Synthetic private hostname", "Synthetic private thinking"]) expect(jsonl).not.toContain(raw);
     } finally {
       await gateway.cleanup(); await upstream.stop(); rmSync(directory, { recursive: true, force: true });
       for (const [key, value] of [["DEVIN_RESPONSES_SAFE_DIAGNOSTICS", oldFlag], ["DEVIN_RESPONSES_SAFE_DIAGNOSTICS_PATH", oldPath], ["DEVIN_CODEX_DESKTOP_COLLAPSE_SYSTEM", oldCollapse]]) {
@@ -1192,7 +1192,7 @@ test("logical GLM Low and SWE High retain equivalent auto/required/specific Resp
   } finally { await gateway.cleanup(); await upstream.stop(); }
 });
 
-test("diagnostics locate a bridge-emitted call rejected only by diagnostic identifier format, without altering the Responses call", async () => {
+test("long bridge-emitted call retains evidence without altering Responses identity or exposing it", async () => {
   const directory = mkdtempSync(join(tmpdir(), "synthetic-id-boundary-"));
   const path = join(directory, "safe.jsonl"); const oldFlag = process.env.DEVIN_RESPONSES_SAFE_DIAGNOSTICS; const oldPath = process.env.DEVIN_RESPONSES_SAFE_DIAGNOSTICS_PATH;
   process.env.DEVIN_RESPONSES_SAFE_DIAGNOSTICS = "1"; process.env.DEVIN_RESPONSES_SAFE_DIAGNOSTICS_PATH = path;
@@ -1205,8 +1205,8 @@ test("diagnostics locate a bridge-emitted call rejected only by diagnostic ident
     const response = await fetch(`${gateway.url}/v1/responses`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ model: "swe-2-high", reasoning: { effort: "high" }, input: "Synthetic private prompt", tools: [{ type: "function", name: "exec_command", parameters: { type: "object" } }] }) });
     expect(response.status).toBe(200); expect((await response.json()).output[0].call_id).toBe(id);
     const r = JSON.parse(readFileSync(path, "utf8"));
-    expect(r).toMatchObject({ upstream_toolcall_event_count: 1, normalized_tool_call_object_count: 1, bridge_completed_tool_call_count: 1, responses_tool_call_emitted_count: 1, tool_evidence_emitted_count: 0, had_tool_call: false });
-    expect(r.identifier_checks).toContainEqual({ stage: "emitted_evidence", field: "call_id", state: "rejected", reason: "invalid_format", sensitive_text_overlap: false });
+    expect(r).toMatchObject({ upstream_toolcall_event_count: 1, normalized_tool_call_object_count: 1, bridge_completed_tool_call_count: 1, responses_tool_call_emitted_count: 1, tool_evidence_emitted_count: 1, had_tool_call: true });
+    expect(r.identifier_checks).toContainEqual({ stage: "emitted_evidence", field: "call_id", state: "accepted", reason: "none", sensitive_text_overlap: false });
     expect(readFileSync(path, "utf8")).not.toContain(id);
   } finally { await gateway.cleanup(); await upstream.stop(); rmSync(directory, { recursive: true, force: true }); if (oldFlag === undefined) delete process.env.DEVIN_RESPONSES_SAFE_DIAGNOSTICS; else process.env.DEVIN_RESPONSES_SAFE_DIAGNOSTICS = oldFlag; if (oldPath === undefined) delete process.env.DEVIN_RESPONSES_SAFE_DIAGNOSTICS_PATH; else process.env.DEVIN_RESPONSES_SAFE_DIAGNOSTICS_PATH = oldPath; }
 });

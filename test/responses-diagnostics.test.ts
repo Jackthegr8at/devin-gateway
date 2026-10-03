@@ -6,7 +6,37 @@ import { ProtoEncoder } from "../src/proto.ts";
 import {
   ResponsesSafeDiagnostic,
   responsesSafeDiagnosticsEnabled,
+  opaqueCallId,
+  MAX_CORRELATION_CALL_ID_BYTES,
 } from "../src/responses-diagnostics.ts";
+
+test("opaque correlation identities preserve exact spelling and enforce UTF-8 budget/control safety", () => {
+  for (const id of ["chatcmpl-tool-91596c45e5ad039f", "synthetic[provider]+=call@id", "synthetic/" + "x".repeat(180), " Provider ID ", "模型-call", "x".repeat(MAX_CORRELATION_CALL_ID_BYTES)]) expect(opaqueCallId(id)).toBe(id);
+  for (const id of [undefined, null, 42, {}, "", "  ", "x".repeat(MAX_CORRELATION_CALL_ID_BYTES + 1), "é".repeat(MAX_CORRELATION_CALL_ID_BYTES / 2 + 1), "a\0b", "a\nb", "a\rb", "a\tb", "a\u0085b", "a\u2028b", "a\u2029b", "a\ud800b"]) expect(opaqueCallId(id)).toBeUndefined();
+  expect(opaqueCallId("Call")).not.toBe(opaqueCallId("call"));
+  expect(opaqueCallId(" call")).not.toBe(opaqueCallId("call"));
+});
+
+test("only normalized evidence retains opaque identity internally; JSONL never contains raw IDs", () => {
+  const root = mkdtempSync(join(tmpdir(), "synthetic-opaque-evidence-")); const path = join(root, "safe.jsonl");
+  try {
+    const id = "synthetic[provider]+=call@" + "x".repeat(150);
+    let evidence: any;
+    const d = new ResponsesSafeDiagnostic("synthetic-opaque", Date.now(), path, (_record, value) => { evidence = value; });
+    d.addSensitiveValues([`Synthetic history ${id}`]);
+    d.recordNormalizedUpstreamToolCall({ id, name: "exec_command" });
+    d.recordNormalizedEmittedToolCall({ id, name: "exec_command" });
+    d.recordNormalizedFunctionCallOutput({ role: "tool", tool_call_id: id, content: "Synthetic private result" }, true);
+    d.recordNormalizedFunctionCallOutput({ role: "user", tool_call_id: "arbitrary", content: "Synthetic user text" }, true);
+    d.recordToolCall("exec_command", id);
+    d.finalize();
+    expect(evidence.emitted).toEqual([{ id, name: "exec_command" }]);
+    expect(evidence.returned).toEqual([{ id, success: true }]);
+    const json = readFileSync(path, "utf8");
+    expect(json).not.toContain(id);
+    expect(JSON.parse(json)).toMatchObject({ had_tool_call: true, had_function_call_output: true, tool_evidence_emitted_count: 1, tool_evidence_returned_count: 1, tool_calls: [{ name: "exec_command" }] });
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
 
 test("safe Responses diagnostics are explicitly opt-in", () => {
   expect(responsesSafeDiagnosticsEnabled(undefined)).toBe(false);
@@ -22,7 +52,7 @@ test("stage diagnostics contain fixed rejection reasons and normalized counts, n
     d.addCredentialValues([privateValue]); d.addSensitiveValues(["Synthetic history references valid-call exec_command", "private-looking-id"]);
     d.recordRequestStructure([{ role: "developer", content: "Synthetic private developer" }, { role: "tool", tool_call_id: "valid-call", content: "Synthetic private tool output" }], { type: "function", name: "exec_command" }, { toolName: "exec_command" }, true);
     d.recordUpstreamEvent("toolcall");
-    for (const id of ["", "synthetic invalid value", privateValue, "synthetic-token-value", "valid-call"]) d.recordNormalizedUpstreamToolCall({ id, name: "exec_command" });
+    for (const id of ["", "synthetic\ninvalid value", privateValue, "synthetic-token-value", "valid-call"]) d.recordNormalizedUpstreamToolCall({ id, name: "exec_command" });
     d.recordToolCall("exec_command", "private-looking-id");
     d.recordNormalizedEmittedToolCall({ id: "valid-call", name: "exec_command" }); d.recordResponsesToolCallEmitted(); d.finalize();
     const json = readFileSync(path, "utf8"); const r = JSON.parse(json);

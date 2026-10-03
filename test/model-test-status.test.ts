@@ -95,7 +95,7 @@ test("only normalized structured fields retain history-mentioned IDs; credential
   d.recordNormalizedFunctionCallOutput({ role: "tool", tool_call_id: credential, content: privateText }, true);
   d.recordSuccessfulCompletion(); d.finalize(); const json = await readFile(path, "utf8"); const r = JSON.parse(json);
   expect(r).toMatchObject({ logical_model: "swe-2", requested_effort: "max", resolved_model_id: "swe-2-max", had_tool_call: true, had_function_call_output: true });
-  expect(r.tool_calls).toEqual([{ name: "exec_command", call_id: "synthetic-issued-call" }]);
+  expect(r.tool_calls).toEqual([{ name: "exec_command" }]);
   for (const raw of [privateText, credential, "private-looking-id", "arbitrary-user-id", "arbitrary text", "synthetic-cookie-value-9251"]) expect(json).not.toContain(raw);
 }));
 
