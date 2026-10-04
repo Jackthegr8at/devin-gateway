@@ -125,7 +125,7 @@ The exact-ID reviewed profiles advertise only GLM `low` and SWE-2 `medium`, with
 
 The store uses private POSIX directory/file modes (`0700`/`0600`), a flushed temporary file and atomic rename, plus a bounded filesystem writer lock. A corrupt existing file stops initialization or returns a sanitized `503`; it is never overwritten with defaults. After an interrupted writer, an abandoned `.selection-write.lock` fails closed: confirm every writer is stopped before manually removing that lock. Normal saves leave no lock or temporary file.
 
-Management endpoints are served only when `DEVIN_ADMIN_PORT` is explicitly set alongside enabled selection. Compose binds management to `127.0.0.1:3001` inside the gateway network namespace without publishing its raw port. The permanent private picker is available through authenticated Caddy HTTPS at `https://devin-admin.home.arpa/admin/`. Caddy shares the namespace, validates external Host/Origin/fetch metadata, then translates to the unchanged loopback guard and strips browser credentials. See [admin HTTPS deployment, private credentials and certificate trust](deploy/ADMIN_HTTPS.md). The listener has no inference CORS/raw tracing. The picker uses these existing endpoints:
+Management endpoints are served only when `DEVIN_ADMIN_PORT` is explicitly set alongside enabled selection. Compose publishes container management port 3001 on the configured private IPv4 address at port 38644. A persistent Docker-aware firewall permits only the separate Nginx host. The permanent picker is available at `https://devin-admin.dev.kryptxt.ca/admin/`, using the existing wildcard certificate, LAN/WireGuard allowlist and site-specific Basic authentication. Nginx validates external Host/Origin/fetch metadata, translates to the unchanged loopback header contract and strips browser credentials. Install the firewall before publishing management; see [admin HTTPS deployment](deploy/ADMIN_HTTPS.md). The listener has no inference CORS/raw tracing. The picker uses these existing endpoints:
 
 | Method/path | Response |
 |---|---|
@@ -617,7 +617,7 @@ Key files:
 
 ## Web model picker (Phase 2)
 
-Open `https://devin-admin.home.arpa/admin/` through the authenticated private proxy after configuring local hostname resolution and certificate trust. The page never handles Devin credentials and is not served on the inference port. Its fixed assets use a same-origin CSP without inline scripts, inline styles, or eval. No external fonts, analytics, or CDN assets are loaded.
+Open `https://devin-admin.dev.kryptxt.ca/admin/` through the authenticated internal Nginx proxy. DNS targets the Nginx host; its existing wildcard Let's Encrypt certificate requires no new CA. The page never handles Devin credentials and is not served on the inference port. Its fixed assets use a same-origin CSP without inline scripts, inline styles, or eval. No external fonts, analytics, or CDN assets are loaded.
 
 The compact dark picker adapts Cody's MIT-licensed category, display and pagination helpers; attribution is in `web/model-picker/THIRD_PARTY_NOTICES.txt` and the built `/admin/assets/third-party-notices.txt`. React/React DOM are the only added runtime dependencies. Bun bundles the frontend; no Next.js or separate UI server is required:
 
@@ -645,7 +645,7 @@ Initialization atomically migrates a valid v1 file to v2 without advancing its r
 
 Saving a selection changes gateway settings, not active Desktop files. The guarded Windows workflow consumes the selection during its next activation and restores the original configuration afterward. Permanent browser access does not change that contract or its fingerprint guard.
 
-After configuring private admin credentials as documented in [admin HTTPS](deploy/ADMIN_HTTPS.md), deploy without removing auth/settings or Caddy volumes:
+After installing the persistent management firewall and configuring Nginx authentication as documented in [admin HTTPS](deploy/ADMIN_HTTPS.md), deploy without removing auth/settings volumes:
 
 ```sh
 cd <existing-gateway-checkout>
@@ -653,11 +653,11 @@ git fetch origin
 git switch codex-desktop
 git pull --ff-only
 sudo docker compose build devin-gateway
-sudo docker compose up -d --force-recreate devin-gateway devin-admin-proxy
+sudo docker compose up -d --force-recreate devin-gateway
 sudo docker compose ps
 ```
 
-Open the HTTPS hostname after completing the one-time Windows CA trust and local DNS steps. Manual acceptance should verify search/filter/page-wide bulk changes, Cancel, required-role errors, future mode, and a conflict between two browser tabs. Confirm `/admin/` remains absent on inference port 38643 and no raw management port is published. Do not submit an inference request for this acceptance.
+Open the HTTPS hostname after setting your Nginx admin password. Manual acceptance should verify search/filter/page-wide bulk changes, Cancel, required-role errors, future mode, and a conflict between two browser tabs. Confirm `/admin/` remains absent on inference port 38643 and raw port 38644 is reachable only from Nginx. Do not submit an inference request for this acceptance.
 
 ## License
 

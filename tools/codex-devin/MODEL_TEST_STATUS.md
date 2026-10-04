@@ -121,4 +121,4 @@ Management-only API:
 - PUT /admin/api/model-test-status accepts exactly modelId and status, with application/json, x-devin-management: 1 and If-Match. A stale ETag returns 412.
 - GET /admin/api/models merges effective status into the variant rows and supplies testStatusETag.
 
-Existing Host/Origin/CSRF guards and the loopback-only management listener apply. Compose exposes these routes only through the authenticated private HTTPS proxy, never on the inference listener. Codex selection export remains based on enabled + available + structurally compatible, never Tested gating. See [admin HTTPS deployment](../../deploy/ADMIN_HTTPS.md).
+Existing Host/Origin/CSRF guards and their loopback header contract apply. Compose publishes management only on the private host address, with a persistent Docker-aware firewall admitting only the separate Nginx host. Browsers use authenticated Nginx HTTPS, never the raw management or inference listener. Codex selection export remains based on enabled + available + structurally compatible, never Tested gating. See [admin HTTPS deployment](../../deploy/ADMIN_HTTPS.md).

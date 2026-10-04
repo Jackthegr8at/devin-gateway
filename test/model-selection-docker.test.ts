@@ -13,21 +13,14 @@ test("Compose settings/auth volumes and login mounts remain separate", async () 
   expect(login).not.toContain("devin-gateway-settings");
   expect(compose.split("\nvolumes:")[1]).toContain("  devin-gateway-settings:");
   expect(gateway).toContain('DEVIN_ADMIN_PORT: "3001"');
-  expect(gateway).toContain('DEVIN_ADMIN_HOST: "127.0.0.1"');
+  expect(gateway).toContain('DEVIN_ADMIN_HOST: "0.0.0.0"');
   expect(compose).not.toContain('DEVIN_ADMIN_PUBLIC_PORT');
-  expect(compose).not.toContain('38644:3001');
+  expect(gateway).toContain('}:38644:3001"');
   expect(gateway).toContain('}:38643:3000"');
-  expect(gateway).toContain('}:443:443"');
-  const proxy = compose.split("  devin-admin-proxy:")[1].split("  devin-login:")[0];
-  expect(proxy).toContain("network_mode: service:devin-gateway");
-  expect(proxy).not.toContain("ports:");
-  expect(proxy).toContain("condition: service_healthy");
-  expect(proxy).toContain("restart: true");
-  expect(proxy).toContain("restart: unless-stopped");
-  expect(proxy).toContain("devin-admin-caddy-data:/data");
-  expect(proxy).toContain("devin-admin-caddy-config:/config");
-  expect(proxy).not.toContain("devin-gateway-auth:");
-  expect(proxy).not.toContain("devin-gateway-settings:");
+  expect(compose).not.toContain('}:443:443"');
+  expect(compose).not.toContain("devin-admin-proxy:");
+  expect(compose).not.toContain("network_mode:");
+  expect(compose).not.toContain("caddy");
 });
 
 test("image creates private settings owned by gateway; entrypoint does not touch auth", async () => {

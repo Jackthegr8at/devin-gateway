@@ -1,127 +1,115 @@
-# Permanent private admin HTTPS
+# Permanent internal Nginx admin HTTPS
 
-The existing picker is at `https://devin-admin.home.arpa/admin/`. It is not a
-second UI or inference proxy. DNS is operator-managed: map this hostname to the
-gateway host's private address. Do not publish public DNS or router forwarding.
+Open `https://devin-admin.dev.kryptxt.ca/admin/`. DNS targets the existing Nginx
+host, not the gateway. Reuse the wildcard Let's Encrypt certificate and its
+existing renewal process; do not create or import another CA.
 
-## Network and security contract
+## Reviewed topology
 
-- `devin-gateway` owns the Docker network namespace and all published ports.
-  Inference retains its exact private `38643:3000` mapping. HTTPS adds private
-  `443:443`; the old `38644:3001` publication is removed.
-- `devin-admin-proxy` shares `network_mode: service:devin-gateway` and has no
-  `ports` or separate `networks`. Management binds `127.0.0.1:3001` inside that
-  namespace, inaccessible through the bridge or LAN. Caddy proxies loopback.
-- Caddy 2.10.2-alpine is version-pinned. Its admin API and HTTP redirects are
-  disabled; no port 80, 2019, or raw management port is published.
-- `DEVIN_ADMIN_ALLOWED_CIDRS` is a required space-separated list of approved
-  client networks in private `.env`. This supplements the private bind/firewall;
-  Docker port publication must not be assumed to obey ordinary UFW rules alone.
-- Exact external Host, present Origin, and fetch metadata are validated before
-  translation. Only absent or `https://devin-admin.home.arpa` Origin is accepted;
-  fetch site must be absent, `same-origin`, or `none`. Unmatched hosts are rejected.
-- Basic authentication protects every forwarded resource. After validation, Host
-  becomes `127.0.0.1:3001`; a present accepted Origin becomes
-  `http://127.0.0.1:3001`. Authorization, Cookie and X-Api-Key are removed upstream.
-  Discovery continues using the gateway's existing fallback credential.
-- Gateway Host/Origin/fetch-metadata checks, CSRF management header, JSON bounds,
-  ETags and no-store behavior remain unchanged. The browser uses same-origin
-  credentials only, never cross-origin authentication or provider tokens.
-- Only `/admin/`, three fixed asset paths, and the models, model-selection and
-  model-test-status APIs are forwarded. The HTML page is the fourth static
-  resource. All other paths are rejected, including health, inference, Codex
-  export and Caddy administration. No proxy access/debug logging is enabled.
+Browser -> Nginx HTTPS + LAN/WireGuard allowlist + Basic authentication ->
+private gateway host port 38644 -> container management port 3001.
 
-## Private credentials
+Inference remains on private host port 38643. Management listens on 0.0.0.0
+**inside the container only**, with host publication restricted to the configured
+private IPv4. This is necessary because Nginx runs on a different host.
+Neither the raw port nor the browser interface is anonymously available to LAN
+clients. Do not expose management on host 0.0.0.0, IPv6 wildcard or public routing.
 
-Set `.env` private bind/CIDRs and create the private secret before starting:
+## Firewall first
+
+Install `scripts/devin-admin-firewall.sh` as
+`/usr/local/sbin/devin-admin-firewall` (root-owned, mode 0755). Adapt the two
+IPv4 arguments in `deploy/20-devin-admin-firewall.conf` and install that file
+under `/etc/systemd/system/docker.service.d/` (root-owned, mode 0644), after
+the existing host firewall hook. Install the adapted
+`deploy/devin-admin-firewall.service` under `/etc/systemd/system/` as well. Run:
 
 ```sh
-# Run from the checkout on the Linux Docker host, with Docker permission.
-sudo python3 scripts/bootstrap-admin-auth.py --generate
-docker compose config --quiet
-docker compose run --rm --no-deps devin-admin-proxy \
-  caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
-docker compose build devin-gateway
-docker compose up -d --force-recreate devin-gateway devin-admin-proxy
+sudo /usr/local/sbin/devin-admin-firewall <gateway-private-ip> <nginx-private-ip>
+sudo systemctl daemon-reload
+sudo systemctl enable --now devin-admin-firewall.service
+sudo systemctl show docker -p ExecStartPost -p UnitFileState
+sudo iptables -S DOCKER-USER
+sudo iptables -S INPUT
 ```
 
-The helper uses the official Caddy `hash-password` command with password input
-through stdin, not arguments/logs. It creates `secrets/` mode 0700 and private
-files mode 0600. `secrets/devin-admin-users.caddy` contains the username/hash and
-is mounted read-only as `/run/secrets/devin_admin_users`. The generated initial
-password is retained only in `secrets/devin-admin-bootstrap.json` for the operator
-to retrieve privately over SSH. Do not post it in chat. Existing credentials
-are never overwritten by `--generate`; both Git and Docker build ignore secrets.
+The destination-specific deny matches original host port 38644 using conntrack,
+before Docker's broad post-DNAT port-3001 permits. All sources except Nginx are
+dropped. INPUT is restricted as well. Reapplication restores first position
+without flushing unrelated rules. The existing LAN rules allow Nginx.
+Keep Docker enabled at boot. Do not restart Docker simply to test the hook:
+inspect its configuration and explicitly reapply the script.
 
-Rotate to your own password after bootstrap:
+The required oneshot installs restrictions after UFW but before Docker can start
+containers on reboot. Raw PREROUTING denies non-proxy requests before DNAT,
+independently of broad filter permits inserted by other startup hooks.
+ExecStartPost reasserts filter rule ordering after the existing Docker firewall.
+Do not assume UFW INPUT alone protects Docker publications.
+
+## Nginx deployment
+
+Adapt `deploy/nginx-devin-admin.conf`'s upstream IPv4 placeholder, install it in
+`/etc/nginx/sites-available/devin-admin` and symlink it in sites-enabled. Keep
+the existing certificate paths and approved LAN/WireGuard networks. Only this
+site uses `/etc/nginx/auth/devin-admin.htpasswd`.
+
+- Authentication and IP restrictions both apply (`satisfy all`).
+- Exact external Host, optional HTTPS Origin and fetch metadata are checked
+  before rewriting upstream Host/Origin to the existing loopback contract.
+- Authorization, Cookie and X-Api-Key are removed before forwarding.
+- Only the HTML page, three fixed assets and three admin APIs are proxied.
+- Gateway Host/Origin/CSRF, ETag and persistence semantics remain unchanged.
+- Existing host access/error log and logrotate conventions apply. Do not enable
+  header/body debugging or put passwords in URLs.
+- No other virtual host's authentication or routing is changed.
+
+Validate with `sudo nginx -t`, then `sudo systemctl reload nginx`.
+
+## Set or rotate the password
+
+Run interactively on the Nginx host:
 
 ```sh
-sudo python3 scripts/bootstrap-admin-auth.py --rotate
-docker compose up -d --no-deps --force-recreate devin-admin-proxy
+sudo install -d -o root -g www-data -m 0750 /etc/nginx/auth
+sudo htpasswd -B /etc/nginx/auth/devin-admin.htpasswd admin
+sudo chown root:www-data /etc/nginx/auth/devin-admin.htpasswd
+sudo chmod 0640 /etc/nginx/auth/devin-admin.htpasswd
 ```
 
-Rotation prompts without echo, stores only the new hash, and removes the obsolete
-bootstrap file. The Basic login is always over TLS; the browser can cache the old
-login, so use a fresh browser session after rotation. This is independent of Devin
-OAuth: no OAuth token file/volume is read or modified by either helper operation.
+For a brand-new file only, add `-c` to htpasswd; never use `-c` to rotate an
+existing multi-user file. Password prompts are not echoed. Do not use `-b`,
+environment variables, command arguments or Git to carry passwords.
+Only the hash remains on this host; no gateway/provider credential is involved.
+Nginx reads the file for subsequent authentication without a reload. A private
+browser window avoids cached old credentials after rotation.
 
-## Windows hostname and certificate trust
+Automated initial acceptance uses a random in-memory password, then LOCKS the
+admin account. You must set your own password before normal browser access.
 
-1. Configure local DNS or hosts for `devin-admin.home.arpa -> <private gateway IP>`.
-2. Export **only** the public Caddy root certificate on the server:
+## Validation and persistence
 
-```sh
-docker compose cp devin-admin-proxy:/data/caddy/pki/authorities/local/root.crt ./caddy-root.crt
-```
+`sudo python3 scripts/test-nginx-admin.py` runs isolated proxy checks on the
+Nginx host using its existing certificate and a synthetic backend. It checks
+TLS, authentication, route isolation, Host/Origin/fetch rejection and header
+stripping without provider access. `--live-bootstrap --gateway-ip <nginx-ip>`
+is a one-time installation acceptance operation: it refuses to replace an
+existing htpasswd file, validates real read-only APIs, and locks the account
+afterward. Never use this bootstrap option for routine password rotation.
 
-3. Copy `caddy-root.crt` over authenticated SSH. Verify its fingerprint through
-   that trusted channel before importing it. Never export `root.key` or the whole
-   Caddy data volume; a trusted CA root can sign other hostnames too.
-4. In Windows PowerShell, import for the current user (replace the local path):
+Verify raw management succeeds from Nginx but fails from an ordinary LAN host.
+Verify inference health remains ok/fallback_token=set/collapse_system_enabled=true.
+Record selection/Tested hashes before and after recreation. Do not run inference
+or mutate selections for proxy acceptance.
 
-```powershell
-Import-Certificate -FilePath .\caddy-root.crt -CertStoreLocation Cert:\CurrentUser\Root
-```
+Nginx and Docker are enabled host services; Compose gateway restart is
+unless-stopped. The settings/auth volumes remain unchanged. Reboot persistence
+is validated by startup ordering/rules inspection, not by rebooting shared hosts.
 
-5. Open the HTTPS `/admin/` URL, authenticate as `admin`, and check current
-   models/roles/Tested state. TLS warnings must be resolved, not bypassed for
-   normal use. A harmless selection edit is a separate manual acceptance action.
+## Retired Caddy state
 
-## Persistence and restart
-
-Auth/settings volume names and mount paths remain unchanged. Caddy has separate
-`devin-admin-caddy-data` and `devin-admin-caddy-config` named volumes, preserving
-its CA and certificate state. Never remove those volumes to restart services.
-Both services use `unless-stopped`; Docker must be enabled at host boot. A
-deliberately stopped service remains stopped after a reboot by design.
-
-Process/container restarts preserve state. Compose v2.20.2 supports the explicit
-dependency `restart: true`, but namespace-owner **recreation must recreate both**
-services with the command above. Do not manually remove/recreate only the gateway
-and assume a running sidecar has followed its replacement namespace. No boot-time
-SSH action is necessary. After any restart verify health, HTTPS authentication,
-and the current selection/status revision; do not run inference for these checks.
-
-## Offline proxy validation and rollback
-
-```sh
-sudo python3 scripts/test-admin-proxy.py
-```
-
-This runs Caddy against a synthetic loopback backend on disposable ports and
-private temporary paths. It never reads production credentials/volumes or calls
-Devin. The fixture removes its own container and temporary CA after completion.
-Gateway backend security tests remain required alongside this proxy test.
-
-After deployment, `sudo python3 scripts/verify-admin-https.py` performs GET-only
-acceptance using the private bootstrap credential (or a non-echoed password prompt
-after rotation). It verifies the actual Caddy CA, allowed/denied routes, inference
-health, raw-port removal, internal loopback binding and unchanged settings/status
-bytes. It prints only fixed results/revisions and never the credential or bodies.
-
-Before deployment record the previous commit/image and hashes of selection/status
-files, without printing their contents. If rollback is needed, stop only
-`devin-admin-proxy`, restore the recorded gateway checkout/image and recreate
-the gateway using that revision's Compose file. Retain all named volumes and
-private secret files. The previous revision's SSH-only access remains available.
+The old sidecar, namespace coupling, HTTPS host-port publication, secret mounts
+and bootstrap helpers are removed from active Compose. Remove only the old
+sidecar container after replacement acceptance; do not prune volumes.
+Retain the old Caddy data/config volumes temporarily. After manual browser
+acceptance, those two unused volumes can be deleted explicitly if rollback to
+Caddy is no longer needed. Never remove gateway auth/settings volumes.

@@ -4,15 +4,15 @@ version: 1
 date_created: 2026-10-04
 last_updated: 2026-10-04
 owner: Gateway maintainers
-status: Completed
+status: Deprecated
 tags: [infrastructure, security]
 ---
 
 # Introduction
 
-![Status: Completed](https://img.shields.io/badge/status-Completed-brightgreen)
+![Status: Deprecated](https://img.shields.io/badge/status-Deprecated-red)
 
-Implement the user-approved Caddy sidecar without changing inference or native tooling.
+Historical implementation record, superseded by [the Nginx migration](infrastructure-nginx-admin-1.md). Do not use this retired topology or its commands for current deployment.
 
 ## 1. Requirements & Constraints
 

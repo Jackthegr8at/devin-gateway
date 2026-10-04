@@ -1,0 +1,14 @@
+# Adapt the private IPv4 arguments to match 20-devin-admin-firewall.conf.
+[Unit]
+Description=Restrict Devin management publication to the Nginx host
+After=ufw.service
+Requires=ufw.service
+Before=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/devin-admin-firewall 192.168.0.214 192.168.0.199
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
