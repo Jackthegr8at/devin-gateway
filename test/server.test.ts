@@ -1452,6 +1452,165 @@ describe("sequential Responses tool loops", () => {
   });
 });
 
+describe("offline multi-agent lifecycle transport", () => {
+  test("disconnect after synthetic spawn aborts upstream without inventing child cleanup", async () => {
+    let aborted = false;
+    let requests = 0;
+    const upstream = Bun.serve({ hostname: HOST, port: 0, fetch(req) {
+      if (new URL(req.url).pathname === DEVIN_AUTH_PATH) return new Response(Uint8Array.from(encodeString(1, "synthetic-jwt")));
+      requests++;
+      req.signal.addEventListener("abort", () => { aborted = true; }, { once: true });
+      return new Response(new ReadableStream({ start(controller) { controller.enqueue(dataFrame({ text: "Synthetic waiting delta" })); } }));
+    } });
+    const gateway = await startGateway(upstream.url.origin, "synthetic-key");
+    const client = new AbortController();
+    try {
+      const response = await fetch(`${gateway.url}/v1/responses`, { method: "POST", signal: client.signal, headers: { "content-type": "application/json" }, body: JSON.stringify({ model: "swe-2-medium", stream: true, input: [
+        { role: "user", content: "Synthetic parent" },
+        { type: "function_call", namespace: "multi_agent_v1", name: "spawn_agent", call_id: "synthetic-spawn", arguments: "{}" },
+        { type: "function_call_output", call_id: "synthetic-spawn", output: JSON.stringify({ agent_id: "00000000-0000-4000-8000-000000000001" }) },
+      ] }) });
+      const reader = response.body!.getReader();
+      let text = "";
+      try {
+        const deadline = Date.now() + 2000;
+        while (!text.includes("response.output_text.delta")) {
+          let timer: ReturnType<typeof setTimeout> | undefined;
+          const part = await Promise.race([reader.read(), new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error("Synthetic agent delta deadline")), Math.max(1, deadline - Date.now())); })]).finally(() => clearTimeout(timer));
+          if (part.done) break;
+          text += new TextDecoder().decode(part.value);
+        }
+        expect(text).toContain("response.output_text.delta");
+        client.abort(); await reader.cancel().catch(() => {});
+      } finally { reader.releaseLock(); }
+      const deadline = Date.now() + 2000;
+      while (!aborted && Date.now() < deadline) await Bun.sleep(5);
+      expect(aborted).toBe(true);
+      expect(requests).toBe(1);
+    } finally { client.abort(); await gateway.cleanup(); await upstream.stop(true); }
+  }, 6000);
+  // Synthetic results characterize transport, not execution of a Codex runtime.
+  const agentA = "00000000-0000-4000-8000-000000000001";
+  const agentB = "00000000-0000-4000-8000-000000000002";
+  const names = ["spawn_agent", "send_input", "wait_agent", "resume_agent", "close_agent"];
+  const tools = [
+    { type: "namespace", name: "multi_agent_v1", tools: names.map(name => ({ type: "function", name, parameters: { type: "object" } })) },
+    { type: "function", name: "exec_command", parameters: { type: "object" } },
+  ];
+  type Step = { name: string; args: Record<string, unknown>; output: string };
+  const spawn: Step = { name: "spawn_agent", args: { agent_type: "swe_worker", message: "Synthetic child task" }, output: JSON.stringify({ agent_id: agentA, nickname: "Synthetic worker" }) };
+  const wait: Step = { name: "wait_agent", args: { targets: [agentA], timeout_ms: 30000 }, output: JSON.stringify({ status: { [agentA]: { completed: "Synthetic child result" } }, timed_out: false }) };
+  const pending: Step = { ...wait, output: JSON.stringify({ status: {}, timed_out: true }) };
+  const send: Step = { name: "send_input", args: { target: agentA, message: "Synthetic follow-up", interrupt: false }, output: JSON.stringify({ submission_id: "synthetic-submission" }) };
+  const close: Step = { name: "close_agent", args: { target: agentA }, output: JSON.stringify({ previous_status: "shutdown" }) };
+  const resume: Step = { name: "resume_agent", args: { id: agentA }, output: JSON.stringify({ status: "running" }) };
+  const scenarios: Array<{ name: string; steps: Step[]; failAt?: number }> = [
+    { name: "spawn result, wait result, final", steps: [spawn, wait] },
+    { name: "spawn, multiple sends, wait, final", steps: [spawn, send, send, wait] },
+    { name: "spawn, pending wait, completed wait", steps: [spawn, pending, wait] },
+    { name: "spawn, close, resume, wait, close again", steps: [spawn, close, resume, wait, close] },
+    { name: "already closed and unknown resume results remain opaque", steps: [spawn, close, close, { ...resume, args: { id: agentB }, output: "agent with synthetic id not found" }] },
+    { name: "invalid child target error remains an ordinary output", steps: [spawn, { ...send, args: { target: "synthetic-invalid-id", message: "Synthetic" }, output: "invalid agent id synthetic-invalid-id" }, close] },
+    { name: "two different agent targets remain distinct in ordered history", steps: [spawn, { ...wait, args: { targets: [agentB] }, output: JSON.stringify({ status: { [agentB]: "not_found" }, timed_out: false }) }, wait] },
+    { name: "agent history mixes with exec history and replay", steps: [spawn, { name: "exec_command", args: { cmd: "synthetic-command" }, output: "Exit code: 0\nOutput:\nSynthetic command result" }, wait] },
+    { name: "continuation failure after spawn, followed by explicit close", steps: [spawn, close], failAt: 1 },
+    { name: "upstream failure during wait continuation, followed by explicit close", steps: [spawn, wait, close], failAt: 2 },
+    { name: "child errored during wait, followed by close", steps: [spawn, { ...wait, output: JSON.stringify({ status: { [agentA]: { errored: "Synthetic child failure" } }, timed_out: false }) }, close] },
+  ];
+  for (const stream of [false, true]) for (const scenario of scenarios) {
+    test(`${scenario.name} (${stream ? "SSE" : "JSON"})`, async () => {
+      const directory = mkdtempSync(join(tmpdir(), "synthetic-agent-transport-"));
+      const oldFlag = process.env.DEVIN_RESPONSES_SAFE_DIAGNOSTICS;
+      const oldPath = process.env.DEVIN_RESPONSES_SAFE_DIAGNOSTICS_PATH;
+      const diagnosticPath = join(directory, "safe.jsonl");
+      process.env.DEVIN_RESPONSES_SAFE_DIAGNOSTICS = "1";
+      process.env.DEVIN_RESPONSES_SAFE_DIAGNOSTICS_PATH = diagnosticPath;
+      const captured: ReturnType<typeof decodeChatRequest>[] = [];
+      let emitted = 0;
+      let failed = false;
+      const upstream = startUpstream({
+        captureChatRequest: bytes => captured.push(decodeChatRequest(bytes)),
+        chatBody: () => {
+          if (emitted === scenario.failAt && !failed) {
+            failed = true;
+            return framesBody([], { error: { code: "internal", message: "Synthetic continuation failure" } });
+          }
+          const step = scenario.steps[emitted];
+          if (!step) return framesBody([dataFrame({ text: "SYNTHETIC_AGENT_FINAL" })]);
+          const id = `synthetic-agent-call-${emitted++}`;
+          const name = step.name === "exec_command" ? step.name : `multi_agent_v1__${step.name}`;
+          // Two cumulative deltas must produce one restored call, not two spawns.
+          const args = JSON.stringify(step.args);
+          return framesBody([
+            dataFrame({ toolCalls: [{ id, name, argumentsJson: args.slice(0, 8) }] }),
+            dataFrame({ toolCalls: [{ id, name, argumentsJson: args }], stopReason: 10 }),
+          ]);
+        },
+      });
+      const gateway = await startGateway(upstream.url.origin, "synthetic-agent-credential", { directory });
+      const history: Record<string, unknown>[] = [{ role: "user", content: "Synthetic parent task" }];
+      const expected: ReturnType<typeof decodeChatRequest>["prompts"] = [{ source: 1, prompt: "Synthetic parent task", toolCalls: [] }];
+      try {
+        const count = scenario.steps.length + 1 + (scenario.failAt === undefined ? 0 : 1);
+        for (let request = 0; request < count; request++) {
+          const before = emitted;
+          const response = await fetch(`${gateway.url}/v1/responses`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ model: "swe-2-high", reasoning: { effort: "high" }, stream, input: history, tools }) });
+          const wire = await response.text();
+          const events = stream ? parseSse(wire).map(e => JSON.parse(e.data)) : [];
+          expect(captured[request].prompts).toEqual(expected);
+          expect(captured[request].disableParallelToolCalls).toBe(true);
+          expect(captured[request].tools.map(t => t.name)).toEqual([...names.map(n => `multi_agent_v1__${n}`), "exec_command"]);
+          if (before === scenario.failAt && emitted === before) {
+            if (stream) {
+              expect(events.filter(e => e.type === "response.failed")).toHaveLength(1);
+              expect(events.some(e => e.type === "response.completed")).toBe(false);
+            } else expect(response.status).toBe(502);
+            // No fabricated output is appended; next request explicitly asks for cleanup.
+            history.push({ role: "user", content: "Synthetic explicit cleanup" });
+            expected.push({ source: 1, prompt: "Synthetic explicit cleanup", toolCalls: [] });
+            continue;
+          }
+          expect(response.status).toBe(200);
+          const completed = stream ? events.find(e => e.type === "response.completed").response : JSON.parse(wire);
+          expect(completed.status).toBe("completed");
+          expect(completed.output).toHaveLength(1);
+          if (before === scenario.steps.length) {
+            expect(completed.output[0].content[0].text).toBe("SYNTHETIC_AGENT_FINAL");
+            continue;
+          }
+          const step = scenario.steps[before];
+          const call = completed.output[0];
+          const namespace = step.name === "exec_command" ? undefined : "multi_agent_v1";
+          expect(call).toMatchObject({ type: "function_call", call_id: `synthetic-agent-call-${before}`, name: step.name });
+          expect(call.namespace).toBe(namespace);
+          expect(JSON.parse(call.arguments)).toEqual(step.args);
+          expect(call.call_id).not.toBe(agentA);
+          expect(call.call_id).not.toBe(agentB);
+          history.push(call, { type: "function_call_output", call_id: call.call_id, output: step.output });
+          expected.push(
+            { source: 2, toolCalls: [{ id: call.call_id, name: namespace ? `${namespace}__${step.name}` : step.name, argumentsJson: JSON.stringify(step.args) }] },
+            { source: 4, prompt: step.output, toolCallId: call.call_id, toolCalls: [] },
+          );
+        }
+        const safe = readFileSync(diagnosticPath, "utf8");
+        for (const privateValue of [agentA, agentB, "synthetic-agent-call-", "Synthetic child", "synthetic-submission", "synthetic-agent-credential", "synthetic-command"]) expect(safe).not.toContain(privateValue);
+        const records = safe.trim().split("\n").map(line => JSON.parse(line));
+        // Native agent payloads are transported but not reclassified as terminal exec success.
+        if (!scenario.steps.some(s => s.name === "exec_command")) {
+          expect(records.some(r => r.correlation_results?.matched_success)).toBe(false);
+          expect(JSON.parse(readFileSync(join(directory, "model-test-status.json"), "utf8")).revision).toBe(1);
+        }
+        expect(records.some(r => r.correlation_results?.no_issued_call)).toBe(true);
+      } finally {
+        await gateway.cleanup(); await upstream.stop();
+        rmSync(directory, { recursive: true, force: true });
+        if (oldFlag === undefined) delete process.env.DEVIN_RESPONSES_SAFE_DIAGNOSTICS; else process.env.DEVIN_RESPONSES_SAFE_DIAGNOSTICS = oldFlag;
+        if (oldPath === undefined) delete process.env.DEVIN_RESPONSES_SAFE_DIAGNOSTICS_PATH; else process.env.DEVIN_RESPONSES_SAFE_DIAGNOSTICS_PATH = oldPath;
+      }
+    });
+  }
+});
+
 // ─── POST /v1/messages (Anthropic, non-streaming) ────────────────────────────
 
 test("runtime status persists only after an issued tool and its successful Responses continuation, streaming or JSON", async () => {

@@ -90,7 +90,9 @@ try {
             $effective = Invoke-CodexDevinSelectionProcess -Executable $runtime.Path -Arguments @('debug', 'models') | ConvertFrom-Json
             $loaded = @($effective.models)
             Assert-Selection ($loaded.Count -eq 2) 'installed reviewed runtime loads only the generated reviewed models offline'
-            $generated = Get-Content -LiteralPath $state.catalogPath -Raw | ConvertFrom-Json
+            # The generated catalog is BOM-less UTF-8. Windows PowerShell's default
+            # ANSI decoding corrupts non-ASCII instructions before the alias probe.
+            $generated = Get-Content -LiteralPath $state.catalogPath -Raw -Encoding UTF8 | ConvertFrom-Json
             Assert-Selection (@($generated.models | Where-Object { $_.multi_agent_version -cne 'v1' -or $_.shell_type -cne 'shell_command' }).Count -eq 0) 'generated catalog preserves reviewed V1 and shell metadata'
             Assert-Selection (@($loaded | Where-Object { $_.multi_agent_version -cne 'v1' }).Count -eq 0) 'effective runtime preserves reviewed V1 metadata'
             Write-Host ('Effective runtime shell metadata: ' + (($loaded | ForEach-Object { $_.slug + ':' + $_.shell_type + ':' + $_.multi_agent_version }) -join ', '))

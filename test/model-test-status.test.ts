@@ -45,6 +45,40 @@ test("concurrent writers preserve variants; corrupt status never reseeds", async
   expect(await readFile(store.file, "utf8")).toBe("synthetic-corrupt-data");
 }));
 
+test("native agent results do not invent success and agent identities cannot satisfy tool call identities", async () => fixture(async store => {
+  const agentId = "00000000-0000-4000-8000-000000000001";
+  const tracker = new ModelValidationTracker(store);
+  function observe(call?: { id: string; name: string }, returned?: { id: string; output: unknown }) {
+    let outcomes: unknown;
+    const d = new ResponsesSafeDiagnostic("synthetic-agent", Date.now(), undefined, (r, e) => {
+      tracker.observe("synthetic-scope", r, e); outcomes = r.correlation_results;
+    }, false);
+    d.recordResolvedRouting({ logicalModel: "swe-2", requestedEffort: "high", resolvedModelId: "swe-2-high" });
+    d.recordUpstreamResponse(200, true); d.recordUpstreamComplete();
+    if (call) d.recordNormalizedEmittedToolCall(call);
+    if (returned) d.recordNormalizedFunctionCallOutput({ role: "tool", tool_call_id: returned.id, content: JSON.stringify(returned.output) }, returnedToolSucceeded(returned.output));
+    d.recordSuccessfulCompletion(); d.finalize(); return outcomes;
+  }
+  for (const output of [
+    { agent_id: agentId, nickname: "Synthetic" },
+    { submission_id: "synthetic-submission" },
+    { status: {}, timed_out: true },
+    { status: { [agentId]: { completed: "Synthetic child result" } }, timed_out: false },
+    { status: "running" }, { previous_status: "shutdown" },
+  ]) expect(returnedToolSucceeded(output)).toBe(false);
+  observe({ id: "synthetic-spawn-call", name: "multi_agent_v1__spawn_agent" });
+  expect(observe(undefined, { id: agentId, output: { status: "success" } })).toEqual({ no_issued_call: 1 });
+  expect(observe({ id: "synthetic-wait-call", name: "multi_agent_v1__wait_agent" }, { id: "synthetic-spawn-call", output: { agent_id: agentId } })).toEqual({ tool_result_not_successful: 1, issued_call_recorded: 1 });
+  expect(observe(undefined, { id: "synthetic-spawn-call", output: { status: "success" } })).toEqual({ no_issued_call: 1 });
+  expect(observe(undefined, { id: "synthetic-wait-call", output: { status: { [agentId]: { completed: "Synthetic" } }, timed_out: false } })).toEqual({ tool_result_not_successful: 1 });
+  await tracker.drain(); expect((await store.read()).variants).toEqual({});
+  // Existing policy is generic, not tool-name-specific: only an explicit successful
+  // envelope could qualify. This is a policy boundary, not a native agent fixture.
+  observe({ id: "synthetic-generic-call", name: "multi_agent_v1__send_input" });
+  expect(observe(undefined, { id: "synthetic-generic-call", output: { status: "success" } })).toEqual({ matched_success: 1 });
+  await tracker.drain(); expect((await store.read()).variants["swe-2-high"].automatic).toBeDefined();
+}));
+
 test("correlated completed tool round-trip promotes; text/history/failures/wrong credential or effort/replay do not", async () => fixture(async store => {
   let now = 1000; const tracker = new ModelValidationTracker(store, () => now);
   const outcomes: Array<Record<string, number>> = [];
