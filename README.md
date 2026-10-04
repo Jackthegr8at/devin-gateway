@@ -125,7 +125,7 @@ The exact-ID reviewed profiles advertise only GLM `low` and SWE-2 `medium`, with
 
 The store uses private POSIX directory/file modes (`0700`/`0600`), a flushed temporary file and atomic rename, plus a bounded filesystem writer lock. A corrupt existing file stops initialization or returns a sanitized `503`; it is never overwritten with defaults. After an interrupted writer, an abandoned `.selection-write.lock` fails closed: confirm every writer is stopped before manually removing that lock. Normal saves leave no lock or temporary file.
 
-Management endpoints are served only when `DEVIN_ADMIN_PORT` is explicitly set alongside enabled selection. This separate listener defaults to `127.0.0.1`. Compose explicitly uses `DEVIN_ADMIN_HOST=0.0.0.0` and port `3001` inside the container, published **only** as `127.0.0.1:38644:3001` on the host. `DEVIN_ADMIN_PUBLIC_PORT=38644` permits that exact loopback authority through the Host/Origin guard; LAN hosts and forwarded-host headers are not trusted. The listener rejects cross-site fetch metadata and has no inference CORS/raw tracing. The Phase 2 picker at `/admin/` uses this listener only:
+Management endpoints are served only when `DEVIN_ADMIN_PORT` is explicitly set alongside enabled selection. Compose binds management to `127.0.0.1:3001` inside the gateway network namespace without publishing its raw port. The permanent private picker is available through authenticated Caddy HTTPS at `https://devin-admin.home.arpa/admin/`. Caddy shares the namespace, validates external Host/Origin/fetch metadata, then translates to the unchanged loopback guard and strips browser credentials. See [admin HTTPS deployment, private credentials and certificate trust](deploy/ADMIN_HTTPS.md). The listener has no inference CORS/raw tracing. The picker uses these existing endpoints:
 
 | Method/path | Response |
 |---|---|
@@ -140,7 +140,7 @@ PUT requires `Content-Type: application/json`, `X-Devin-Management: 1`, and the 
 
 The Codex manifest contains no scripts, instructions, TOML, permissions or OAuth credentials. It is **not** a complete Codex `ModelInfo` catalog: later Windows integration must combine these facts with a trusted template for the exact installed Codex runtime. Only the two currently reviewed IDs are eligible. Unvalidated selections are reported under `excludedModels`, not silently included.
 
-Access management through an SSH local forward from Windows (`ssh -L 38644:127.0.0.1:38644 <private-host>`), then use `http://127.0.0.1:38644/admin/api/...`. Do not publish port 38644 on a LAN, WireGuard, or public interface. Inference remains on its existing private port 38643. The Windows reviewed-source pin is refreshed only after reviewing the final Phase 1 runtime diff; the fingerprint algorithm and guards remain unchanged.
+Use the authenticated HTTPS URL for normal browser access. The raw management listener is not host-published; inference remains on its existing private port 38643. Standalone deployments may still use loopback access or SSH forwarding to an explicitly configured host-local listener. Windows activation and fingerprint guards are unchanged.
 
 Offline coverage:
 
@@ -617,7 +617,7 @@ Key files:
 
 ## Web model picker (Phase 2)
 
-Open `http://127.0.0.1:38644/admin/` through an SSH tunnel. The page never handles Devin credentials and is not served on the inference port. Its fixed assets use a same-origin CSP without inline scripts, inline styles, or eval. No external fonts, analytics, or CDN assets are loaded.
+Open `https://devin-admin.home.arpa/admin/` through the authenticated private proxy after configuring local hostname resolution and certificate trust. The page never handles Devin credentials and is not served on the inference port. Its fixed assets use a same-origin CSP without inline scripts, inline styles, or eval. No external fonts, analytics, or CDN assets are loaded.
 
 The compact dark picker adapts Cody's MIT-licensed category, display and pagination helpers; attribution is in `web/model-picker/THIRD_PARTY_NOTICES.txt` and the built `/admin/assets/third-party-notices.txt`. React/React DOM are the only added runtime dependencies. Bun bundles the frontend; no Next.js or separate UI server is required:
 
@@ -643,29 +643,21 @@ For Responses, `model: "swe-2"` plus `reasoning: {"effort":"medium"}` routes to 
 
 Initialization atomically migrates a valid v1 file to v2 without advancing its revision. It first preserves the original bytes as private `model-selection.v1.json`. A conflicting existing backup, invalid original, or ambiguous family fails closed. The v2 ETag is `"model-selection-v2-<revision>"`, so old v1 clients cannot overwrite migrated settings. To reverse a migration, stop all settings writers, archive any newer v2 selection, and restore the original v1 bytes from that private backup before running the old gateway. Never touch the auth volume.
 
-Phase 3 remains unimplemented. Dynamic catalog/worker generation and a reviewed Windows source-pin refresh require separate approval. No live model access or Linux migration acceptance is implied by offline tests.
+Saving a selection changes gateway settings, not active Desktop files. The guarded Windows workflow consumes the selection during its next activation and restores the original configuration afterward. Permanent browser access does not change that contract or its fingerprint guard.
 
-**Phase 3 is not implemented:** Windows activation still uses its validated static catalog/worker. Saving here does not change Desktop configuration. Runtime/package changes require a separately reviewed Windows source-fingerprint refresh before using the local launcher; its guard has not been bypassed.
-
-After review and publication of this branch, deploy without removing auth/settings volumes:
+After configuring private admin credentials as documented in [admin HTTPS](deploy/ADMIN_HTTPS.md), deploy without removing auth/settings or Caddy volumes:
 
 ```sh
 cd <existing-gateway-checkout>
 git fetch origin
-git switch feat/model-picker-phase2
+git switch codex-desktop
 git pull --ff-only
 sudo docker compose build devin-gateway
-sudo docker compose up -d --no-deps --force-recreate devin-gateway
+sudo docker compose up -d --force-recreate devin-gateway devin-admin-proxy
 sudo docker compose ps
 ```
 
-From a standalone Windows terminal:
-
-```powershell
-ssh.exe -N -o ExitOnForwardFailure=yes -L 127.0.0.1:38644:127.0.0.1:38644 -i '<ssh-key-path>' '<ssh-user>@<private-host>'
-```
-
-Manual acceptance should verify search/filter/page-wide bulk changes, Cancel, required-role errors, future mode, and a conflict between two browser tabs. Confirm `/admin/` remains absent on inference port 38643 and management port 38644 is not LAN-published. Do not submit an inference request for this acceptance.
+Open the HTTPS hostname after completing the one-time Windows CA trust and local DNS steps. Manual acceptance should verify search/filter/page-wide bulk changes, Cancel, required-role errors, future mode, and a conflict between two browser tabs. Confirm `/admin/` remains absent on inference port 38643 and no raw management port is published. Do not submit an inference request for this acceptance.
 
 ## License
 

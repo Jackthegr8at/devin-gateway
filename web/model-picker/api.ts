@@ -14,8 +14,8 @@ function parseSelection(value: any): ModelSelection {
 export function createPickerApi(send: typeof fetch = fetch): PickerApi {
   async function json(path: string, init: RequestInit = {}) {
     let response: Response;
-    try { response = await send(path, { ...init, mode: "same-origin", credentials: "omit", redirect: "error", cache: "no-store", signal: AbortSignal.timeout(15_000) }); }
-    catch { throw new PickerApiError(0, "The management gateway could not be reached. Check your SSH tunnel, then retry."); }
+    try { response = await send(path, { ...init, mode: "same-origin", credentials: "same-origin", redirect: "error", cache: "no-store", signal: AbortSignal.timeout(15_000) }); }
+    catch { throw new PickerApiError(0, "The management gateway could not be reached. Check your HTTPS connection or local management access, then retry."); }
     if (!response.ok) throw new PickerApiError(response.status, response.status === 412
       ? path === "/admin/api/model-test-status" ? "Model test status changed. Refresh/reopen the picker before marking again; your selection draft is unchanged." : "Another client changed the selection. Your draft was not saved. Reload the latest state before editing again."
       : `The gateway rejected this request (HTTP ${response.status}). Your draft has not been discarded.`);

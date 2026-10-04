@@ -1,0 +1,47 @@
+{
+	admin off
+	auto_https disable_redirects
+}
+
+# Unmatched HTTP authorities must not receive Caddy's empty default 200.
+https://:443 {
+	respond "Forbidden" 403
+}
+
+https://devin-admin.home.arpa {
+	tls internal
+
+	# route preserves validation-before-rewrite ordering.
+	route {
+		@unapproved_client not remote_ip {$DEVIN_ADMIN_ALLOWED_CIDRS}
+		respond @unapproved_client "Forbidden" 403
+
+		@wrong_host expression `{http.request.hostport} != "devin-admin.home.arpa"`
+		respond @wrong_host "Forbidden" 403
+
+		@foreign_origin {
+			header Origin *
+			not header Origin https://devin-admin.home.arpa
+		}
+		respond @foreign_origin "Forbidden" 403
+
+		@foreign_site expression `header({'Sec-Fetch-Site': ['*']}) && !header({'Sec-Fetch-Site': ['same-origin', 'none']})`
+		respond @foreign_site "Forbidden" 403
+
+		@admin_resources path /admin/ /admin/api/models /admin/api/model-selection /admin/api/model-test-status /admin/assets/model-picker.js /admin/assets/model-picker.css /admin/assets/third-party-notices.txt
+		handle @admin_resources {
+			basic_auth {
+				import /run/secrets/devin_admin_users
+			}
+			@present_origin header Origin *
+			request_header @present_origin Origin http://127.0.0.1:3001
+			reverse_proxy http://127.0.0.1:3001 {
+				header_up Host 127.0.0.1:3001
+				header_up -Authorization
+				header_up -Cookie
+				header_up -X-Api-Key
+			}
+		}
+		respond "Not found" 404
+	}
+}

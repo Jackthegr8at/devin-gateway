@@ -6,16 +6,16 @@ services:
       dockerfile: Dockerfile
     ports:
       - "${DEVIN_GATEWAY_BIND_IP:?Set DEVIN_GATEWAY_BIND_IP in .env to a private devhub interface IP}:38643:3000"
-      - "127.0.0.1:38644:3001"
+      # Caddy shares this namespace; publish its HTTPS port on the owner.
+      - "${DEVIN_GATEWAY_BIND_IP:?Set DEVIN_GATEWAY_BIND_IP in .env to a private devhub interface IP}:443:443"
     environment:
       PORT: "3000"
       HOST: "0.0.0.0"
       DEVIN_GATEWAY_CONFIG_DIR: "/home/gateway/.devin-gateway"
       DEVIN_GATEWAY_SETTINGS_DIR: "/home/gateway/.devin-gateway-settings"
       DEVIN_MODEL_SELECTION_ENABLED: "1"
-      DEVIN_ADMIN_HOST: "0.0.0.0"
+      DEVIN_ADMIN_HOST: "127.0.0.1"
       DEVIN_ADMIN_PORT: "3001"
-      DEVIN_ADMIN_PUBLIC_PORT: "38644"
       DEVIN_CODEX_DESKTOP_COLLAPSE_SYSTEM: "1"
       DEVIN_RESPONSES_SAFE_DIAGNOSTICS: "${DEVIN_RESPONSES_SAFE_DIAGNOSTICS:-0}"
       DEVIN_RESPONSES_SAFE_DIAGNOSTICS_PATH: "/app/logs/responses-safe-diagnostic.jsonl"
@@ -35,6 +35,30 @@ services:
       start_period: 10s
       retries: 3
 
+  devin-admin-proxy:
+    image: caddy:2.10.2-alpine
+    network_mode: service:devin-gateway
+    depends_on:
+      devin-gateway:
+        condition: service_healthy
+        restart: true
+    environment:
+      DEVIN_ADMIN_ALLOWED_CIDRS: "${DEVIN_ADMIN_ALLOWED_CIDRS:?Set the approved client CIDRs in .env}"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - devin-admin-caddy-data:/data
+      - devin-admin-caddy-config:/config
+    secrets:
+      - devin_admin_users
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
   devin-login:
     image: devin-gateway-codex:local
     profiles: ["auth"]
@@ -49,3 +73,9 @@ services:
 volumes:
   devin-gateway-auth:
   devin-gateway-settings:
+  devin-admin-caddy-data:
+  devin-admin-caddy-config:
+
+secrets:
+  devin_admin_users:
+    file: ./secrets/devin-admin-users.caddy

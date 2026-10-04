@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { createPickerApi } from "../web/model-picker/api.ts";
 import { initialModelSelection } from "../src/admin/model-selection.ts";
 describe("management-only browser API", () => {
-  test("parallel GET load uses exact selection ETag and no client credentials", async () => {
+  test("parallel GET load uses exact selection ETag and same-origin browser authentication only", async () => {
     const calls: { path: string; init: RequestInit }[] = [];
     const api = createPickerApi((async (path, init) => {
       calls.push({ path: String(path), init: init! });
@@ -11,13 +11,14 @@ describe("management-only browser API", () => {
     }) as typeof fetch);
     expect((await api.load()).etag).toBe('"model-selection-v2-1"');
     expect(calls.map((call) => call.path).sort()).toEqual(["/admin/api/model-selection", "/admin/api/models"]);
-    for (const { init } of calls) { expect(init.credentials).toBe("omit"); expect(init.mode).toBe("same-origin"); expect(init.redirect).toBe("error"); expect(init.signal).toBeInstanceOf(AbortSignal); }
+    for (const { path, init } of calls) { expect(path.startsWith("/admin/api/")).toBe(true); expect(init.credentials).toBe("same-origin"); expect(init.mode).toBe("same-origin"); expect(init.redirect).toBe("error"); expect(init.signal).toBeInstanceOf(AbortSignal); expect(new Headers(init.headers).has("authorization")).toBe(false); }
   });
   test("Save sends the complete draft, ETag and explicit CSRF management header only once", async () => {
     let calls = 0;
     const api = createPickerApi((async (path, init) => {
       calls++; expect(path).toBe("/admin/api/model-selection"); expect(init?.method).toBe("PUT");
       const headers = new Headers(init?.headers);
+      expect(init?.credentials).toBe("same-origin"); expect(init?.mode).toBe("same-origin"); expect(init?.redirect).toBe("error");
       expect(headers.get("if-match")).toBe('"model-selection-v2-1"'); expect(headers.get("x-devin-management")).toBe("1");
       expect(headers.get("content-type")).toBe("application/json"); expect(headers.has("authorization")).toBe(false);
       expect(JSON.parse(String(init?.body))).toEqual(initialModelSelection());
@@ -43,6 +44,6 @@ describe("management-only browser API", () => {
   });
   test("network failures retain a safe recovery message, not raw network data", async () => {
     const api = createPickerApi((async () => { throw new Error("SYNTHETIC_NETWORK_SECRET"); }) as typeof fetch);
-    await expect(api.load()).rejects.toThrow("SSH tunnel");
+    await expect(api.load()).rejects.toThrow("HTTPS connection");
   });
 });

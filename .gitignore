@@ -22,3 +22,6 @@ logs/
 
 # Local agent instructions (not committed; imported via @AGENTS.local.md in AGENTS.md)
 AGENTS.local.md
+
+# Private deployment authentication, including temporary bootstrap credentials.
+secrets/
