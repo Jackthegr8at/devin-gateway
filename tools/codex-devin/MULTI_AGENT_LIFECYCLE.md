@@ -127,7 +127,7 @@ next request, not automatic recovery invented by the gateway.
 
 No production bridge bug was exposed. Basic single-child execution has since
 passed manual acceptance, as recorded below. Exact current target schemas,
-two-sibling execution and cancellation/orphan behavior remain manual boundaries.
+send/resume execution and cancellation/orphan behavior remain manual boundaries.
 Do not enable parallel parent tool calls or nested agents.
 
 ## Single-child manual acceptance (passed)
@@ -185,9 +185,18 @@ pass need not modify Tested status under the current output-success predicate.
   `git diff --check`, and changed-file privacy checks passed.
 - Existing source fingerprint inputs are unchanged. These test/documentation
   changes require no gateway deployment. Single-child live acceptance subsequently
-  passed; two-sibling live acceptance has not been performed.
+  passed; two-sibling live acceptance subsequently passed as recorded below.
 
-## Next acceptance: two sibling identities (design/offline only)
+## Two sibling identities (live acceptance passed)
+
+The operator observed exactly two sibling swe_worker agents, distinct correctly
+attributed result shapes, waits for both, and explicit closure of both. No
+replacement/additional agent was created. No child output or raw target/call ID
+is retained here. The last parent histories advanced through four, five and six
+assistant function calls with matching output counts; the final request emitted
+no further upstream/Responses tool call and completed. This corroborates the six
+ordered lifecycle operations below. Consumed historical outputs remained
+`no_issued_call` while newly issued operations were tracked independently.
 
 Keep parent operations sequential and upstream parallel tool calls disabled.
 Two live children are runtime concurrency, not two calls in one provider response.
@@ -205,9 +214,9 @@ not an exact-source match for the installed binary: it permits multiple siblings
 also describes concurrently open child threads and targeted orchestration, but
 is not a version pin. No explicit thread-cap override was found in the active
 user config. Thus sibling support is supported by source/docs, while the exact
-installed declaration/capacity remains a live preflight boundary. Use the
-runtime-supplied schema; if spawning B returns a limit/schema error, close A and
-stop rather than changing permissions/config or falling back to another role.
+installed full declaration is not exported by that probe. The accepted live
+two-child run now demonstrates sufficient native sibling capacity in this setup.
+Continue using the runtime-supplied schema, without changing configuration.
 
 Offline JSON/SSE fixtures now preserve two distinct spawn results, per-target wait
 results, both wait/close order permutations, closing either sibling before waiting
@@ -238,3 +247,100 @@ history or recovery evidence as a substitute for native close.
 Validation for the sibling coverage: 44 focused tests passed; full Bun 528 passed,
 18 skipped, with only the documented upstream Windows SIGTERM failure (547 tests,
 34 files, 7002 assertions). Production behavior and diagnostic fields are unchanged.
+
+## Next acceptance: send_input, then resume_agent (separate tests)
+
+### Current installed evidence and its limits
+
+The managed backend still reports `0.160.0`. Offline app-server schema generation
+was executed without starting a server or performing inference. Its
+`collabAgentToolCall` representation includes `tool`, `status`, `senderThreadId`,
+`receiverThreadIds` (string array), and `agentsStates` keyed by target identity,
+plus private prompt/model/effort fields. No private field values were captured.
+Temporary generated protocol schemas were removed after inspection.
+
+Memory-only inspection of the installed binary confirmed all five reviewed
+guidance anchors: resume a previously closed agent, resume by ID, send to an
+existing agent, target the spawn-returned ID, and queue unless interruption is
+requested. Only boolean match results were printed; no instruction/tool body was
+persisted. This confirms the binary's declared operation meanings, not an offline
+execution of native tools. The exported app-server schema is not the model-visible
+function-argument schema. Exact full native parameter serialization remains a
+limitation; use the actual declaration supplied by Desktop, not a fabricated one.
+
+The source reference specifies the following input/output contract:
+
+| Operation | Input | Output |
+| --- | --- | --- |
+| send_input | required `target`; `message` or typed `items`; optional `interrupt=false` | `{submission_id}` acknowledges submission, not child completion |
+| resume_agent | required `id` | `{status}` of that same agent; not a new spawn ID |
+
+In that source, send resolves one exact target, parses nonempty message/items,
+optionally interrupts, then starts or steers that child's turn. An open completed
+child can receive a new task; no race with running initial work is needed. Errors
+return as ordinary function outputs and do not invent a replacement child.
+Neither a prior spawn result nor a wait result is a send acknowledgement.
+
+Resume is a reload/reopen operation, not a request to repeat an earlier task. The
+reference returns an existing loaded agent's state, or loads that same persisted
+thread when its runtime is absent; a missing rollout/invalid identity fails.
+It does not itself submit new user work. These handler details come from the
+qualified source reference, not a claimed exact installed-source match. Current
+binary guidance explicitly supports the closed-child case, so no forced
+interruption or intentional orphan is needed to design that acceptance test.
+
+### Smallest send acceptance
+
+Spawn one swe_worker whose initial task is to reply READY and finish its turn.
+Wait for that exact child to complete, leaving it open. Send that same child one
+follow-up with `interrupt=false`: read only root package.json and return its
+packageManager prefixed AFTER_SEND (or explicitly report the field absent).
+Wait for the new child turn/result, then close that same child and report it.
+The initial READY result is not acceptance of the follow-up; inspect the new
+native turn and its result. If the result is stale or sending fails, explicitly
+close the child and report acceptance incomplete. Do not resend, spawn a
+replacement, resume, nest agents, or execute commands in the parent.
+
+### Smallest resume acceptance, after send acceptance
+
+Spawn one swe_worker, wait for its trivial READY task to complete, and explicitly
+close it. Retain that original target privately. Call resume_agent for that same
+closed ID, inspect a successful native resume result, then explicitly close it
+again before final text. No new work, send_input or wait for a new completion is
+needed: this isolates reopen/status/cleanup from task submission. Do not count
+an already-loaded no-op resume or a new spawn as proof of closed-thread reopen.
+Do not assume READY is regenerated by resume. If validating post-resume new work
+is later desired, a send_input would be naturally required and must be separately
+approved after these isolated operations pass.
+
+### Coverage and cleanup boundary
+
+Additional JSON/SSE coverage verifies completed-child send/ack/post-send result
+ordering, A-only targeting with B history present, distinct A/B sends and results,
+failed send followed by close, upstream failure after acknowledgement, closed
+identity resume followed by close, already-loaded status transport, and resume
+failure followed by explicit close. Correlation tests prove consumed spawn/wait
+replays cannot consume a pending send acknowledgement; native acknowledgements
+do not promote Tested. Entire ordered wire history, exact call/target identities,
+disabled parallel calls and private diagnostic absence are asserted.
+
+These tests cannot prevent a model choosing the wrong valid target: the gateway
+has no child-ownership registry. They prove it never retargets the chosen child or
+crosses A/B histories. Native dispatch/state transitions remain live boundaries.
+No production bug or justification for changing routing/correlation was found.
+
+For either manual test, on failure close the original successfully created child;
+after resume success, close that same identity again. If aborted, continue the
+same parent thread solely to close existing children without spawning replacements.
+Inspect native operation results and child state. Cancellation/Desktop exit is
+not proof of closure. There is no verified standalone shell orphan-cleanup
+command; retain history and report unresolved cleanup if native closure cannot be
+confirmed. Do not delete persisted histories or recovery evidence.
+
+Validation for this tests/docs-only update: 61 focused tests passed; full Bun
+545 passed, 18 skipped, and the documented upstream Windows SIGTERM failure
+(564 tests across 34 files, 8278 assertions). All seven PowerShell suites passed
+(204 assertions), including fingerprint, recovery and selection. Three no-emit
+TypeScript configurations, production TypeScript/web build, all 15 PowerShell
+ASTs, entrypoint shell syntax, changed-file privacy scan and diff checks passed.
+No production file, live selection/Tested store or deployment was changed.

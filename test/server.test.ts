@@ -1511,7 +1511,18 @@ describe("offline multi-agent lifecycle transport", () => {
   const closeB: Step = { ...close, args: { target: agentB } };
   const failedA: Step = { ...wait, output: JSON.stringify({ status: { [agentA]: { errored: "Synthetic child A failure" } }, timed_out: false }) };
   const failedB: Step = { ...waitB, output: JSON.stringify({ status: { [agentB]: { errored: "Synthetic child B failure" } }, timed_out: false }) };
+  const postSend: Step = { ...wait, output: JSON.stringify({ status: { [agentA]: { completed: "Synthetic post-send child A result" } }, timed_out: false }) };
+  const sendB: Step = { ...send, args: { target: agentB, message: "Synthetic child B follow-up", interrupt: false }, output: JSON.stringify({ submission_id: "synthetic-submission-B" }) };
+  const postSendB: Step = { ...waitB, output: JSON.stringify({ status: { [agentB]: { completed: "Synthetic post-send child B result" } }, timed_out: false }) };
   const scenarios: Array<{ name: string; steps: Step[]; failAt?: number }> = [
+    { name: "completed open child receives send_input before post-send wait and close", steps: [spawn, wait, send, postSend, close] },
+    { name: "send to A does not retarget B or replace B wait result", steps: [spawn, spawnB, wait, send, postSend, waitB, close, closeB] },
+    { name: "distinct sends to A and B preserve target, submission and post-send result order", steps: [spawn, spawnB, wait, waitB, send, sendB, postSendB, postSend, closeB, close] },
+    { name: "failed send leaves same child available for explicit close", steps: [spawn, wait, { ...send, output: JSON.stringify({ error: "Synthetic input submission failure" }) }, close] },
+    { name: "upstream failure after send acknowledgement does not invent a child result", steps: [spawn, wait, send, close], failAt: 3 },
+    { name: "close then resume same identity without submitting new child work", steps: [spawn, wait, close, { ...resume, output: JSON.stringify({ status: "pending_init" }) }, close] },
+    { name: "resume already loaded completed child returns status without a new spawn", steps: [spawn, wait, { ...resume, output: JSON.stringify({ status: { completed: "Synthetic child result" } }) }, close] },
+    { name: "resume error leaves explicit close history unchanged", steps: [spawn, wait, close, { ...resume, output: JSON.stringify({ error: "Synthetic resume failure" }) }, close] },
     { name: "two active siblings, isolated A/B spawn and wait results, close both", steps: [spawn, spawnB, wait, waitB, close, closeB] },
     { name: "two siblings with reversed wait order", steps: [spawn, spawnB, waitB, wait, close, closeB] },
     { name: "two siblings with reversed close order", steps: [spawn, spawnB, wait, waitB, closeB, close] },

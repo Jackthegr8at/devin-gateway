@@ -102,6 +102,31 @@ test("native sibling call evidence stays independent through reversed results an
   await tracker.drain(); expect(await store.read()).toEqual({ schemaVersion: 1, revision: 1, variants: {} });
 }));
 
+test("replayed native spawn and wait results cannot consume a pending send_input acknowledgement", async () => fixture(async store => {
+  const tracker = new ModelValidationTracker(store);
+  function observe(call?: { id: string; name: string }, returned: Array<{ id: string; output: unknown }> = []) {
+    let outcomes: unknown;
+    const d = new ResponsesSafeDiagnostic("synthetic-send", Date.now(), undefined, (r, e) => {
+      tracker.observe("synthetic-scope", r, e); outcomes = r.correlation_results;
+    }, false);
+    d.recordResolvedRouting({ logicalModel: "swe-2", requestedEffort: "high", resolvedModelId: "swe-2-high" });
+    d.recordUpstreamResponse(200, true); d.recordUpstreamComplete();
+    if (call) d.recordNormalizedEmittedToolCall(call);
+    for (const result of returned) d.recordNormalizedFunctionCallOutput({ role: "tool", tool_call_id: result.id, content: JSON.stringify(result.output) }, returnedToolSucceeded(result.output));
+    d.recordSuccessfulCompletion(); d.finalize(); return outcomes;
+  }
+  const spawnResult = { id: "synthetic-spawn", output: { agent_id: "00000000-0000-4000-8000-000000000001" } };
+  const waitResult = { id: "synthetic-wait", output: { status: {}, timed_out: true } };
+  observe({ id: spawnResult.id, name: "multi_agent_v1__spawn_agent" });
+  observe({ id: waitResult.id, name: "multi_agent_v1__wait_agent" }, [spawnResult]);
+  expect(observe({ id: "synthetic-send", name: "multi_agent_v1__send_input" }, [waitResult])).toEqual({ tool_result_not_successful: 1, issued_call_recorded: 1 });
+  expect(observe(undefined, [spawnResult, waitResult])).toEqual({ no_issued_call: 2 });
+  const sendResult = { id: "synthetic-send", output: { submission_id: "synthetic-submission" } };
+  expect(observe(undefined, [spawnResult, waitResult, sendResult])).toEqual({ no_issued_call: 2, tool_result_not_successful: 1 });
+  expect(observe(undefined, [sendResult])).toEqual({ no_issued_call: 1 });
+  await tracker.drain(); expect(await store.read()).toEqual({ schemaVersion: 1, revision: 1, variants: {} });
+}));
+
 test("correlated completed tool round-trip promotes; text/history/failures/wrong credential or effort/replay do not", async () => fixture(async store => {
   let now = 1000; const tracker = new ModelValidationTracker(store, () => now);
   const outcomes: Array<Record<string, number>> = [];
