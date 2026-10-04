@@ -1,5 +1,50 @@
 # Clean-fork Devin Desktop worker test
 
+## Normal-use acceptance boundary
+
+SWE-2 normal coding usage, sequential local-command loops, one-worker
+spawn/wait/close, and two independent
+sibling workers have passed real Desktop acceptance. Explicitly close every
+created worker. Prefer a fresh worker for follow-up work: send-input delivery and
+child completion are proven, but its full parent lifecycle is paused after an
+unresolved Desktop renderer crash. Resume and nested agents are not live tested.
+No gateway defect was demonstrated, and the crash investigation is closed.
+These limitations do not change tool eligibility. See
+[lifecycle evidence and orphan cleanup](MULTI_AGENT_LIFECYCLE.md).
+
+Verify the guarded wrapper's config/worker restore hashes after each use. This
+supported subset is ready for normal day-to-day use, not an unconditional
+unattended-operation guarantee.
+
+Persisted selection and Tested status survive gateway recreation in the settings
+volume; Devin authentication remains in its separate auth volume. A health result
+of `fallback_token=set` reports credential presence, not expiry or upstream
+availability. Gateway restarts interrupt in-flight requests and clear pending
+in-memory Tested correlation; they do not clear already-persisted Tested marks
+or implicitly close Codex children. Retain both volumes and recovery records.
+
+The guarded wrapper restores config/worker bytes only after real Desktop/backend
+processes exit. After an interrupted wrapper or machine restart, resolve its
+existing recovery record with the restore workflow before enabling another run;
+never delete recovery evidence to bypass the guard. Successful restore removes
+the managed temporary worker or restores its pre-test version, and restores the
+original config so it no longer depends on the per-run catalog. Catalog bytes
+remain in the recovery record for evidence; they are not active configuration.
+
+### Sustained-use operational limits
+
+- Selection and Tested writers use bounded, fail-closed directory locks. Abrupt
+  process termination while holding a lock can leave it behind. Inspect ownership
+  and confirm no writer remains before any manual recovery; never remove a live
+  writer's lock. Offline tests cover refusal, not automated stale-lock recovery.
+- Long histories remain subject to the selected upstream model's context limits;
+  the gateway does not provide conversation compaction or durable request replay.
+  Extended soak/load and restart-between-tool-turn scenarios are not certified by
+  the existing short synthetic tests.
+- Safe diagnostic JSONL is append-only when enabled. Arrange retention/rotation
+  and monitor disk space for prolonged use; do not enable raw/debug tracing as a
+  substitute. Settings/auth volume backups must remain private.
+
 The model picker now persists exact-variant Tested/Untested status separately from enabled models and roles. See [model validation status](MODEL_TEST_STATUS.md); manual marks save immediately and never change the activation manifest.
 
 This guarded, one-run workflow uses the gateway source in the current repository checkout. It never starts Codex Desktop or submits a model request; you perform both manually.

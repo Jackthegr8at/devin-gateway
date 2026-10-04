@@ -21,6 +21,42 @@ different target field names. The gateway forwards the actual incoming schema;
 it must not rewrite arguments based on this snapshot. Tests use synthetic
 contract-shaped outputs and do not emulate or verify Codex execution.
 
+## Current acceptance and practical supported subset
+
+The renderer crash investigation is closed. No additional crash collector,
+debugging-tool installation, deliberate crash or reproduction is planned.
+
+| Path | Current acceptance |
+| --- | --- |
+| SWE-2 normal coding usage | Live accepted |
+| Sequential `exec_command` loops and large incoming Desktop tool-catalog filtering | Live accepted |
+| `spawn_agent` -> `wait_agent` -> `close_agent`, one child | Live accepted |
+| Two simultaneously active sibling workers, independent results and explicit closure | Live accepted |
+| `send_input` to the intended child, follow-up work and child completion | Transport and child-side execution proven |
+| Full `send_input` parent lifecycle through its second wait and final response | Paused; not fully live accepted |
+| `resume_agent` | Not live tested |
+| Nested agents | Not live tested |
+
+During the send-input trial, the same child received the follow-up, performed
+the work and completed. Desktop recorded a renderer crash during the parent's
+second wait while the backend remained alive. An earlier renderer crash occurred
+before that trial began. The cause remains unresolved: these observations do not
+establish a gateway transport/bridge defect or causally attribute Desktop
+instability to `send_input` or `wait_agent`.
+
+For ordinary use, prefer independent workers with explicit spawn/wait/close,
+including the accepted two-sibling pattern. For follow-up work, spawn a fresh
+worker instead of depending on send/resume until the Desktop limitation is
+revisited. This recommendation does not disable either tool, change eligibility,
+or justify any production gateway change. Cancellation and Desktop exit remain
+insufficient evidence of native child closure; use the cleanup boundary below.
+
+Final production-readiness validation: 544 Bun tests passed and 18 were skipped;
+all seven PowerShell suites, typechecks, production build, syntax and diff checks
+passed. The discovery-deadline test stalled and the documented Windows SIGTERM
+baseline failure reproduced. These are explicit validation limitations, not a
+claim that the complete suite passed without exclusions.
+
 ## Bridge path: identical for all five operations
 
 `namespace=multi_agent_v1` plus one of `spawn_agent`, `send_input`, `wait_agent`,
@@ -248,7 +284,12 @@ Validation for the sibling coverage: 44 focused tests passed; full Bun 528 passe
 18 skipped, with only the documented upstream Windows SIGTERM failure (547 tests,
 34 files, 7002 assertions). Production behavior and diagnostic fields are unchanged.
 
-## Next acceptance: send_input, then resume_agent (separate tests)
+## Paused send/resume investigation: historical offline designs
+
+The operation descriptions and test designs below preserve earlier offline
+findings. They are not instructions to run another live trial. Full send-input
+acceptance is paused due to the unresolved Desktop renderer limitation;
+resume and nested-agent acceptance are not scheduled.
 
 ### Current installed evidence and its limits
 
