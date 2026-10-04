@@ -4,13 +4,13 @@ version: 1
 date_created: 2026-10-04
 last_updated: 2026-10-04
 owner: Gateway maintainers
-status: In progress
+status: Completed
 tags: [infrastructure, security]
 ---
 
 # Introduction
 
-![Status: In progress](https://img.shields.io/badge/status-In_progress-yellow)
+![Status: Completed](https://img.shields.io/badge/status-Completed-brightgreen)
 
 Implement the user-approved Caddy sidecar without changing inference or native tooling.
 
@@ -44,7 +44,7 @@ Implement the user-approved Caddy sidecar without changing inference or native t
 |------|-------------|-----------|------|
 | TASK-006 | Document secret generation/rotation, certificate trust, restart/recreation and browser acceptance. | yes | 2026-10-04 |
 | TASK-007 | Run offline tests/build and disposable Docker proxy/Compose validation. | yes | 2026-10-04 |
-| TASK-008 | Commit/push codex-desktop, deploy gateway plus Caddy, verify private binds and saved-state hashes. | no | |
+| TASK-008 | Commit/push codex-desktop, deploy gateway plus Caddy, verify private binds and saved-state hashes. | yes | 2026-10-04 |
 
 ## 3. Alternatives
 
@@ -79,7 +79,9 @@ Implement the user-approved Caddy sidecar without changing inference or native t
 
 - **NOTE-001**: Port publication must be on devin-gateway, not the namespace-sharing proxy.
 - **NOTE-002**: Gateway backend guards remain unchanged; only the browser API credential mode changes.
-- **NOTE-003**: 546 Bun tests passed, 18 skipped; existing discovery-deadline stall and Windows SIGTERM baseline excluded. Typechecks/build/fingerprint passed; 36 disposable Linux proxy/bootstrap checks passed. Deployment acceptance is recorded separately after publication.
+- **NOTE-003**: 546 Bun tests passed, 18 skipped; existing discovery-deadline stall and Windows SIGTERM baseline excluded. Typechecks/build/fingerprint passed; 36 disposable Linux proxy/bootstrap checks passed.
+- **NOTE-004**: Implementation commit 39daad2 deployed. GET-only verified-TLS acceptance passed, including authentication, route/Host/Origin rejection, raw-port removal and internal loopback binding. Selection revision 30 and Tested revision 16 survived byte-for-byte; both gateway volumes retained. No inference or OAuth ran. User DNS, Windows CA trust and visual browser acceptance remain manual.
+- **NOTE-005**: Build retried with host networking for package downloads only; runtime namespace/ports unchanged. Both services have persistent state and automatic restart policies; Docker restart and host reboot were not performed against unrelated services.
 
 ## 9. Related Specifications / Further Reading
 
