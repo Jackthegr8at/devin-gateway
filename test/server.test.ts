@@ -8,6 +8,8 @@ import { startServer } from "../src/server.ts";
 import { listModels } from "../src/models.ts";
 import { ProtoDecoder } from "../src/proto.ts";
 import { familyFixture, familyPayload } from "./fixtures/model-families.ts";
+import { incomingCatalog } from "./fixtures/tool-catalog.ts";
+import { responsesToolsetToDevin } from "../src/convert.ts";
 
 const HOST = "127.0.0.1";
 const DEVIN_AUTH_PATH = "/exa.auth_pb.AuthService/GetUserJwt";
@@ -1209,6 +1211,94 @@ test("long bridge-emitted call retains evidence without altering Responses ident
     expect(r.identifier_checks).toContainEqual({ stage: "emitted_evidence", field: "call_id", state: "accepted", reason: "none", sensitive_text_overlap: false });
     expect(readFileSync(path, "utf8")).not.toContain(id);
   } finally { await gateway.cleanup(); await upstream.stop(); rmSync(directory, { recursive: true, force: true }); if (oldFlag === undefined) delete process.env.DEVIN_RESPONSES_SAFE_DIAGNOSTICS; else process.env.DEVIN_RESPONSES_SAFE_DIAGNOSTICS = oldFlag; if (oldPath === undefined) delete process.env.DEVIN_RESPONSES_SAFE_DIAGNOSTICS_PATH; else process.env.DEVIN_RESPONSES_SAFE_DIAGNOSTICS_PATH = oldPath; }
+});
+
+describe("large incoming Responses catalogs", () => {
+  test("specific filtered tool and duplicate/invalid supported declarations fail before chat", async () => {
+    let chatCount = 0;
+    const upstream = startUpstream({ captureChatRequest: () => { chatCount++; } });
+    const gateway = await startGateway(upstream.url.origin, "synthetic-key");
+    try {
+      const tools = incomingCatalog(128);
+      for (const body of [
+        { tools, tool_choice: { type: "function", namespace: "namespace_a", name: "search" } },
+        { tools: [...tools, { type: "function", name: "exec_command", parameters: {} }] },
+        { tools: [...tools, { type: "function", name: "exec_command", parameters: [] }] },
+      ]) {
+        const response = await fetch(`${gateway.url}/v1/responses`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ model: "swe-2-medium", input: "Synthetic", ...body }) });
+        expect(response.status).toBe(400);
+        expect((await response.json()).error.type).toBe("invalid_request_error");
+      }
+      expect(chatCount).toBe(0);
+    } finally { await gateway.cleanup(); await upstream.stop(); }
+  });
+  for (const stream of [false, true]) for (const position of [0, 3, 5]) {
+    test(`large catalog return/choice position ${position} and continuation (${stream ? "SSE" : "JSON"})`, async () => {
+      const directory = mkdtempSync(join(tmpdir(), "synthetic-catalog-"));
+      const oldFlag = process.env.DEVIN_RESPONSES_SAFE_DIAGNOSTICS;
+      const oldPath = process.env.DEVIN_RESPONSES_SAFE_DIAGNOSTICS_PATH;
+      const path = join(directory, "safe.jsonl");
+      process.env.DEVIN_RESPONSES_SAFE_DIAGNOSTICS = "1";
+      process.env.DEVIN_RESPONSES_SAFE_DIAGNOSTICS_PATH = path;
+      const tools = incomingCatalog(128, 4096);
+      const mapped = responsesToolsetToDevin(tools);
+      const target = mapped.tools[position]; const identity = mapped.identities.get(target.name)!;
+      const captured: ReturnType<typeof decodeChatRequest>[] = [];
+      const choices: ReturnType<typeof decodeChatRequestToolChoice>[] = [];
+      let count = 0;
+      const upstream = startUpstream({
+        captureChatRequest: bytes => { captured.push(decodeChatRequest(bytes)); choices.push(decodeChatRequestToolChoice(bytes)); },
+        chatBody: () => ++count % 2 === 1
+          ? framesBody([dataFrame({ toolCalls: [{ id: `synthetic-catalog-call-${position}`, name: target.name, argumentsJson: '{"marker":"synthetic"}' }], stopReason: 10 })])
+          : framesBody([dataFrame({ text: "SYNTHETIC_CATALOG_FINAL" })]),
+      });
+      const gateway = await startGateway(upstream.url.origin, "synthetic-catalog-credential");
+      try {
+        for (const choice of ["auto", "required", { type: "function", ...identity }]) {
+          const send = async (input: unknown, declarations: unknown) => {
+            const response = await fetch(`${gateway.url}/v1/responses`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ model: "swe-2-medium", stream, input, tools: declarations, tool_choice: choice, parallel_tool_calls: true }) });
+            expect(response.status).toBe(200); const wire = await response.text();
+            const events = stream ? parseSse(wire).map(event => JSON.parse(event.data)) : [];
+            expect(events.some(event => event.type === "response.failed")).toBe(false);
+            return stream ? events.find(event => event.type === "response.completed").response : JSON.parse(wire);
+          };
+          const emitted = await send("Synthetic catalog request", tools);
+          const call = emitted.output[0];
+          expect(call).toMatchObject({ type: "function_call", call_id: `synthetic-catalog-call-${position}`, ...identity });
+          const completed = await send([
+            { role: "user", content: "Synthetic catalog request" }, call,
+            { type: "function_call_output", call_id: call.call_id, output: "Exit code: 0\nOutput:\nSynthetic catalog result" },
+          ], [...tools].reverse());
+          expect(completed.output[0].content[0].text).toBe("SYNTHETIC_CATALOG_FINAL");
+          for (const request of captured.slice(-2)) {
+            expect(new Map(request.tools.map(t => [t.name, t]))).toEqual(new Map(mapped.tools.map(t => [t.name, { name: t.name, description: t.description, schema: t.jsonSchemaString, strict: t.strict }])));
+            expect(request.disableParallelToolCalls).toBe(true);
+          }
+          expect(captured.at(-1)!.prompts).toEqual([
+            { source: 1, prompt: "Synthetic catalog request", toolCalls: [] },
+            { source: 2, toolCalls: [{ id: call.call_id, name: target.name, argumentsJson: call.arguments }] },
+            { source: 4, prompt: "Exit code: 0\nOutput:\nSynthetic catalog result", toolCallId: call.call_id, toolCalls: [] },
+          ]);
+          const expectedChoice = choice === "auto" ? { optionName: "auto" } : choice === "required" ? { optionName: "any" } : { toolName: target.name };
+          expect(choices.slice(-2)).toEqual([expectedChoice, expectedChoice]);
+        }
+        const records = readFileSync(path, "utf8").trim().split("\n").map(line => JSON.parse(line));
+        expect(records).toHaveLength(6);
+        for (let index = 0; index < records.length; index++) {
+          expect(records[index].tool_count).toBe(6);
+          expect(records[index].forwarded_tool_fingerprints).toHaveLength(6);
+          expect(records[index].had_tool_call).toBe(index % 2 === 0);
+          expect(records[index].had_function_call_output).toBe(index % 2 === 1);
+        }
+        const safe = JSON.stringify(records);
+        for (const privateValue of ["Synthetic private", "synthetic-schema-", "synthetic-catalog-call-", "synthetic-catalog-credential", "Synthetic catalog result", "Synthetic catalog request"]) expect(safe).not.toContain(privateValue);
+      } finally {
+        await gateway.cleanup(); await upstream.stop(); rmSync(directory, { recursive: true, force: true });
+        if (oldFlag === undefined) delete process.env.DEVIN_RESPONSES_SAFE_DIAGNOSTICS; else process.env.DEVIN_RESPONSES_SAFE_DIAGNOSTICS = oldFlag;
+        if (oldPath === undefined) delete process.env.DEVIN_RESPONSES_SAFE_DIAGNOSTICS_PATH; else process.env.DEVIN_RESPONSES_SAFE_DIAGNOSTICS_PATH = oldPath;
+      }
+    });
+  }
 });
 
 // Synthetic full-history fixtures: no commands are executed by these tests.
