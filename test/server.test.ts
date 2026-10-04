@@ -1453,7 +1453,7 @@ describe("sequential Responses tool loops", () => {
 });
 
 describe("offline multi-agent lifecycle transport", () => {
-  test("disconnect after synthetic spawn aborts upstream without inventing child cleanup", async () => {
+  for (const childCount of [1, 2]) test(`disconnect with ${childCount} synthetic active children aborts upstream without inventing child cleanup`, async () => {
     let aborted = false;
     let requests = 0;
     const upstream = Bun.serve({ hostname: HOST, port: 0, fetch(req) {
@@ -1467,8 +1467,10 @@ describe("offline multi-agent lifecycle transport", () => {
     try {
       const response = await fetch(`${gateway.url}/v1/responses`, { method: "POST", signal: client.signal, headers: { "content-type": "application/json" }, body: JSON.stringify({ model: "swe-2-medium", stream: true, input: [
         { role: "user", content: "Synthetic parent" },
-        { type: "function_call", namespace: "multi_agent_v1", name: "spawn_agent", call_id: "synthetic-spawn", arguments: "{}" },
-        { type: "function_call_output", call_id: "synthetic-spawn", output: JSON.stringify({ agent_id: "00000000-0000-4000-8000-000000000001" }) },
+        ...Array.from({ length: childCount }, (_, index) => [
+          { type: "function_call", namespace: "multi_agent_v1", name: "spawn_agent", call_id: `synthetic-spawn-${index}`, arguments: "{}" },
+          { type: "function_call_output", call_id: `synthetic-spawn-${index}`, output: JSON.stringify({ agent_id: `00000000-0000-4000-8000-00000000000${index + 1}` }) },
+        ]).flat(),
       ] }) });
       const reader = response.body!.getReader();
       let text = "";
@@ -1504,7 +1506,21 @@ describe("offline multi-agent lifecycle transport", () => {
   const send: Step = { name: "send_input", args: { target: agentA, message: "Synthetic follow-up", interrupt: false }, output: JSON.stringify({ submission_id: "synthetic-submission" }) };
   const close: Step = { name: "close_agent", args: { target: agentA }, output: JSON.stringify({ previous_status: "shutdown" }) };
   const resume: Step = { name: "resume_agent", args: { id: agentA }, output: JSON.stringify({ status: "running" }) };
+  const spawnB: Step = { ...spawn, args: { agent_type: "swe_worker", message: "Synthetic child B task" }, output: JSON.stringify({ agent_id: agentB, nickname: "Synthetic worker B" }) };
+  const waitB: Step = { ...wait, args: { targets: [agentB], timeout_ms: 30000 }, output: JSON.stringify({ status: { [agentB]: { completed: "Synthetic child B result" } }, timed_out: false }) };
+  const closeB: Step = { ...close, args: { target: agentB } };
+  const failedA: Step = { ...wait, output: JSON.stringify({ status: { [agentA]: { errored: "Synthetic child A failure" } }, timed_out: false }) };
+  const failedB: Step = { ...waitB, output: JSON.stringify({ status: { [agentB]: { errored: "Synthetic child B failure" } }, timed_out: false }) };
   const scenarios: Array<{ name: string; steps: Step[]; failAt?: number }> = [
+    { name: "two active siblings, isolated A/B spawn and wait results, close both", steps: [spawn, spawnB, wait, waitB, close, closeB] },
+    { name: "two siblings with reversed wait order", steps: [spawn, spawnB, waitB, wait, close, closeB] },
+    { name: "two siblings with reversed close order", steps: [spawn, spawnB, wait, waitB, closeB, close] },
+    { name: "two siblings with reversed wait and close order", steps: [spawn, spawnB, waitB, wait, closeB, close] },
+    { name: "close A leaves B target and result intact", steps: [spawn, spawnB, wait, close, waitB, closeB] },
+    { name: "close B leaves A target and result intact", steps: [spawn, spawnB, waitB, closeB, wait, close] },
+    { name: "A fails while B succeeds, explicit cleanup of both", steps: [spawn, spawnB, failedA, waitB, close, closeB] },
+    { name: "B fails while A succeeds, explicit cleanup of both", steps: [spawn, spawnB, failedB, wait, closeB, close] },
+    { name: "continuation fails with two active siblings, explicit cleanup of both", steps: [spawn, spawnB, close, closeB], failAt: 2 },
     { name: "spawn result, wait result, final", steps: [spawn, wait] },
     { name: "spawn, multiple sends, wait, final", steps: [spawn, send, send, wait] },
     { name: "spawn, pending wait, completed wait", steps: [spawn, pending, wait] },

@@ -125,11 +125,25 @@ wire history; private diagnostic absence; no accidental Tested promotion; and
 agent-ID versus call-ID isolation. Mock failure cleanup is an explicitly supplied
 next request, not automatic recovery invented by the gateway.
 
-No production bridge bug was exposed. Installed Desktop execution, exact target
-schemas, real cancellation/orphan behavior and model-generated lifecycle choices
-remain a **manual** validation boundary. Do not expand parallel/nested agents yet.
+No production bridge bug was exposed. Basic single-child execution has since
+passed manual acceptance, as recorded below. Exact current target schemas,
+two-sibling execution and cancellation/orphan behavior remain manual boundaries.
+Do not enable parallel parent tool calls or nested agents.
 
-## Proposed one-child manual acceptance (not executed)
+## Single-child manual acceptance (passed)
+
+The operator validated the SWE-2 High native lifecycle in a fresh Desktop thread:
+exactly one child was created, waited for, and explicitly closed before the parent
+returned final text. No visible orphan remained. No raw child IDs, call IDs,
+prompts or child output are recorded here.
+
+Safe diagnostics corroborated ordered spawn -> spawn output -> wait -> wait
+output -> close -> close output -> final text. The close-request history had two
+assistant calls and two outputs and emitted one further call. The final request
+had three assistant calls and three outputs, emitted no further call, and
+completed successfully. Ordinary native result objects still produce the expected
+`tool_result_not_successful`; `unknown_tool` is the known nameless function-output
+history fallback, not an extra invocation. Neither interpretation changes Tested.
 
 Use the existing guarded worker workflow after manually closing Desktop. Keep
 the saved parent/worker/provider/effort/security settings. Manually launch Desktop
@@ -170,5 +184,57 @@ pass need not modify Tested status under the current output-success predicate.
 - All 15 PowerShell script/module ASTs, entrypoint shell syntax,
   `git diff --check`, and changed-file privacy checks passed.
 - Existing source fingerprint inputs are unchanged. These test/documentation
-  changes require no gateway deployment. Real Desktop agent lifecycle acceptance
-  is unrun.
+  changes require no gateway deployment. Single-child live acceptance subsequently
+  passed; two-sibling live acceptance has not been performed.
+
+## Next acceptance: two sibling identities (design/offline only)
+
+Keep parent operations sequential and upstream parallel tool calls disabled.
+Two live children are runtime concurrency, not two calls in one provider response.
+Expected sequence: spawn A -> spawn B -> wait only A -> receive A -> wait only B
+-> receive B -> close only A -> close only B -> final response. Retain the private
+spawn results as separate targets; never substitute a call/item ID for a child ID.
+No nesting, parent-side command, or send_input is needed for these read-only tasks.
+
+Installed backend discovery reports `0.160.0`; no runtime or active config was
+changed. Its offline selection contract passes, but that probe does not export
+the native spawn/wait declarations. The available source reference is `0.159.1`,
+not an exact-source match for the installed binary: it permits multiple siblings
+(V1 default thread capacity six) and `wait_agent.targets=[one child ID]`. Current
+[official subagent documentation](https://learn.chatgpt.com/docs/agent-configuration/subagents)
+also describes concurrently open child threads and targeted orchestration, but
+is not a version pin. No explicit thread-cap override was found in the active
+user config. Thus sibling support is supported by source/docs, while the exact
+installed declaration/capacity remains a live preflight boundary. Use the
+runtime-supplied schema; if spawning B returns a limit/schema error, close A and
+stop rather than changing permissions/config or falling back to another role.
+
+Offline JSON/SSE fixtures now preserve two distinct spawn results, per-target wait
+results, both wait/close order permutations, closing either sibling before waiting
+for the other, one failed/one completed child, and explicit cleanup after upstream
+failure with two active children. Every request compares the entire ordered wire
+history and verifies disabled parallel calls. These are transport tests, not an
+implementation of the Codex child registry. A deterministic disconnect test with
+two synthetic active children proves upstream abort without invented cleanup.
+Independent close-call evidence also verifies reversed returns and consumed replay
+cannot consume the other pending call or promote native output to Tested.
+
+For manual identity isolation, give A only the root package name task and B only
+the root packageManager task. Keep the distinction in the private parent/child UI;
+do not add these values or target IDs to diagnostics. Safe tool names/counts and
+final completion corroborate transport, but cannot alone prove which child closed.
+Inspect the native tool result and both child tabs for explicit close completion.
+
+On any child failure, explicitly close both successfully created children; if B
+was never created, close only A. Pending waits may repeat for that same target.
+If the parent errors or acceptance is aborted, use the same parent thread to ask
+it to close the already-created children without spawning replacements. Retain
+their identities privately from the original spawn results. Do not assume gateway
+cancellation or closing Desktop closes either child. No verified standalone shell
+cleanup command is available; if the native parent cannot resume, report cleanup
+as unresolved rather than claiming the children were closed. Never delete session
+history or recovery evidence as a substitute for native close.
+
+Validation for the sibling coverage: 44 focused tests passed; full Bun 528 passed,
+18 skipped, with only the documented upstream Windows SIGTERM failure (547 tests,
+34 files, 7002 assertions). Production behavior and diagnostic fields are unchanged.

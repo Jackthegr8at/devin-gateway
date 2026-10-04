@@ -79,6 +79,29 @@ test("native agent results do not invent success and agent identities cannot sat
   await tracker.drain(); expect((await store.read()).variants["swe-2-high"].automatic).toBeDefined();
 }));
 
+test("native sibling call evidence stays independent through reversed results and consumed replay", async () => fixture(async store => {
+  const tracker = new ModelValidationTracker(store);
+  function observe(calls: string[], returned: string[]) {
+    let outcomes: unknown;
+    const d = new ResponsesSafeDiagnostic("synthetic-siblings", Date.now(), undefined, (r, e) => {
+      tracker.observe("synthetic-scope", r, e); outcomes = r.correlation_results;
+    }, false);
+    d.recordResolvedRouting({ logicalModel: "swe-2", requestedEffort: "high", resolvedModelId: "swe-2-high" });
+    d.recordUpstreamResponse(200, true); d.recordUpstreamComplete();
+    for (const id of calls) d.recordNormalizedEmittedToolCall({ id, name: "multi_agent_v1__close_agent" });
+    for (const id of returned) d.recordNormalizedFunctionCallOutput({ role: "tool", tool_call_id: id, content: '{"previous_status":"shutdown"}' }, false);
+    d.recordSuccessfulCompletion(); d.finalize(); return outcomes;
+  }
+  // Calls are issued in separate parent requests, never parallel tool calls.
+  expect(observe(["synthetic-close-A"], [])).toEqual({ issued_call_recorded: 1 });
+  expect(observe(["synthetic-close-B"], [])).toEqual({ issued_call_recorded: 1 });
+  expect(observe([], ["synthetic-unrelated-call"])).toEqual({ no_issued_call: 1 });
+  expect(observe([], ["synthetic-close-B"])).toEqual({ tool_result_not_successful: 1 });
+  expect(observe([], ["synthetic-close-B", "synthetic-close-A"])).toEqual({ no_issued_call: 1, tool_result_not_successful: 1 });
+  expect(observe([], ["synthetic-close-A", "synthetic-close-B"])).toEqual({ no_issued_call: 2 });
+  await tracker.drain(); expect(await store.read()).toEqual({ schemaVersion: 1, revision: 1, variants: {} });
+}));
+
 test("correlated completed tool round-trip promotes; text/history/failures/wrong credential or effort/replay do not", async () => fixture(async store => {
   let now = 1000; const tracker = new ModelValidationTracker(store, () => now);
   const outcomes: Array<Record<string, number>> = [];
