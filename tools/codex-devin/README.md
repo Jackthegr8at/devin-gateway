@@ -114,3 +114,9 @@ Set-Location .\tools\codex-devin # from the repository root
 ```
 
 The wrapper prints the safe diagnostic log path. After the config/worker restore is verified, stop the gateway by pressing Ctrl+C in its visible PowerShell window.
+
+### Responses single-call capability and temporary model guidance
+
+The Responses bridge rejects multiple distinct upstream calls in one response with `multiple_call_conflict`; it neither executes/discards extra calls nor regenerates automatically. Every model on this path receives a labelled bridge-capability instruction explaining sequential execution. Composition preserves native instruction bytes first, adds SWE autonomy guidance only for Medium/High/Max, and places the generic bridge capability last. With collapse enabled these are inside the textual `<system>` wrapper before the unchanged latest user content; this does not confer protocol-level system priority. Other API surfaces are unchanged.
+
+The retained diagnostic snapshot before this change contained: SWE Medium 20 completed, 0 conflicts, 11 completed with tools; SWE High 20 completed, 2 conflicts, 12 completed with tools; SWE Max 5 completed, 0 conflicts, 3 completed with tools. These are historical observations, not comparative benchmark results. Prefer SWE Medium temporarily for autonomous tool-heavy work; this does not guarantee freedom from conflicts or change any saved role/selection. Do not recommend GLM for long autonomous work while the reported duplicate-loop issue remains unresolved.

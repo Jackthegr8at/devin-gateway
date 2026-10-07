@@ -4,11 +4,11 @@ import { collapseSystemPromptIntoLatestUserMessage } from "../src/responses-syst
 import { ChatMessageSource } from "../src/proto.ts";
 
 const syntheticAnchor = "Synthetic runtime anchor\n  Preserve whitespace.\n";
-test("SWE guidance combines autonomous continuation with sequential tool execution", () => {
+test("SWE guidance retains autonomy without duplicating the bridge capability", () => {
   expect(SWE_AUTONOMY_SUPPLEMENT).toContain("Continue until the task is complete or genuinely blocked");
   expect(SWE_AUTONOMY_SUPPLEMENT).toContain("execute it rather than ending with an announcement");
-  expect(SWE_AUTONOMY_SUPPLEMENT).toContain("Issue at most one tool call at a time.");
-  expect(SWE_AUTONOMY_SUPPLEMENT).toContain("After its result is returned, continue with the next necessary action in the following turn.");
+  expect(SWE_AUTONOMY_SUPPLEMENT).not.toContain("one tool call");
+  expect(SWE_AUTONOMY_SUPPLEMENT).not.toContain("parallel");
 });
 test("only reviewed resolved SWE variants receive separate guidance", () => {
   for (const model of ["swe-2-medium", "swe-2-high", "swe-2-max"]) {

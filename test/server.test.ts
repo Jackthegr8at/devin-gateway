@@ -10,7 +10,7 @@ import { ProtoDecoder } from "../src/proto.ts";
 import { familyFixture, familyPayload } from "./fixtures/model-families.ts";
 import { incomingCatalog } from "./fixtures/tool-catalog.ts";
 import { responsesToolsetToDevin } from "../src/convert.ts";
-import { withSweAutonomySupplement } from "../src/responses-swe-autonomy.ts";
+import { withResponsesBridgeInstructions } from "../src/responses-bridge-capability.ts";
 
 const HOST = "127.0.0.1";
 const DEVIN_AUTH_PATH = "/exa.auth_pb.AuthService/GetUserJwt";
@@ -1097,7 +1097,8 @@ describe("POST /v1/responses (non-streaming)", () => {
           expect(captured).toHaveLength(count + 1); // A normal final response never triggers another request.
           const decoded = decodeChatRequest(captured[count]);
           expect(decoded.modelUid).toBe(wire);
-          const effective = withSweAutonomySupplement(anchor, wire);
+          expect(decoded.disableParallelToolCalls).toBe(true);
+          const effective = withResponsesBridgeInstructions(anchor, wire);
           expect(effective.slice(0, anchor.length)).toBe(anchor);
           expect(decoded.prompt).toBe(flag === "1" ? "" : effective);
           expect(decoded.prompts[0].prompt).toBe(flag === "1" ? `<system>\n${effective}\n</system>\n\nSynthetic task` : "Synthetic task");
@@ -1137,11 +1138,11 @@ describe("POST /v1/responses (non-streaming)", () => {
       const [glm, swe, unrelated] = captured.map(decodeChatRequest);
       const exactSystem = "Top-level Codex catalog\n\nDesktop developer block";
       expect(glm.prompt).toBe("");
-      expect(glm.prompts).toEqual([{ source: 1, prompt: `<system>\n${exactSystem}\n</system>\n\nUser task`, toolCalls: [] }]);
+      expect(glm.prompts).toEqual([{ source: 1, prompt: `<system>\n${withResponsesBridgeInstructions(exactSystem, "glm-5-3-flash-low")}\n</system>\n\nUser task`, toolCalls: [] }]);
       expect(swe.prompt).toBe("");
-      expect(swe.prompts[0].prompt).toBe(`<system>\n${withSweAutonomySupplement(exactSystem, "swe-2-medium")}\n</system>\n\nUser task`);
+      expect(swe.prompts[0].prompt).toBe(`<system>\n${withResponsesBridgeInstructions(exactSystem, "swe-2-medium")}\n</system>\n\nUser task`);
       expect(unrelated.prompt).toBe("");
-      expect(unrelated.prompts[0].prompt).toBe(`<system>\n${exactSystem}\n</system>\n\nUser task`);
+      expect(unrelated.prompts[0].prompt).toBe(`<system>\n${withResponsesBridgeInstructions(exactSystem, "unrelated-model")}\n</system>\n\nUser task`);
     } finally {
       await cleanup();
       await upstream.stop();
