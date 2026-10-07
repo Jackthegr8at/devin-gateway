@@ -16,6 +16,7 @@
 import { streamChat, discoverModels, discoverModelMetadata, type ChatStreamEvent } from "./devin.js";
 import { projectModelFamilies, resolveFamilyModelId, FamilyRoutingError } from "./model-families.js";
 import { getCodexModelProfile } from "./admin/codex-model-profiles.js";
+import { withSweAutonomySupplement } from "./responses-swe-autonomy.js";
 import { ModelSelectionStore } from "./admin/model-selection-store.js";
 import { CODEX_SELECTION_PATH, createModelSelectionRoutes, managementRequestAllowed } from "./admin/routes.js";
 import { createAdminStaticHandler } from "./admin/static.js";
@@ -608,12 +609,14 @@ async function handleResponses(req: Request, reqId: string, trace: ErrorTrace): 
   const cascadeId = crypto.randomUUID();
   const originalPrompts = toDevinPrompts(internal, cascadeId);
   const originalSystemPrompt = extractSystemPrompt(messages);
+  // Keep native instructions intact; append gateway guidance after wire routing.
+  const effectiveSystemPrompt = withSweAutonomySupplement(originalSystemPrompt, modelUid);
   const collapseRequested = isCodexDesktopSystemCollapseRequest({
     featureFlag: process.env[CODEX_DESKTOP_SYSTEM_COLLAPSE_ENV],
   });
   const collapse = collapseRequested
-    ? collapseSystemPromptIntoLatestUserMessage(originalSystemPrompt, originalPrompts)
-    : { applied: false, systemPrompt: originalSystemPrompt, prompts: originalPrompts };
+    ? collapseSystemPromptIntoLatestUserMessage(effectiveSystemPrompt, originalPrompts)
+    : { applied: false, systemPrompt: effectiveSystemPrompt, prompts: originalPrompts };
   const prompts = collapse.prompts;
   const systemPrompt = collapse.systemPrompt;
   diagnostic?.setRequestSummary({

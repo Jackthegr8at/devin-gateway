@@ -10,6 +10,7 @@ import { ProtoDecoder } from "../src/proto.ts";
 import { familyFixture, familyPayload } from "./fixtures/model-families.ts";
 import { incomingCatalog } from "./fixtures/tool-catalog.ts";
 import { responsesToolsetToDevin } from "../src/convert.ts";
+import { withSweAutonomySupplement } from "../src/responses-swe-autonomy.ts";
 
 const HOST = "127.0.0.1";
 const DEVIN_AUTH_PATH = "/exa.auth_pb.AuthService/GetUserJwt";
@@ -1076,6 +1077,40 @@ describe("POST /v1/responses (non-streaming)", () => {
     }
   });
 
+  test("SWE guidance follows resolved routing without auto-continuing completed JSON or SSE turns", async () => {
+    const originalFlag = process.env.DEVIN_CODEX_DESKTOP_COLLAPSE_SYSTEM;
+    const captured: Uint8Array[] = [];
+    const upstream = startUpstream({
+      modelsBody: familyPayload([familyFixture("swe-2-high", "SWE-2", "high")]),
+      captureChatRequest: body => captured.push(body),
+    });
+    const gateway = await startGateway(upstream.url.origin, "synthetic-key");
+    const anchor = "Synthetic native anchor\n  Whitespace stays intact.\n";
+    try {
+      for (const flag of ["0", "1"]) for (const stream of [false, true]) {
+        process.env.DEVIN_CODEX_DESKTOP_COLLAPSE_SYSTEM = flag;
+        for (const [model, effort, wire] of [["swe-2", "high", "swe-2-high"], ["swe-2-medium", "medium", "swe-2-medium"], ["swe-2-max", "max", "swe-2-max"], ["glm-5-3-flash-low", "low", "glm-5-3-flash-low"]]) {
+          const count = captured.length;
+          const response = await fetch(`${gateway.url}/v1/responses`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ model, reasoning: { effort }, stream, instructions: anchor, input: "Synthetic task" }) });
+          expect(response.status).toBe(200);
+          expect(await response.text()).toContain(stream ? "response.completed" : '"status":"completed"');
+          expect(captured).toHaveLength(count + 1); // A normal final response never triggers another request.
+          const decoded = decodeChatRequest(captured[count]);
+          expect(decoded.modelUid).toBe(wire);
+          const effective = withSweAutonomySupplement(anchor, wire);
+          expect(effective.slice(0, anchor.length)).toBe(anchor);
+          expect(decoded.prompt).toBe(flag === "1" ? "" : effective);
+          expect(decoded.prompts[0].prompt).toBe(flag === "1" ? `<system>\n${effective}\n</system>\n\nSynthetic task` : "Synthetic task");
+        }
+      }
+    } finally {
+      await gateway.cleanup();
+      await upstream.stop();
+      if (originalFlag === undefined) delete process.env.DEVIN_CODEX_DESKTOP_COLLAPSE_SYSTEM;
+      else process.env.DEVIN_CODEX_DESKTOP_COLLAPSE_SYSTEM = originalFlag;
+    }
+  });
+
   test("system collapse is opt-in and applies provider-wide in the Responses endpoint", async () => {
     const originalFlag = process.env.DEVIN_CODEX_DESKTOP_COLLAPSE_SYSTEM;
     process.env.DEVIN_CODEX_DESKTOP_COLLAPSE_SYSTEM = "1";
@@ -1104,7 +1139,7 @@ describe("POST /v1/responses (non-streaming)", () => {
       expect(glm.prompt).toBe("");
       expect(glm.prompts).toEqual([{ source: 1, prompt: `<system>\n${exactSystem}\n</system>\n\nUser task`, toolCalls: [] }]);
       expect(swe.prompt).toBe("");
-      expect(swe.prompts[0].prompt).toBe(`<system>\n${exactSystem}\n</system>\n\nUser task`);
+      expect(swe.prompts[0].prompt).toBe(`<system>\n${withSweAutonomySupplement(exactSystem, "swe-2-medium")}\n</system>\n\nUser task`);
       expect(unrelated.prompt).toBe("");
       expect(unrelated.prompts[0].prompt).toBe(`<system>\n${exactSystem}\n</system>\n\nUser task`);
     } finally {
