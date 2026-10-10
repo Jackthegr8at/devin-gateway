@@ -117,3 +117,19 @@ code { font-family: "Cascadia Code", "SFMono-Regular", Consolas, monospace; colo
 .picker.page-scroll { height: auto; min-height: 100%; overflow: visible; }
 .page-scroll .picker-body, .page-scroll .edit-controls, .page-scroll .model-browser { flex: 0 0 auto; }
 .page-scroll .model-list { flex: 0 0 auto; overflow: visible; }
+/* Accounts section: names and the active profile only. Credentials are never rendered. */
+.accounts { margin: 8px 0 12px; }
+.accounts-form { margin: 0; }
+.account-controls { padding: 0; border: 0; margin: 0; min-width: 0; display: grid; gap: 8px; }
+.account-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 8px; }
+.account-row { display: grid; grid-template-columns: minmax(0, 2fr) auto auto; gap: 8px 12px; align-items: end; padding: 10px 12px; border: 1px solid var(--border); border-radius: 7px; background: var(--bg); }
+.account-row.is-active { border-color: var(--accent); }
+.account-name-field { display: grid; gap: 5px; min-width: 0; color: var(--muted); font-size: 11px; }
+.account-name-input { width: 100%; min-height: 34px; padding: 6px 8px; border: 1px solid var(--border); border-radius: 6px; background: var(--control); color: var(--text); font-size: 12px; min-width: 0; }
+.account-name-input:disabled { opacity: .5; cursor: default; }
+.account-status { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; min-height: 34px; }
+.active-marker { color: var(--accent); border-color: var(--accent); font-weight: 600; }
+.account-help { grid-column: 1 / -1; }
+.account-save { display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; }
+@media (max-width: 640px) { .account-row { grid-template-columns: minmax(0, 1fr); } .account-status { min-height: 0; } }
+.account-notice { margin: 0 0 8px; padding: 10px 12px; border: 1px solid var(--warning); border-radius: 6px; color: var(--warning); background: var(--bg); font-size: 12px; line-height: 1.5; }

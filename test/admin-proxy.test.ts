@@ -21,7 +21,10 @@ test("Nginx authenticates and validates externally before translating to the unc
     expect(config).toContain(`proxy_set_header ${name} "";`);
   }
   expect(config).toContain("location / { return 404; }");
-  expect(config).toContain("api/(?:models|model-selection|model-test-status)$");
+  expect(config).toContain("limit_except GET PUT { deny all; }");
+  expect(config).toContain("proxy_set_header X-Devin-Admin-Proxy \"\";");
+  expect(config).toContain("include /etc/nginx/devin-admin-proxy-secret.conf;");
+  expect(config).toContain("api/(?:models|model-selection|model-test-status|accounts)$");
   expect(config).toContain("assets/(?:model-picker\\.js|model-picker\\.css|third-party-notices\\.txt)$");
   expect(config).not.toContain("38643");
 });

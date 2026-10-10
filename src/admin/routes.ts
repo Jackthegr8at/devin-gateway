@@ -3,12 +3,15 @@ import { adminModels, codexSelectionManifest, validateDiscoveredRoles } from "./
 import { inspectModelFamilies } from "../model-families.js";
 import { MAX_SELECTION_BYTES, ModelSelectionError, selectionETag, validateModelSelection } from "./model-selection.js";
 import type { ModelSelectionStore } from "./model-selection-store.js";
+import { ADMIN_PROXY_HEADER, type AdminProxySecret } from "./proxy-secret.js";
 import { isModelId } from "./model-selection.js";
 import { testStatusETag, type ModelTestStatusStore } from "./model-test-status.js";
 
 export const CODEX_SELECTION_PATH = "/gateway/api/codex-selection";
 export interface ModelSelectionRoutesOptions {
   store: ModelSelectionStore;
+  /** Required for every management write when set. Absent only in offline tests. */
+  proxySecret?: AdminProxySecret;
   testStatusStore?: ModelTestStatusStore;
   discover: (request: Request) => Promise<DiscoveredModelMetadata[]>;
 }
@@ -70,6 +73,7 @@ export function createModelSelectionRoutes(options: ModelSelectionRoutesOptions)
         if (req.method === "PUT") {
           if (req.headers.get("content-type")?.split(";")[0].trim().toLowerCase() !== "application/json") return error(415, "invalid_content_type", "Management writes require application/json.");
           if (req.headers.get("x-devin-management") !== "1") return error(403, "management_header_required", "Management writes require the explicit management header.");
+          if (!options.proxySecret?.matches(req.headers.get(ADMIN_PROXY_HEADER))) return error(403, "admin_proxy_required", "Management writes must come through the authenticated admin proxy.");
           const expected = req.headers.get("if-match"); if (!expected) return error(428, "revision_required", "If-Match is required for status writes.");
           const body = await selectionBody(req) as Record<string, unknown>;
           if (!body || typeof body !== "object" || Array.isArray(body) || Object.keys(body).length !== 2
@@ -97,6 +101,7 @@ export function createModelSelectionRoutes(options: ModelSelectionRoutesOptions)
           return error(415, "invalid_content_type", "Management writes require application/json.");
         }
         if (req.headers.get("x-devin-management") !== "1") return error(403, "management_header_required", "Management writes require the explicit management header.");
+          if (!options.proxySecret?.matches(req.headers.get(ADMIN_PROXY_HEADER))) return error(403, "admin_proxy_required", "Management writes must come through the authenticated admin proxy.");
         const expected = req.headers.get("if-match");
         if (!expected) return error(428, "revision_required", "If-Match is required for model selection writes.");
         const proposed = validateModelSelection(await selectionBody(req));

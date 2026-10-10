@@ -86,6 +86,33 @@ browser window avoids cached old credentials after rotation.
 Automated initial acceptance uses a random in-memory password, then LOCKS the
 admin account. You must set your own password before normal browser access.
 
+## Management write secret
+
+Browser writes to `/admin/api/accounts`, `/admin/api/model-selection`, and `/admin/api/model-test-status` require a per-install secret. Nginx adds it on the admin path, after Basic auth and the allowlist. The browser cannot set it, because Nginx replaces any value a client sends. The gateway accepts a write only when the header matches the secret it holds.
+
+The gateway creates the secret itself on first start, in `admin-proxy-secret` in the settings volume (mode 0600, 64 lowercase hex characters). Nginx must hold the same value. Provision in this order, and never print the value in a transcript or commit it:
+
+1. Start the gateway once so it creates the file. Its reads and existing admin reads work without the secret.
+2. On devhub, copy the value from the settings volume into a root-owned Nginx snippet without echoing it. The value stays in a pipe between the two files:
+
+```sh
+sudo sh -c 'printf "proxy_set_header X-Devin-Admin-Proxy \"%s\";\n" "$(cat /path/to/settings-volume/admin-proxy-secret)" > /etc/nginx/devin-admin-proxy-secret.conf'
+sudo chown root:root /etc/nginx/devin-admin-proxy-secret.conf
+sudo chmod 0600 /etc/nginx/devin-admin-proxy-secret.conf
+```
+
+3. Reload Nginx with `sudo nginx -t` followed by `sudo systemctl reload nginx`.
+
+Before the first production write, verify on the Nginx host that a browser-supplied copy of the header never reaches the gateway. Nginx has no local test in this repository, so run this check on the real host:
+
+1. Confirm the gateway rejects a forged value. A write with a wrong `X-Devin-Admin-Proxy` value through Nginx must return HTTP 403 `admin_proxy_required`, and a write with no header must also return 403.
+2. Confirm the correct value succeeds only through Nginx. A write through Nginx with the real value must return 200 or the normal business response.
+3. Confirm `sudo nginx -T` shows the `proxy_set_header X-Devin-Admin-Proxy ""` line before the `include` line in the admin location.
+
+If step 1 returns anything other than 403 for a forged value, stop. Do not deploy the write path.
+The gateway refuses a malformed secret file and never replaces it. A value mismatch appears as HTTP 403 `admin_proxy_required` on writes and never silently rotates the secret. Never place the secret in `.env`, Compose values, the repository, or the logs. The template `deploy/devin-admin-proxy-secret.conf.example` contains only a placeholder.
+
+To rotate, write a new 64-hex value into both files in the same maintenance step, reload Nginx, and recreate the gateway. Writes sent with the old value fail closed until both sides match.
 ## Validation and persistence
 
 `sudo python3 scripts/test-nginx-admin.py` runs isolated proxy checks on the

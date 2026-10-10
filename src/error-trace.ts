@@ -43,7 +43,7 @@ function maskToken(token: string): string {
 /** Mask sensitive header values (Authorization, x-api-key, cookie). */
 function maskHeader(key: string, value: string): string {
   const lk = key.toLowerCase();
-  if (lk === "authorization" || lk === "x-api-key" || lk === "cookie") {
+  if (lk === "authorization" || lk === "x-api-key" || lk === "cookie" || lk === "x-devin-admin-proxy") {
     return maskToken(value.replace(/^Bearer\s+/i, ""));
   }
   return value;

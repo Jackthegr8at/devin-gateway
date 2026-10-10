@@ -40,12 +40,15 @@ async function fixture(run: (context: { gateway: string; admin: string; director
   } });
   const directory = join(root, "settings");
   const gateway = await offlineGateway({ host: "127.0.0.1", token: "synthetic-selection-token", baseUrl: upstream.url.origin, modelSelection: { directory, adminPort: 0 } });
+  proxySecretValue = (await readFile(join(directory, "admin-proxy-secret"), "utf8")).trim();
   try {
     await run({ gateway: `http://127.0.0.1:${gateway.port}`, admin: `http://127.0.0.1:${gateway.adminPort}`, directory,
       setModels: (ids) => { response = payload(ids); }, setFailure: () => { failure = true; } });
   } finally { await gateway.stop(); await upstream.stop(true); await rm(root, { recursive: true, force: true }); }
 }
-const putHeaders = (etag: string) => ({ "content-type": "application/json", "x-devin-management": "1", "if-match": etag });
+// Set by each fixture from its own settings directory. The value is never printed.
+let proxySecretValue = "";
+const putHeaders = (etag: string) => ({ "content-type": "application/json", "x-devin-management": "1", "x-devin-admin-proxy": proxySecretValue, "if-match": etag });
 
 test("manual test status is protected, exact-variant scoped, persistent and independent of selection", async () => fixture(async ({ gateway, admin }) => {
   const initial = await (await fetch(`${admin}/admin/api/model-selection`)).json();
@@ -147,7 +150,7 @@ describe("isolated management routes and read-only Codex export", () => {
     const body = JSON.stringify(initialModelSelection());
     expect((await fetch(url, { method: "PUT", body })).status).toBe(415);
     expect((await fetch(url, { method: "PUT", headers: { "content-type": "application/json" }, body })).status).toBe(403);
-    expect((await fetch(url, { method: "PUT", headers: { "content-type": "application/json", "x-devin-management": "1" }, body })).status).toBe(428);
+    expect((await fetch(url, { method: "PUT", headers: { "content-type": "application/json", "x-devin-management": "1", "x-devin-admin-proxy": proxySecretValue }, body })).status).toBe(428);
     expect((await fetch(url, { method: "PUT", headers: putHeaders('"model-selection-v2-1"'), body: "{invalid" })).status).toBe(400);
     expect((await fetch(url, { method: "PUT", headers: putHeaders('"model-selection-v2-1"'), body: "x".repeat(256 * 1024 + 1) })).status).toBe(400);
   }));
@@ -190,6 +193,7 @@ describe("isolated management routes and read-only Codex export", () => {
     const upstream = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response(payload(initialModelSelection().enabledModels)) });
     const options = { host: "127.0.0.1", token: "synthetic-recreation-token", baseUrl: upstream.url.origin, modelSelection: { directory: join(root, "settings"), adminPort: 0 } };
     let gateway = await offlineGateway(options);
+    proxySecretValue = (await readFile(join(root, "settings", "admin-proxy-secret"), "utf8")).trim();
     try {
       const url = `http://127.0.0.1:${gateway.adminPort}/admin/api/model-selection`;
       const next = { ...initialModelSelection(), enabledModels: [...initialModelSelection().enabledModels, "saved-unknown"] };

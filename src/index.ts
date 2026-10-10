@@ -11,7 +11,7 @@
  *   import { chat, startServer } from "devin-gateway";
  */
 
-import { startServer } from "./server.js";
+import { accountProfilesEnabled, startServer } from "./server.js";
 import { readFallbackToken } from "./config.js";
 
 export * from "./proto.js";
@@ -23,6 +23,13 @@ export * from "./client.js";
 export { startServer, type ServerOptions, type ServerHandle } from "./server.js";
 
 if (import.meta.main) {
-  const token = await readFallbackToken();
-  await startServer(token ? { token } : {});
+  // With model selection (and so account profiles) enabled, the saved login token is an account credential,
+  // managed by AccountRuntime, and must not become a static override. Without selection, keep the legacy fallback.
+  const accountsEnabled = accountProfilesEnabled();
+  if (accountsEnabled) {
+    await startServer();
+  } else {
+    const token = await readFallbackToken();
+    await startServer(token ? { token } : {});
+  }
 }

@@ -206,6 +206,32 @@ The guarded Windows worker wrapper can run the same interactive login step autom
 
 The container writes normal operational logs to stderr, so `docker compose logs -f devin-gateway` works without debug mode. `DEBUG` and `ERROR_TRACE` are explicitly disabled; error traces can otherwise include request bodies. Safe Responses diagnostics are disabled by default. Their configured path is `/app/logs/responses-safe-diagnostic.jsonl`, under the ignored `./logs` bind mount, so they can be explicitly enabled later without changing the image. Do not enable raw debug/error tracing for routine operation.
 
+#### Personal and Team accounts
+
+The gateway keeps two independently signed-in Devin accounts, `Personal` and `Team`. Each profile has its own token file, so signing in or refreshing one never changes the other:
+
+- `personal` uses the existing `devin-gateway-auth` token file, so an existing sign-in keeps working without a copy or rewrite.
+- `team` uses `accounts/team/token` in the same named volume.
+
+Enroll each profile once. Run these from the same Windows PowerShell window, as in the first deployment, and open the printed URL in your browser. The token is written inside the container and never printed:
+
+```powershell
+ssh -t <ssh-user>@<gateway-host> "cd '<gateway-directory>' && sudo -n docker compose run --rm devin-login"
+ssh -t <ssh-user>@<gateway-host> "cd '<gateway-directory>' && sudo -n docker compose run --rm devin-login --profile team"
+```
+
+A profile that already has a sign-in is refused, and the existing token is left unchanged. To replace it deliberately, add `--replace` to the same command. `docker compose run --rm devin-login --profile team --status` shows the profile name, whether it is signed in, and the token file path. It never prints token text.
+
+Switch the active account from the admin page at `https://devin-admin.dev.kryptxt.ca/admin/`, in the **Accounts** section. The switch button is disabled for a profile that is not signed in, and the gateway also refuses that switch on the server. The gateway persists the active choice in the settings volume, so it survives a restart:
+
+- A switch affects requests that start after it succeeds. A request already running keeps the account it started with, and that account is never swapped mid-request.
+- Each request reads its account's token from disk, so a re-enrolled token takes effect without a restart. A profile with no usable token fails the request. The gateway never sends it to the other account.
+- Responses continuations use a fresh cascade per request and no server-side conversation state, so there is no session to move between accounts. Tested-status evidence is keyed by credential scope. A switch therefore does not credit a pending tool call from one account to the other.
+- A request header (`Authorization` or `x-api-key`) still takes precedence over the active account. A static `DEVIN_API_KEY` is an explicit override, and while it is set, switching is refused with a clear error. Unset `DEVIN_API_KEY` to use account switching.
+
+Management writes (saving names, switching the active account, and the model selection and test status writes) require a per-install proxy secret. Nginx adds it on the admin path, and the browser never sees it. Provisioning is in [deploy/ADMIN_HTTPS.md](deploy/ADMIN_HTTPS.md). The Codex endpoint and model discovery reads are unaffected.
+
+Account state is held in `accounts.json` in the settings volume. It stores profile names, the active id, and a revision. It never stores a token. Admin responses report only `configured`, `unconfigured`, or `invalid` for each profile.
 #### Health and live model verification
 
 On devhub, replace the placeholder with the actual private host address:

@@ -10,7 +10,7 @@
  *
  * The server holds an optional fallback token in memory. Request credentials
  * via `Authorization: Bearer <token>` or `x-api-key: <token>` take precedence.
- * The fallback can be supplied through `DEVIN_API_KEY` or `ServerOptions.token`.
+ * The fallback can be supplied through `DEVIN_API_KEY` or `ServerOptions.token`. With model selection on, the active account profile is the fallback when neither is set.
  */
 
 import { streamChat, discoverModels, discoverModelMetadata, type ChatStreamEvent } from "./devin.js";
@@ -19,6 +19,11 @@ import { getCodexModelProfile } from "./admin/codex-model-profiles.js";
 import { withResponsesBridgeInstructions } from "./responses-bridge-capability.js";
 import { ModelSelectionStore } from "./admin/model-selection-store.js";
 import { CODEX_SELECTION_PATH, createModelSelectionRoutes, managementRequestAllowed } from "./admin/routes.js";
+import { ACCOUNTS_PATH, createAccountRoutes } from "./admin/accounts-routes.js";
+import { AdminProxySecret } from "./admin/proxy-secret.js";
+import { AccountStore } from "./accounts/account-store.js";
+import { AccountRuntime, type CredentialSnapshot } from "./accounts/runtime.js";
+import { CONFIG_DIR } from "./config.js";
 import { createAdminStaticHandler } from "./admin/static.js";
 import { ModelTestStatusStore, ModelValidationTracker, returnedToolSucceeded } from "./admin/model-test-status.js";
 import { createHash } from "node:crypto";
@@ -60,11 +65,35 @@ let PORT = 3000;
 let HOST = "0.0.0.0";
 /** Optional in-memory fallback token when a request carries no credentials. */
 let DEFAULT_DEVIN_KEY = "";
+/** Accounts are on whenever model selection is on, unless DEVIN_ACCOUNTS_DISABLED=1. Shared by every entry path. */
+export function accountProfilesEnabled(selectionEnabled = process.env.DEVIN_MODEL_SELECTION_ENABLED === "1"): boolean {
+  return selectionEnabled && process.env.DEVIN_ACCOUNTS_DISABLED !== "1";
+}
+
+/** Account runtime when model selection is enabled. Undefined otherwise. */
+let ACCOUNT_RUNTIME: AccountRuntime | undefined;
+/** One credential snapshot per request, resolved at entry, so a switch cannot split a request. */
+const REQUEST_CREDENTIALS = new WeakMap<Request, CredentialSnapshot>();
 /** Base URL override for the Devin API (default: https://server.codeium.com). */
 let DEVIN_BASE_URL = "";
 const knownLogicalFamilyIds = new Set<string>();
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
+
+/** Explicit request-header token only. The fallback is applied by credentialFor. */
+function requestHeaderToken(req: Request): string {
+  const auth = req.headers.get("authorization") ?? "";
+  const bearer = auth.startsWith("Bearer ") ? auth.slice(7) : auth;
+  return bearer || (req.headers.get("x-api-key") ?? "");
+}
+
+/** Request header first, then the static fallback, then the active account profile. */
+async function credentialFor(req: Request): Promise<CredentialSnapshot> {
+  const requestToken = requestHeaderToken(req);
+  if (ACCOUNT_RUNTIME) return ACCOUNT_RUNTIME.snapshot(requestToken);
+  const token = requestToken || DEFAULT_DEVIN_KEY;
+  return { token, origin: requestToken ? "request" : token ? "static" : "none" };
+}
 
 function extractToken(req: Request): string {
   // Authorization: Bearer <token> (OpenAI) or bare <token>
@@ -72,6 +101,10 @@ function extractToken(req: Request): string {
   const bearer = auth.startsWith("Bearer ") ? auth.slice(7) : auth;
   // x-api-key: <token> (Anthropic SDK convention)
   const apiKey = req.headers.get("x-api-key") ?? "";
+  // Requests dispatched through fetch reuse the snapshot resolved at entry, which already applied
+  // the header, static fallback, and active-account precedence.
+  const snapshot = REQUEST_CREDENTIALS.get(req);
+  if (snapshot) return snapshot.token;
   // Per-request credentials override the optional DEVIN_API_KEY fallback.
   return bearer || apiKey || DEFAULT_DEVIN_KEY;
 }
@@ -180,7 +213,7 @@ interface OpenAIChatRequest {
 async function handleChatCompletions(req: Request, reqId: string, trace: ErrorTrace): Promise<Response> {
   const body = (await req.json()) as OpenAIChatRequest;
   const token = extractToken(req);
-  if (!token) return errorResponse(req, 401, "No Devin API key. Set DEVIN_API_KEY or pass Authorization: Bearer <token> / x-api-key: <token>.", "authentication_error");
+  if (!token) return errorResponse(req, 401, "No Devin API key. Sign in an account profile, set DEVIN_API_KEY, or pass Authorization: Bearer <token> / x-api-key: <token>.", "authentication_error");
 
   let modelUid: string;
   try { modelUid = await resolveRequestModel(body.model, body.reasoning_effort, token, req.signal); }
@@ -574,7 +607,7 @@ async function handleResponses(req: Request, reqId: string, trace: ErrorTrace): 
   const body = (await req.json()) as OpenAIResponsesRequest;
   const diagnostic = currentResponsesDiagnostic();
   const token = extractToken(req);
-  if (!token) return errorResponse(req, 401, "No Devin API key. Set DEVIN_API_KEY or pass Authorization: Bearer <token> / x-api-key: <token>.", "authentication_error");
+  if (!token) return errorResponse(req, 401, "No Devin API key. Sign in an account profile, set DEVIN_API_KEY, or pass Authorization: Bearer <token> / x-api-key: <token>.", "authentication_error");
 
   let messages: OpenAIMessage[];
   let tools: ChatToolDefinition[];
@@ -970,7 +1003,7 @@ interface AnthropicRequest {
 async function handleAnthropicMessages(req: Request, reqId: string, trace: ErrorTrace): Promise<Response> {
   const body = (await req.json()) as AnthropicRequest;
   const token = extractToken(req);
-  if (!token) return errorResponse(req, 401, "No Devin API key. Set DEVIN_API_KEY or pass Authorization: Bearer <token> / x-api-key: <token>.", "authentication_error");
+  if (!token) return errorResponse(req, 401, "No Devin API key. Sign in an account profile, set DEVIN_API_KEY, or pass Authorization: Bearer <token> / x-api-key: <token>.", "authentication_error");
 
   let modelUid: string;
   try { modelUid = await resolveRequestModel(body.model, undefined, token, req.signal); }
@@ -1219,7 +1252,7 @@ async function handleModels(req: Request, reqId: string, trace: ErrorTrace): Pro
 
   // Remote discovery — requires a valid token.
   const token = extractToken(req);
-  if (!token) return errorResponse(req, 401, "No Devin API key for model discovery.", "authentication_error");
+  if (!token) return errorResponse(req, 401, "No Devin API key for model discovery. Sign in an account profile, set DEVIN_API_KEY, or pass a credential.", "authentication_error");
 
   try {
     const remote = await discoverModels(token, DEVIN_BASE_URL || undefined);
@@ -1294,12 +1327,33 @@ export async function startServer(options: ServerOptions = {}): Promise<ServerHa
     throw new Error("Management public loopback port must be valid.");
   }
   const selectionStore = selectionEnabled ? new ModelSelectionStore(options.modelSelection?.directory) : undefined;
+  // Account profiles keep tokens in the auth volume and selection in the settings volume. An overlapping directory refuses startup before this point.
+  // A static fallback here is an explicit operator override; the saved login token is never one.
+  // Accounts are on whenever model selection is enabled for this server, by option or environment. DEVIN_ACCOUNTS_DISABLED=1 turns them off.
+  ACCOUNT_RUNTIME = selectionStore && accountProfilesEnabled(selectionEnabled)
+    ? new AccountRuntime(new AccountStore(selectionStore.directory, CONFIG_DIR), CONFIG_DIR, DEFAULT_DEVIN_KEY)
+    : undefined;
+  if (ACCOUNT_RUNTIME) {
+    try {
+      await ACCOUNT_RUNTIME.initialize();
+    } catch {
+      // A static DEVIN_API_KEY does not need account state, so inference still starts.
+      // Account routes report 503 until the store is repaired. Details are not logged.
+      if (!DEFAULT_DEVIN_KEY) throw new Error("Account storage is unavailable; start with DEVIN_API_KEY or repair accounts.json.");
+      log.warn("[accounts] Account storage is unavailable; continuing with the static DEVIN_API_KEY (details redacted).");
+    }
+  }
   if (selectionStore) await selectionStore.initialize();
   const testStatusStore = selectionStore ? new ModelTestStatusStore(selectionStore.directory) : undefined;
   if (testStatusStore) await testStatusStore.initialize();
   const validationTracker = testStatusStore ? new ModelValidationTracker(testStatusStore) : undefined;
+  // Management writes require the per-install proxy secret. It is created once in the settings volume.
+  const proxySecret = selectionStore ? new AdminProxySecret(selectionStore.directory) : undefined;
+  if (proxySecret) await proxySecret.initialize();
+  const accountRoutes = ACCOUNT_RUNTIME ? createAccountRoutes({ runtime: ACCOUNT_RUNTIME, configDirectory: CONFIG_DIR, proxySecret }) : undefined;
   const selectionRoutes = selectionStore ? createModelSelectionRoutes({
     store: selectionStore,
+    proxySecret,
     testStatusStore,
     discover: async (req) => {
       const token = extractToken(req);
@@ -1318,6 +1372,8 @@ export async function startServer(options: ServerOptions = {}): Promise<ServerHa
     // ceiling (255 is Bun's max) to keep SSE streams alive through quiet gaps.
     idleTimeout: 255,
     async fetch(req: Request): Promise<Response> {
+      // Resolve the credential once per request. Every later read in this request uses this snapshot.
+      if (!REQUEST_CREDENTIALS.has(req)) REQUEST_CREDENTIALS.set(req, await credentialFor(req));
       const url = new URL(req.url);
       const method = req.method;
       const path = url.pathname;
@@ -1354,7 +1410,9 @@ export async function startServer(options: ServerOptions = {}): Promise<ServerHa
           req.headers.get("cookie"),
         ]);
       } else {
-        trace.setToken(extractToken(req));
+        // Account-origin tokens never enter the trace, not even masked. Only the origin label is recorded.
+        const credentialOrigin = REQUEST_CREDENTIALS.get(req)?.origin;
+        trace.setToken(credentialOrigin === "account" ? "" : extractToken(req));
         const headers: Record<string, string> = {};
         req.headers.forEach((v, k) => { headers[k] = v; });
         trace.setRequestHeaders(headers);
@@ -1376,9 +1434,11 @@ export async function startServer(options: ServerOptions = {}): Promise<ServerHa
         // upstream events via currentTrace().
         const dispatch = () => runTraceAsync(trace, async () => {
           if (path === "/health" && method === "GET") {
+            const accountReady = ACCOUNT_RUNTIME ? await ACCOUNT_RUNTIME.activeTokenConfigured() : false;
             return jsonResponse(req, {
               status: "ok",
-              fallback_token: DEFAULT_DEVIN_KEY ? "set" : "not_set",
+              // "set" means inference has a credential: a static key or a configured active account. Never the token.
+              fallback_token: DEFAULT_DEVIN_KEY || accountReady ? "set" : "not_set",
               collapse_system_enabled: process.env.DEVIN_CODEX_DESKTOP_COLLAPSE_SYSTEM === "1",
             });
           } else if (path === "/v1/models" && method === "GET") {
@@ -1452,6 +1512,9 @@ export async function startServer(options: ServerOptions = {}): Promise<ServerHa
           if (!managementRequestAllowed(req, adminServer!.port!, adminPublicPort)) {
             return Response.json({ error: { code: "management_origin_rejected", message: "Management Host/Origin check failed." } }, { status: 403 });
           }
+          // Resolve credentials only after the origin check, so rejected requests never read the token file.
+          if (!REQUEST_CREDENTIALS.has(req)) REQUEST_CREDENTIALS.set(req, await credentialFor(req));
+          if (new URL(req.url).pathname === ACCOUNTS_PATH && accountRoutes) return accountRoutes.handle(req);
           return await staticPage(req) ?? selectionRoutes.admin(req);
         },
       });
@@ -1483,7 +1546,7 @@ export async function startServer(options: ServerOptions = {}): Promise<ServerHa
   console.log(`  Health:    GET  /health`);
   console.log(DEFAULT_DEVIN_KEY
     ? "  Fallback:  configured (used when a request sends no credentials)"
-    : "  Fallback:  none — each request must send Authorization / x-api-key");
+    : ACCOUNT_RUNTIME ? "  Fallback:  active account profile (used when a request sends no credentials)" : "  Fallback:  none — each request must send Authorization / x-api-key");
   if (log.debugMode) {
     console.log(`  Debug:     ON — verbose logs tee'd to ${log.filePath}`);
   } else {

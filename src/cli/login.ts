@@ -3,17 +3,24 @@
  * devin-gateway login CLI.
  *
  * Runs the Devin OAuth PKCE flow on a local callback server, then saves the
- * token to ~/.devin-gateway/token (or $DEVIN_GATEWAY_CONFIG_DIR/token).
+ * token for one account profile:
+ *   personal (default) -> $DEVIN_GATEWAY_CONFIG_DIR/token (legacy file)
+ *   team               -> $DEVIN_GATEWAY_CONFIG_DIR/accounts/team/token
+ * The config directory defaults to ~/.devin-gateway.
  *
  * Runtime: works under both Node.js (>=20) and Bun — uses only `node:http`,
  * `node:readline`, `node:child_process`, and the Web Crypto/fetch globals.
  *
  * Usage:
- *   devin-gateway login              # interactive — opens browser
- *   devin-gateway login --paste      # paste redirect URL manually
- *   devin-gateway login --print      # print token only, don't save
- *   devin-gateway login --no-display-token # save token without printing it
- *   devin-gateway login --status     # show current saved token status
+ *   devin-gateway login                      # interactive — opens browser (personal)
+ *   devin-gateway login --profile team       # interactive — sign in the team profile
+ *   devin-gateway login --paste              # paste redirect URL manually
+ *   devin-gateway login --print              # print token only, don't save (not with --profile)
+ *   devin-gateway login --no-display-token   # save token without printing it
+ *   devin-gateway login --replace            # overwrite an existing sign-in for the target profile
+ *   devin-gateway login --status             # profile name, credential state, and token file path
+ *
+ * Profile logins never print the token.
  *
  * Also runnable directly:
  *   bun run src/cli/login.ts
@@ -23,7 +30,18 @@ import { exec } from "node:child_process";
 import { createServer, type Server } from "node:http";
 import { createInterface } from "node:readline";
 import { startLoginFlow, completeLoginWithUrl, exchangeToken, TOKEN_EXCHANGE_TIMEOUT_MS } from "../login.js";
-import { readToken, writeToken, TOKEN_FILE } from "../config.js";
+import { CONFIG_DIR } from "../config.js";
+import { AccountStore, defaultProfileName } from "../accounts/account-store.js";
+import {
+  ACCOUNT_PROFILE_IDS,
+  isAccountProfileId,
+  profileCredentialState,
+  profileTokenPath,
+  writeProfileCredential,
+  type AccountProfileId,
+  type CredentialState,
+} from "../accounts/profiles.js";
+import { defaultSettingsDirectory } from "../admin/model-selection-store.js";
 import { normalizedErrorMessage } from "../responses-diagnostics.js";
 
 const CALLBACK_PORT = 59653;
@@ -31,23 +49,30 @@ const CALLBACK_PATH = "/callback";
 const TIMEOUT_MS = 5 * 60 * 1000;
 
 export async function runLogin(argv: string[]): Promise<void> {
-  const pasteMode = argv.includes("--paste");
-  const printOnly = argv.includes("--print");
-  const hideToken = argv.includes("--no-display-token");
-  const statusMode = argv.includes("--status");
+  const parsed = parseLoginArguments(argv);
+  if (!parsed.ok) {
+    console.error(parsed.message);
+    process.exit(1);
+  }
+  const options = parsed.options;
+  const pasteMode = options.paste;
+  const printOnly = options.print;
+  const profile = options.profile;
 
   // ─── Status ──────────────────────────────────────────────────────────────────
-  if (statusMode) {
-    const token = await readToken();
-    if (token) {
-      console.log(`Token file: ${TOKEN_FILE}`);
-      console.log(`Token:      ${token.slice(0, 20)}...${token.slice(-8)}`);
-      console.log(`Length:     ${token.length}`);
-    } else {
-      console.log(`No token found at ${TOKEN_FILE}`);
-      console.log("Run `devin-gateway login` to login.");
-    }
+  if (options.status) {
+    await printProfileStatus(profile);
     return;
+  }
+
+  // ─── Replace guard ───────────────────────────────────────────────────────────
+  // --print saves nothing, so only a save is refused.
+  if (!printOnly) {
+    const refusal = await existingSignInRefusal(CONFIG_DIR, profile, { replace: options.replace });
+    if (refusal !== undefined) {
+      console.error(refusal);
+      process.exit(1);
+    }
   }
 
   // ─── Login flow ──────────────────────────────────────────────────────────────
@@ -79,7 +104,7 @@ export async function runLogin(argv: string[]): Promise<void> {
     try {
       console.log(`  Callback received. Contacting Devin to exchange the code (${TOKEN_EXCHANGE_TIMEOUT_MS / 1000}s timeout)...`);
       const token = await completeLoginWithUrl(session, input.trim());
-      await finishLogin(token, printOnly, hideToken);
+      await finishLogin(token, options);
     } catch (err) {
       console.error(`Login failed: ${String((err as Error).message ?? err)}`);
       process.exit(1);
@@ -116,7 +141,7 @@ export async function runLogin(argv: string[]): Promise<void> {
 
     try {
       const t = await token;
-      await finishLogin(t, printOnly, hideToken);
+      await finishLogin(t, options);
     } catch (err) {
       console.error(`Login failed: ${String((err as Error).message ?? err)}`);
       process.exit(1);
@@ -126,25 +151,137 @@ export async function runLogin(argv: string[]): Promise<void> {
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
-export function getLoginCompletionLines(token: string, printOnly: boolean, hideToken: boolean): string[] {
-  if (printOnly) return hideToken ? [] : [token];
+export interface LoginOptions {
+  paste: boolean;
+  print: boolean;
+  hideToken: boolean;
+  status: boolean;
+  replace: boolean;
+  profile: AccountProfileId;
+  /** True only when --profile was given. A profile login never displays the token. */
+  profileRequested: boolean;
+}
 
-  const lines = [
-    "  ✅ Login successful!",
-    "",
-    `  Token saved to: ${TOKEN_FILE}`,
-    "",
-  ];
-  if (!hideToken) {
-    lines.push("  Token (copy to your client's API key field):", `  ${token}`, "");
+export type LoginArgumentResult = { ok: true; options: LoginOptions } | { ok: false; message: string };
+
+/**
+ * Parses login CLI arguments with no side effects. Unknown arguments are ignored,
+ * as before. The invalid-value message lists the valid ids and does not echo the value.
+ */
+export function parseLoginArguments(argv: readonly string[]): LoginArgumentResult {
+  const validIds = ACCOUNT_PROFILE_IDS.join(", ");
+  let profile: AccountProfileId = "personal";
+  let profileRequested = false;
+  for (let index = 0; index < argv.length; index++) {
+    const arg = argv[index] ?? "";
+    if (arg !== "--profile" && !arg.startsWith("--profile=")) continue;
+    if (profileRequested) return { ok: false, message: "--profile may be given only once." };
+    profileRequested = true;
+    const value: string | undefined = arg === "--profile" ? argv[++index] : arg.slice("--profile=".length);
+    if (value === undefined) return { ok: false, message: `Missing value for --profile. Valid profiles: ${validIds}.` };
+    if (!isAccountProfileId(value)) return { ok: false, message: `Invalid --profile value. Valid profiles: ${validIds}.` };
+    profile = value;
+  }
+  if (profileRequested && argv.includes("--print")) {
+    return { ok: false, message: "--print cannot be combined with --profile; profile tokens are never printed." };
+  }
+  return {
+    ok: true,
+    options: {
+      paste: argv.includes("--paste"),
+      print: argv.includes("--print"),
+      hideToken: argv.includes("--no-display-token") || profileRequested,
+      status: argv.includes("--status"),
+      replace: argv.includes("--replace"),
+      profile,
+      profileRequested,
+    },
+  };
+}
+
+/** Lines printed after a successful login. Pass `profile` only for an explicit --profile login. */
+export function getLoginCompletionLines(
+  token: string,
+  printOnly: boolean,
+  hideToken: boolean,
+  profile?: AccountProfileId,
+): string[] {
+  if (printOnly) return profile === undefined && !hideToken ? [token] : [];
+
+  const lines = ["  ✅ Login successful!", ""];
+  if (profile === undefined) {
+    lines.push(`  Token saved to: ${profileTokenPath(CONFIG_DIR, "personal")}`, "");
+    if (!hideToken) lines.push("  Token (copy to your client's API key field):", `  ${token}`, "");
+  } else {
+    lines.push(`  Profile: ${profile}`, `  Token saved to: ${profileTokenPath(CONFIG_DIR, profile)}`, "");
   }
   lines.push("  Start the gateway and point your client at it:", "    bun run src/index.ts", "");
   return lines;
 }
 
-async function finishLogin(token: string, printOnly: boolean, hideToken: boolean): Promise<void> {
-  if (!printOnly) await writeToken(token);
-  for (const line of getLoginCompletionLines(token, printOnly, hideToken)) console.log(line);
+async function finishLogin(token: string, options: LoginOptions): Promise<void> {
+  if (!options.print) {
+    try {
+      await writeProfileCredential(CONFIG_DIR, options.profile, token, { replace: options.replace });
+    } catch (error) {
+      if ((error as Error).message === "profile_already_enrolled") throw new Error(alreadySignedInMessage(options.profile));
+      throw error;
+    }
+  }
+  const profile = options.profileRequested ? options.profile : undefined;
+  for (const line of getLoginCompletionLines(token, options.print, options.hideToken, profile)) console.log(line);
+}
+
+async function printProfileStatus(profile: AccountProfileId): Promise<void> {
+  const lines = profileStatusLines({
+    profile,
+    name: await profileDisplayName(profile),
+    state: await profileCredentialState(CONFIG_DIR, profile),
+    tokenFile: profileTokenPath(CONFIG_DIR, profile),
+  });
+  for (const line of lines) console.log(line);
+}
+
+/** Status lines name the profile, its credential state, and its token file. They never include token text. */
+export function profileStatusLines(status: {
+  profile: AccountProfileId;
+  name: string;
+  state: CredentialState;
+  tokenFile: string;
+}): string[] {
+  return [
+    `Profile:    ${status.name} (${status.profile})`,
+    `Credential: ${status.state}`,
+    `Token file: ${status.tokenFile}`,
+  ];
+}
+
+/** The name from accounts.json when it can be read, otherwise the default name. Read-only. */
+async function profileDisplayName(profile: AccountProfileId): Promise<string> {
+  try {
+    const selection = await new AccountStore(defaultSettingsDirectory(), CONFIG_DIR).read();
+    return selection.profiles.find((entry) => entry.id === profile)?.name ?? defaultProfileName(profile);
+  } catch {
+    return defaultProfileName(profile);
+  }
+}
+
+function alreadySignedInMessage(profile: AccountProfileId): string {
+  const command =
+    profile === "personal" ? "devin-gateway login --replace" : `devin-gateway login --profile ${profile} --replace`;
+  return `Profile "${profile}" already has a saved sign-in, which was left unchanged. Re-run with --replace to overwrite it: ${command}`;
+}
+
+/** Returns the refusal message when a save would overwrite a configured profile without --replace. */
+export async function existingSignInRefusal(
+  configDirectory: string,
+  profile: AccountProfileId,
+  options: { replace: boolean },
+): Promise<string | undefined> {
+  if (options.replace) return undefined;
+  return (await profileCredentialState(configDirectory, profile)) === "configured"
+    ? alreadySignedInMessage(profile)
+    : undefined;
 }
 
 function startCallbackServer(session: {

@@ -6,12 +6,14 @@ import { getModelPageWindow } from "./model-pagination.js";
 import { ModelRow } from "./ModelRow.js";
 import { RoleAssignments } from "./RoleAssignments.js";
 import { ConfigurationZone } from "./ConfigurationZone.js";
+import { AccountsZone } from "./AccountsZone.js";
+import type { AccountsApi } from "./accounts.js";
 import { usePickerViewport } from "./usePickerViewport.js";
 import { orderFamilyVariants } from "./effort-order.js";
 import { allDiscoveredEnabled, bulkSelection, createDraft, draftErrors, draftsEqual, matchingModels, type ModelSelection, type Snapshot } from "./state.js";
 
 const defaultApi = createPickerApi();
-export function ModelPicker({ api = defaultApi }: { api?: PickerApi }) {
+export function ModelPicker({ api = defaultApi, accountsApi }: { api?: PickerApi; accountsApi?: AccountsApi }) {
   const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
   const [draft, setDraft] = useState<ModelSelection | null>(null);
   const [query, setQuery] = useState("");
@@ -128,6 +130,7 @@ export function ModelPicker({ api = defaultApi }: { api?: PickerApi }) {
       <p className="intro">Curate the gateway selection and choose its model roles. Changes stay in this draft until you save.</p>
       <div className="feedback" role="status" aria-live="polite" aria-atomic="true">{status}</div>
       {error ? <div className="error" role="alert"><p>{error}</p>{conflict || !snapshot ? <button type="button" disabled={busy} onClick={() => void load()}>{conflict ? "Reload latest (discard draft)" : "Retry loading"}</button> : null}</div> : null}
+      {accountsApi ? <AccountsZone api={accountsApi} /> : null}
       {snapshot && draft ? <>
         <fieldset className="edit-controls" disabled={busy}>
           <ConfigurationZone models={snapshot.models} draft={draft}>

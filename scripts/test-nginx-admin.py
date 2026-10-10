@@ -23,7 +23,7 @@ import time
 
 HOST = "devin-admin.dev.kryptxt.ca"
 ROUTES = ["/admin/", "/admin/api/models", "/admin/api/model-selection",
-          "/admin/api/model-test-status", "/admin/assets/model-picker.js",
+          "/admin/api/model-test-status", "/admin/api/accounts", "/admin/assets/model-picker.js",
           "/admin/assets/model-picker.css", "/admin/assets/third-party-notices.txt"]
 
 
@@ -63,6 +63,8 @@ def security_checks(port, authorization, address="127.0.0.1"):
             print("selection_revision=" + str(json.loads(body)["revision"]))
         if path.endswith("model-test-status") and address != "127.0.0.1":
             print("test_status_revision=" + str(json.loads(body)["revision"]))
+        if path.endswith("/accounts") and address != "127.0.0.1":
+            print("accounts_revision=" + str(json.loads(body)["revision"]))
     for headers in [{"Host": HOST + ":443"}, {"Origin": "https://foreign.example"},
                     {"Sec-Fetch-Site": "cross-site"}]:
         assert request(port, "/admin/", {**auth, **headers}, address)[0] == 403
