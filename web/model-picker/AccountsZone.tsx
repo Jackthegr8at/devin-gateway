@@ -209,19 +209,37 @@ export function AccountsZone({ api }: { api: AccountsApi }) {
   </section>;
 }
 
-/** Inline confirmation for an account switch. Cancel is focused first, because the change can reach a running task. */
+/** Centered modal confirmation for an account switch. Cancel is focused first, because the change can reach a running task. */
 function SwitchConfirmation({ target, onConfirm, onCancel }: { target: string; onConfirm: () => void; onCancel: () => void }) {
   const cancelRef = useRef<HTMLButtonElement>(null);
+  const dialogRef = useRef<HTMLDivElement>(null);
   useEffect(() => { cancelRef.current?.focus(); }, []);
-  function onKeyDown(event: KeyboardEvent<HTMLDivElement>) {
-    if (event.key === "Escape") { event.stopPropagation(); onCancel(); }
-  }
-  return <div className="account-confirm" role="alertdialog" aria-modal="false" aria-labelledby="account-confirm-title" aria-describedby="account-confirm-text" onKeyDown={onKeyDown}>
-    <h3 id="account-confirm-title">Switch to {target}?</h3>
-    <p id="account-confirm-text">Changing the active Devin account affects subsequent gateway requests, potentially including requests from a Codex task already in progress. Switch accounts between tasks whenever possible.</p>
-    <div className="account-confirm-actions">
-      <button type="button" ref={cancelRef} onClick={onCancel}>Cancel</button>
-      <button type="button" onClick={onConfirm}>Switch to {target}</button>
+  // The key listener sits on the document in the capture phase, so Escape still cancels and Tab still cycles even if focus leaves the dialog, and neither reaches the parent picker.
+  useEffect(() => {
+    function onKey(event: globalThis.KeyboardEvent) {
+      if (event.key === "Escape") { event.stopPropagation(); onCancel(); return; }
+      if (event.key !== "Tab") return;
+      const dialog = dialogRef.current;
+      if (!dialog) return;
+      const buttons = [...dialog.querySelectorAll<HTMLElement>("button")].filter((node) => !node.hasAttribute("disabled"));
+      if (buttons.length === 0) return;
+      const first = buttons[0];
+      const last = buttons[buttons.length - 1];
+      const active = document.activeElement;
+      if (event.shiftKey && (active === first || !dialog.contains(active))) { event.preventDefault(); last.focus(); }
+      else if (!event.shiftKey && (active === last || !dialog.contains(active))) { event.preventDefault(); first.focus(); }
+    }
+    document.addEventListener("keydown", onKey, true);
+    return () => document.removeEventListener("keydown", onKey, true);
+  }, [onCancel]);
+  return <div className="account-confirm-overlay">
+    <div className="account-confirm" role="alertdialog" aria-modal="true" aria-labelledby="account-confirm-title" aria-describedby="account-confirm-text" ref={dialogRef}>
+      <h3 id="account-confirm-title">Switch to {target}?</h3>
+      <p id="account-confirm-text">Changing the active Devin account affects subsequent gateway requests, potentially including requests from a Codex task already in progress. Switch accounts between tasks whenever possible.</p>
+      <div className="account-confirm-actions">
+        <button type="button" ref={cancelRef} onClick={onCancel}>Cancel</button>
+        <button type="button" onClick={onConfirm}>Switch to {target}</button>
+      </div>
     </div>
   </div>;
 }
