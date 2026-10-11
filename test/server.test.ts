@@ -16,6 +16,41 @@ const HOST = "127.0.0.1";
 const DEVIN_AUTH_PATH = "/exa.auth_pb.AuthService/GetUserJwt";
 const CHAT_MESSAGE_PATH = "/exa.api_server_pb.ApiServerService/GetChatMessage";
 
+describe("Responses upstream termination", () => {
+  for (const model of ["swe-2-high", "glm-5-3-flash-low"]) {
+    for (const stream of [false, true]) {
+      for (const stopReason of [0, 3, 10]) {
+        test(`${model} stream=${stream} stopReason=${stopReason}`, async () => {
+          const tool = stopReason === 10;
+          const upstream = startUpstream({ chatBody: () => framesBody([connectFrame(0, chatResponsePayload({
+            text: tool ? undefined : "Synthetic response",
+            stopReason,
+            toolCalls: tool ? [{ id: "synthetic-termination-call", name: "exec_command", argumentsJson: '{"cmd":"synthetic"}' }] : undefined,
+          }))]) });
+          const gateway = await startGateway(upstream.url.origin, "synthetic-key");
+          try {
+            const res = await fetch(`${gateway.url}/v1/responses`, {
+              method: "POST", headers: { "content-type": "application/json" },
+              body: JSON.stringify({ model, stream, input: "Synthetic input", tools: [{ type: "function", name: "exec_command", parameters: { type: "object" } }] }),
+            });
+            expect(res.status).toBe(200);
+            const raw = await res.text();
+            const events = stream ? raw.split("\n").filter(line => line.startsWith("data: ")).map(line => JSON.parse(line.slice(6))) : [];
+            const terminal = stream ? events.find(e => e.type === "response.completed" || e.type === "response.incomplete")?.response : JSON.parse(raw);
+            expect(terminal?.status).toBe(stopReason === 3 ? "incomplete" : "completed");
+            if (stopReason === 3) {
+              expect(terminal.incomplete_details).toEqual({ reason: "max_output_tokens" });
+              expect(terminal.output[0].status).toBe("incomplete");
+              expect(events.some(e => e.type === "response.completed")).toBe(false);
+            } else expect(terminal.incomplete_details).toBeUndefined();
+            if (tool) expect(terminal.output).toMatchObject([{ type: "function_call", call_id: "synthetic-termination-call", status: "completed", name: "exec_command" }]);
+          } finally { await gateway.cleanup(); await upstream.stop(); }
+        });
+      }
+    }
+  }
+});
+
 // ─── protobuf encoders (mirror test/models-source-selection.test.ts) ─────────
 
 function encodeVarint(value: number): number[] {

@@ -2,7 +2,7 @@ import { appendFileSync, mkdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { AsyncLocalStorage } from "node:async_hooks";
-import { ProtoDecoder } from "./proto.js";
+import { ProtoDecoder, StopReason } from "./proto.js";
 import type { OpenAIMessage } from "./convert.js";
 
 export const RESPONSES_SAFE_DIAGNOSTICS_ENV = "DEVIN_RESPONSES_SAFE_DIAGNOSTICS";
@@ -111,6 +111,8 @@ export interface ResponsesSafeDiagnosticRecord {
   upstream_event_types: string[];
   tool_calls: Array<{ name: string }>;
   upstream_terminal_status?: string;
+  upstream_stop_reason?: number;
+  responses_terminal_status?: "completed" | "incomplete" | "failed";
   upstream_error_code?: string;
   connect_error_code?: string;
   connect_error_message?: string;
@@ -157,6 +159,8 @@ export const RESPONSES_SAFE_DIAGNOSTIC_FIELDS = [
   "upstream_event_types",
   "tool_calls",
   "upstream_terminal_status",
+  "upstream_stop_reason",
+  "responses_terminal_status",
   "upstream_error_code",
   "connect_error_code",
   "connect_error_message",
@@ -588,6 +592,7 @@ export class ResponsesSafeDiagnostic {
     message?: unknown;
     terminalStatus?: string;
   }): void {
+    this.record.responses_terminal_status = "failed";
     this.record.response_failed_source = identifier(options.source) ?? "gateway_internal_error";
     this.record.failure_classification = options.classification
       ?? this.record.failure_classification
@@ -601,8 +606,16 @@ export class ResponsesSafeDiagnostic {
   }
 
   recordSuccessfulCompletion(): void {
+    if (this.record.responses_terminal_status === "incomplete") return;
+    this.record.responses_terminal_status = "completed";
     if (!this.record.upstream_terminal_status) this.record.upstream_terminal_status = "completed";
     this.record.response_failed_source = "none";
+  }
+
+  recordResponsesTermination(stopReason: number): void {
+    if (!Number.isSafeInteger(stopReason) || stopReason < 0 || stopReason > 0xffffffff) return;
+    this.record.upstream_stop_reason = stopReason;
+    this.record.responses_terminal_status = stopReason === StopReason.MAX_TOKENS ? "incomplete" : "completed";
   }
 
   finalizeIfNotDeferred(): boolean {

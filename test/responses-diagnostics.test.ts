@@ -2,6 +2,24 @@ import { expect, test } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+
+test("numeric stop reasons and Responses terminal status are safe; incomplete is not success", () => {
+  const root = mkdtempSync(join(tmpdir(), "synthetic-stop-diagnostics-"));
+  try {
+    for (const reason of [0, 3, 10]) {
+      const path = join(root, `${reason}.jsonl`);
+      const d = new ResponsesSafeDiagnostic("synthetic-stop", Date.now(), path);
+      d.recordUpstreamEvent("toolcall"); d.recordResponsesToolCallEmitted();
+      d.recordUpstreamComplete(); d.recordResponsesTermination(reason); d.recordSuccessfulCompletion(); d.finalize();
+      const record = JSON.parse(readFileSync(path, "utf8"));
+      expect(record).toMatchObject({ upstream_stop_reason: reason, responses_terminal_status: reason === 3 ? "incomplete" : "completed", upstream_toolcall_event_count: 1, responses_tool_call_emitted_count: 1 });
+      expect(record.response_failed_source).toBe(reason === 3 ? undefined : "none");
+    }
+    const path = join(root, "invalid.jsonl"); const d = new ResponsesSafeDiagnostic("synthetic-invalid-stop", Date.now(), path);
+    for (const reason of [NaN, Infinity, -1, 0.5, 0x100000000]) d.recordResponsesTermination(reason);
+    d.finalize(); expect(JSON.parse(readFileSync(path, "utf8")).upstream_stop_reason).toBeUndefined();
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
 import { ProtoEncoder } from "../src/proto.ts";
 import {
   ResponsesSafeDiagnostic,

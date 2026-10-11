@@ -692,6 +692,7 @@ async function handleResponses(req: Request, reqId: string, trace: ErrorTrace): 
   try {
     let text = "";
     const toolCallState: ResponsesToolCallAccumulator = { calls: new Map(), sawUnidentifiedDelta: false };
+    let stopReason = StopReason.UNSPECIFIED as number;
     let usage: { inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheWriteTokens: number } | null = null;
 
     for await (const ev of streamChat({
@@ -708,9 +709,12 @@ async function handleResponses(req: Request, reqId: string, trace: ErrorTrace): 
         }
       }
       else if (ev.type === "usage" && ev.usage) usage = ev.usage;
+      else if (ev.type === "done") stopReason = ev.stopReason ?? StopReason.UNSPECIFIED;
       else if (ev.type === "error") throw Object.assign(new Error(ev.error), { code: ev.code });
     }
     diagnostic?.recordUpstreamComplete();
+    diagnostic?.recordResponsesTermination(stopReason);
+    const status = stopReason === StopReason.MAX_TOKENS ? "incomplete" : "completed";
 
     const toolCalls = finishResponsesToolCalls(toolCallState, declaredTools, diagnostic);
     for (const call of toolCalls.values()) diagnostic?.recordNormalizedEmittedToolCall(call);
@@ -719,7 +723,7 @@ async function handleResponses(req: Request, reqId: string, trace: ErrorTrace): 
       output.push({
         type: "message",
         id: `msg_${crypto.randomUUID().replace(/-/g, "").slice(0, 24)}`,
-        status: "completed",
+        status,
         role: "assistant",
         content: [{ type: "output_text", text }],
       });
@@ -734,7 +738,8 @@ async function handleResponses(req: Request, reqId: string, trace: ErrorTrace): 
       object: "response",
       created_at: created,
       model: body.model,
-      status: "completed",
+      status,
+      ...(status === "incomplete" ? { incomplete_details: { reason: "max_output_tokens" } } : {}),
       output,
       usage: usage ? {
         input_tokens: usage.inputTokens,
@@ -800,6 +805,7 @@ function streamOpenAIResponses(
         let reasoningStarted = false;
         let messageStarted = false;
         let fullText = "";
+        let stopReason = StopReason.UNSPECIFIED as number;
         let outputIndex = 0;
         const outputItems: unknown[] = [];
         const toolCallState: ResponsesToolCallAccumulator = { calls: new Map(), sawUnidentifiedDelta: false };
@@ -871,9 +877,13 @@ function streamOpenAIResponses(
             }
           } else if (ev.type === "error") {
             throw Object.assign(new Error(ev.error), { code: ev.code });
+          } else if (ev.type === "done") {
+            stopReason = ev.stopReason ?? StopReason.UNSPECIFIED;
           }
         }
         diagnostic?.recordUpstreamComplete();
+        diagnostic?.recordResponsesTermination(stopReason);
+        const status = stopReason === StopReason.MAX_TOKENS ? "incomplete" : "completed";
         slog(`done — upstream chunks: ${upstreamChunks}`);
         const toolCalls = finishResponsesToolCalls(toolCallState, declaredTools, diagnostic);
         for (const call of toolCalls.values()) diagnostic?.recordNormalizedEmittedToolCall(call);
@@ -897,9 +907,9 @@ function streamOpenAIResponses(
           send("response.output_item.done", {
             type: "response.output_item.done",
             output_index: outputIndex,
-            item: { type: "message", id: messageId, status: "completed", role: "assistant", content: [{ type: "output_text", text: fullText }] },
+            item: { type: "message", id: messageId, status, role: "assistant", content: [{ type: "output_text", text: fullText }] },
           });
-          outputItems.push({ type: "message", id: messageId, status: "completed", role: "assistant", content: [{ type: "output_text", text: fullText }] });
+          outputItems.push({ type: "message", id: messageId, status, role: "assistant", content: [{ type: "output_text", text: fullText }] });
           outputIndex++;
         }
 
@@ -932,10 +942,11 @@ function streamOpenAIResponses(
           diagnostic?.recordResponsesToolCallEmitted();
         }
 
-        send("response.completed", {
-          type: "response.completed",
+        send(`response.${status}`, {
+          type: `response.${status}`,
           response: {
-            id: responseId, object: "response", created_at: created, model: modelId, status: "completed", output: outputItems,
+            id: responseId, object: "response", created_at: created, model: modelId, status, output: outputItems,
+            ...(status === "incomplete" ? { incomplete_details: { reason: "max_output_tokens" } } : {}),
             usage: usage ? {
               input_tokens: usage.inputTokens,
               output_tokens: usage.outputTokens,
