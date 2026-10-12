@@ -212,6 +212,47 @@ function parseSse(text: string): SseEvent[] {
 
 describe("opt-in SWE marker continuation", () => {
   const flag = "DEVIN_SWE_AUTONOMOUS_CONTINUATION";
+  test("native approval reviewer preserves its output contract without agent guidance (JSON and stream)", async () => {
+    const previous = process.env[flag]; process.env[flag] = "1";
+    const requests: string[] = [];
+    const assessment = '{"risk_level":"high","user_authorization":"low","outcome":"deny"}';
+    const upstream = startUpstream({
+      captureChat: async req => {
+        const frame = new Uint8Array(await req.arrayBuffer());
+        requests.push(new TextDecoder().decode(frame[0] === 1 ? gunzipSync(frame.slice(5)) : frame.slice(5)));
+      },
+      chatBody: () => framesBody([dataFrame({ text: assessment, stopReason: 2 })]),
+    });
+    const gateway = await startGateway(upstream.url.origin, "synthetic-token");
+    try {
+      for (const stream of [false, true]) {
+        const result = await fetch(`${gateway.url}/v1/responses`, {
+          method: "POST", headers: { "content-type": "application/json", "x-codex-guardian": "reviewer" },
+          body: JSON.stringify({ model: "swe-2-medium", stream, instructions: "Synthetic native risk policy", input: "Synthetic review" }),
+        });
+        expect(result.status).toBe(200);
+        const response = stream ? parseSse(await result.text()).map(e => JSON.parse(e.data)).find(e => e.type === "response.completed")!.response : await result.json();
+        expect(response.status).toBe("completed");
+        expect(response.end_turn).toBeUndefined();
+        expect(response.output.find((x: any) => x.type === "message").content[0].text).toBe(assessment);
+        expect(requests.at(-1)).toContain("Synthetic native risk policy");
+        expect(requests.at(-1)).not.toContain("[PROCESS_DONE]");
+        expect(requests.at(-1)).not.toContain("Gateway SWE autonomy supplement");
+        expect(requests.at(-1)).not.toContain("Gateway Responses bridge capability");
+      }
+      for (const value of ["agent", "Reviewer", "reviewer-extra"]) {
+        const result = await fetch(`${gateway.url}/v1/responses`, {
+          method: "POST", headers: { "content-type": "application/json", "x-codex-guardian": value },
+          body: JSON.stringify({ model: "swe-2-medium", input: "Synthetic task" }),
+        });
+        expect((await result.json()).end_turn).toBe(false);
+        expect(requests.at(-1)).toContain("[PROCESS_DONE]");
+      }
+    } finally {
+      await gateway.cleanup(); await upstream.stop();
+      if (previous === undefined) delete process.env[flag]; else process.env[flag] = previous;
+    }
+  });
   test("client cancellation aborts upstream and does not start another request", async () => {
     const previous = process.env[flag]; process.env[flag] = "1";
     let aborted = false; let requests = 0;

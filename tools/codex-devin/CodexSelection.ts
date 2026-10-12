@@ -291,6 +291,7 @@ export function generateSelection(input: unknown, runtimeVersion: string, runtim
   const record = dependencies.runtimeRecord ?? loadRuntimeInstructionRecord();
   const instructions = extractRuntimeInstructions(runtimeVersion, runtimePath, dependencies.runRuntime, record);
   const metadata = record.modelMetadata;
+  const reviewerModel = selection.models.find(model => model.id === "swe-2" && model.routing.medium === "swe-2-medium");
   const models = selection.models.map((model, index) => ({
     slug: model.id,
     multi_agent_version: metadata.multi_agent_version,
@@ -308,7 +309,17 @@ export function generateSelection(input: unknown, runtimeVersion: string, runtim
     context_window: model.contextWindow,
     max_context_window: model.contextWindow,
     base_instructions: instructions,
+    ...(model === reviewerModel ? { auto_review_model_override: "swe-2-medium" } : {}),
   }));
+  if (reviewerModel) {
+    // A hidden concrete preset prevents review effort from falling back to the
+    // parent's High/Max. It is derived only from enabled, validated Medium data.
+    const parent = models.find(model => model.slug === reviewerModel.id)!;
+    models.push({ ...parent, slug: "swe-2-medium", display_name: "SWE-2 approval reviewer",
+      visibility: "hide", priority: models.length, default_reasoning_level: "medium",
+      supported_reasoning_levels: reviewerModel.supportedReasoningEfforts.filter(row => row.effort === "medium"),
+    });
+  }
   const catalogText = JSON.stringify({ models }, null, 2) + "\n";
   probeGeneratedCatalog(runtimePath, models, selection.roles, dependencies.runRuntime ?? runBundledRuntimeCatalog);
   return { schemaVersion: 1, runtimeVersion, compatibilityContractVersion: COMPATIBILITY_CONTRACT_VERSION,

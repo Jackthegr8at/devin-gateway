@@ -644,9 +644,12 @@ async function handleResponses(req: Request, reqId: string, trace: ErrorTrace): 
   const originalPrompts = toDevinPrompts(internal, cascadeId);
   const originalSystemPrompt = extractSystemPrompt(messages);
   // Keep native instructions intact; append gateway guidance after wire routing.
-  const sweContinuationEnabled = process.env[SWE_AUTONOMOUS_CONTINUATION_ENV] === "1";
+  // Codex 0.162's native approval reviewer sets this exact protocol header.
+  // This is request classification, not authentication or approval authority.
+  const approvalReviewer = req.headers.get("x-codex-guardian") === "reviewer";
+  const sweContinuationEnabled = !approvalReviewer && process.env[SWE_AUTONOMOUS_CONTINUATION_ENV] === "1";
   const effectiveSystemPrompt = withSweCompletionInstruction(
-    withResponsesBridgeInstructions(originalSystemPrompt, modelUid), modelUid, sweContinuationEnabled,
+    approvalReviewer ? originalSystemPrompt : withResponsesBridgeInstructions(originalSystemPrompt, modelUid), modelUid, sweContinuationEnabled,
   );
   const collapseRequested = isCodexDesktopSystemCollapseRequest({
     featureFlag: process.env[CODEX_DESKTOP_SYSTEM_COLLAPSE_ENV],
