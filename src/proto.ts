@@ -207,6 +207,7 @@ export const ChatMessageSource = {
 
 export const StopReason = {
   UNSPECIFIED: 0,
+  STOP_PATTERN: 2,
   MAX_TOKENS: 3,
   FUNCTION_CALL: 10,
 } as const;

@@ -11,6 +11,7 @@ import { familyFixture, familyPayload } from "./fixtures/model-families.ts";
 import { incomingCatalog } from "./fixtures/tool-catalog.ts";
 import { responsesToolsetToDevin } from "../src/convert.ts";
 import { withResponsesBridgeInstructions } from "../src/responses-bridge-capability.ts";
+import { withSweCompletionInstruction } from "../src/responses-swe-autonomy.ts";
 
 const HOST = "127.0.0.1";
 const DEVIN_AUTH_PATH = "/exa.auth_pb.AuthService/GetUserJwt";
@@ -1109,6 +1110,40 @@ describe("POST /v1/responses (non-streaming)", () => {
     } finally {
       await cleanup();
       await upstream.stop();
+    }
+  });
+
+  test("marker continuation follows logical SWE routing and preserves native bytes with or without collapse", async () => {
+    const previous = process.env.DEVIN_SWE_AUTONOMOUS_CONTINUATION;
+    const previousCollapse = process.env.DEVIN_CODEX_DESKTOP_COLLAPSE_SYSTEM;
+    process.env.DEVIN_SWE_AUTONOMOUS_CONTINUATION = "1";
+    const captured: Uint8Array[] = [];
+    const upstream = startUpstream({
+      modelsBody: familyPayload([familyFixture("swe-2-high", "SWE-2", "high")]),
+      captureChatRequest: body => captured.push(body),
+      chatBody: () => framesBody([dataFrame({ text: "Synthetic progress", stopReason: 2 })]),
+    });
+    const gateway = await startGateway(upstream.url.origin, "synthetic-key");
+    const anchor = "Synthetic native anchor\n  Preserve every byte.\n";
+    try {
+      for (const collapse of ["0", "1"]) for (const stream of [false, true]) {
+        process.env.DEVIN_CODEX_DESKTOP_COLLAPSE_SYSTEM = collapse;
+        const response = await fetch(`${gateway.url}/v1/responses`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ model: "swe-2", reasoning: { effort: "high" }, instructions: anchor, input: "Synthetic task", stream }) });
+        expect(response.status).toBe(200);
+        const wire = await response.text();
+        const completed = stream ? parseSse(wire).map(e => JSON.parse(e.data)).find(e => e.type === "response.completed").response : JSON.parse(wire);
+        expect(completed.end_turn).toBe(false);
+        const decoded = decodeChatRequest(captured.at(-1)!);
+        expect(decoded.modelUid).toBe("swe-2-high");
+        const effective = withSweCompletionInstruction(withResponsesBridgeInstructions(anchor, "swe-2-high"), "swe-2-high", true);
+        expect(effective.slice(0, anchor.length)).toBe(anchor);
+        expect(decoded.prompt).toBe(collapse === "1" ? "" : effective);
+        expect(decoded.prompts).toEqual([{ source: 1, prompt: collapse === "1" ? `<system>\n${effective}\n</system>\n\nSynthetic task` : "Synthetic task", toolCalls: [] }]);
+      }
+    } finally {
+      await gateway.cleanup(); await upstream.stop();
+      if (previous === undefined) delete process.env.DEVIN_SWE_AUTONOMOUS_CONTINUATION; else process.env.DEVIN_SWE_AUTONOMOUS_CONTINUATION = previous;
+      if (previousCollapse === undefined) delete process.env.DEVIN_CODEX_DESKTOP_COLLAPSE_SYSTEM; else process.env.DEVIN_CODEX_DESKTOP_COLLAPSE_SYSTEM = previousCollapse;
     }
   });
 

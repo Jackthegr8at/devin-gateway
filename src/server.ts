@@ -17,6 +17,7 @@ import { streamChat, discoverModels, discoverModelMetadata, type ChatStreamEvent
 import { projectModelFamilies, resolveFamilyModelId, FamilyRoutingError } from "./model-families.js";
 import { getCodexModelProfile } from "./admin/codex-model-profiles.js";
 import { withResponsesBridgeInstructions } from "./responses-bridge-capability.js";
+import { SWE_AUTONOMOUS_CONTINUATION_ENV, withSweCompletionInstruction, sweResponseEndTurn } from "./responses-swe-autonomy.js";
 import { ModelSelectionStore } from "./admin/model-selection-store.js";
 import { CODEX_SELECTION_PATH, createModelSelectionRoutes, managementRequestAllowed } from "./admin/routes.js";
 import { ACCOUNTS_PATH, createAccountRoutes } from "./admin/accounts-routes.js";
@@ -643,7 +644,10 @@ async function handleResponses(req: Request, reqId: string, trace: ErrorTrace): 
   const originalPrompts = toDevinPrompts(internal, cascadeId);
   const originalSystemPrompt = extractSystemPrompt(messages);
   // Keep native instructions intact; append gateway guidance after wire routing.
-  const effectiveSystemPrompt = withResponsesBridgeInstructions(originalSystemPrompt, modelUid);
+  const sweContinuationEnabled = process.env[SWE_AUTONOMOUS_CONTINUATION_ENV] === "1";
+  const effectiveSystemPrompt = withSweCompletionInstruction(
+    withResponsesBridgeInstructions(originalSystemPrompt, modelUid), modelUid, sweContinuationEnabled,
+  );
   const collapseRequested = isCodexDesktopSystemCollapseRequest({
     featureFlag: process.env[CODEX_DESKTOP_SYSTEM_COLLAPSE_ENV],
   });
@@ -682,7 +686,7 @@ async function handleResponses(req: Request, reqId: string, trace: ErrorTrace): 
 
   if (body.stream) {
     return streamOpenAIResponses(req, {
-      reqId, trace, token, modelUid, systemPrompt, prompts, tools,
+      reqId, trace, token, modelUid, systemPrompt, prompts, tools, sweContinuationEnabled,
       maxTokens: body.max_output_tokens, temperature: body.temperature, topP: body.top_p,
       cascadeId, modelId: body.model, responseId, created, toolChoice, declaredTools,
       diagnostic,
@@ -717,6 +721,7 @@ async function handleResponses(req: Request, reqId: string, trace: ErrorTrace): 
     const status = stopReason === StopReason.MAX_TOKENS ? "incomplete" : "completed";
 
     const toolCalls = finishResponsesToolCalls(toolCallState, declaredTools, diagnostic);
+    const endTurn = sweResponseEndTurn(modelUid, sweContinuationEnabled, text, stopReason, toolCalls.size);
     for (const call of toolCalls.values()) diagnostic?.recordNormalizedEmittedToolCall(call);
     const output: Record<string, unknown>[] = [];
     if (text || toolCalls.size === 0) {
@@ -739,6 +744,7 @@ async function handleResponses(req: Request, reqId: string, trace: ErrorTrace): 
       created_at: created,
       model: body.model,
       status,
+      ...(endTurn !== undefined ? { end_turn: endTurn } : {}),
       ...(status === "incomplete" ? { incomplete_details: { reason: "max_output_tokens" } } : {}),
       output,
       usage: usage ? {
@@ -777,6 +783,7 @@ function streamOpenAIResponses(
     cascadeId: string; modelId: string; responseId: string; created: number;
     toolChoice?: ChatToolChoice; declaredTools: Map<string, { name: string; namespace?: string }>;
     diagnostic?: ResponsesSafeDiagnostic;
+    sweContinuationEnabled: boolean;
   },
 ): Response {
   const { reqId, trace, token, modelUid, systemPrompt, prompts, tools, maxTokens, temperature, topP, cascadeId, modelId, responseId, created, toolChoice, declaredTools, diagnostic } = params;
@@ -886,6 +893,7 @@ function streamOpenAIResponses(
         const status = stopReason === StopReason.MAX_TOKENS ? "incomplete" : "completed";
         slog(`done — upstream chunks: ${upstreamChunks}`);
         const toolCalls = finishResponsesToolCalls(toolCallState, declaredTools, diagnostic);
+        const endTurn = sweResponseEndTurn(modelUid, params.sweContinuationEnabled, fullText, stopReason, toolCalls.size);
         for (const call of toolCalls.values()) diagnostic?.recordNormalizedEmittedToolCall(call);
 
         if (reasoningStarted) {
@@ -946,6 +954,7 @@ function streamOpenAIResponses(
           type: `response.${status}`,
           response: {
             id: responseId, object: "response", created_at: created, model: modelId, status, output: outputItems,
+            ...(endTurn !== undefined ? { end_turn: endTurn } : {}),
             ...(status === "incomplete" ? { incomplete_details: { reason: "max_output_tokens" } } : {}),
             usage: usage ? {
               input_tokens: usage.inputTokens,

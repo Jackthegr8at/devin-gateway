@@ -2,6 +2,7 @@ import { expect, test, describe } from "bun:test";
 
 import { startServer } from "../src/server.ts";
 import OpenAI from "openai";
+import { gunzipSync } from "node:zlib";
 
 const HOST = "127.0.0.1";
 const DEVIN_AUTH_PATH = "/exa.auth_pb.AuthService/GetUserJwt";
@@ -112,6 +113,7 @@ function dataFrame(fields: ChatResponseFields): Uint8Array {
 
 interface UpstreamOptions {
   chatBody?: () => Uint8Array;
+  captureChat?: (req: Request) => Promise<void>;
   /** Return a non-ok status for GetCliModelConfigs (model discovery). */
   modelsStatus?: number;
 }
@@ -132,6 +134,7 @@ function startUpstream(opts: UpstreamOptions = {}): Upstream {
         return new Response(payload, { headers: { "content-type": "application/proto" } });
       }
       if (url.pathname === CHAT_MESSAGE_PATH) {
+        await opts.captureChat?.(req);
         const body = opts.chatBody ? opts.chatBody() : framesBody([dataFrame({ text: "hi" })]);
         return new Response(body, { headers: { "content-type": "application/connect+proto" } });
       }
@@ -206,6 +209,141 @@ function parseSse(text: string): SseEvent[] {
 }
 
 // ─── tests ───────────────────────────────────────────────────────────────────
+
+describe("opt-in SWE marker continuation", () => {
+  const flag = "DEVIN_SWE_AUTONOMOUS_CONTINUATION";
+  test("client cancellation aborts upstream and does not start another request", async () => {
+    const previous = process.env[flag]; process.env[flag] = "1";
+    let aborted = false; let requests = 0;
+    const upstream = Bun.serve({ hostname: HOST, port: 0, fetch(req) {
+      if (new URL(req.url).pathname === DEVIN_AUTH_PATH) return new Response(Uint8Array.from(encodeString(1, "synthetic-jwt")));
+      requests++;
+      req.signal.addEventListener("abort", () => { aborted = true; }, { once: true });
+      return new Response(new ReadableStream({ start(controller) { controller.enqueue(dataFrame({ text: "Synthetic progress" })); } }));
+    } });
+    const gateway = await startGateway(upstream.url.origin, "synthetic-token");
+    const client = new AbortController();
+    try {
+      const result = await fetch(`${gateway.url}/v1/responses`, { method: "POST", signal: client.signal, headers: { "content-type": "application/json" }, body: JSON.stringify({ model: "swe-2-medium", stream: true, input: "Synthetic task" }) });
+      const reader = result.body!.getReader();
+      let received = "";
+      try {
+        const deadline = Date.now() + 2000;
+        while (!received.includes("response.output_text.delta")) {
+          let timer: ReturnType<typeof setTimeout> | undefined;
+          const part = await Promise.race([reader.read(), new Promise<never>((_, reject) => {
+            timer = setTimeout(() => reject(new Error("Synthetic delta deadline")), Math.max(1, deadline - Date.now()));
+          })]).finally(() => clearTimeout(timer));
+          if (part.done) break;
+          received += new TextDecoder().decode(part.value);
+        }
+        expect(received).toContain("response.output_text.delta");
+        expect(received).not.toContain("response.completed");
+        client.abort(); await reader.cancel().catch(() => {});
+      } finally { reader.releaseLock(); }
+      const deadline = Date.now() + 2000;
+      while (!aborted && Date.now() < deadline) await Bun.sleep(5);
+      expect(aborted).toBe(true);
+      await Bun.sleep(30);
+      expect(requests).toBe(1);
+    } finally {
+      client.abort(); await gateway.cleanup(); await upstream.stop(true);
+      if (previous === undefined) delete process.env[flag]; else process.env[flag] = previous;
+    }
+  }, 6000);
+  for (const fixture of [
+    { name: "unmarked STOP_PATTERN", model: "swe-2-medium", text: "Synthetic next step", reason: 2, enabled: true, endTurn: false },
+    { name: "marked STOP_PATTERN", model: "swe-2-high", text: "Synthetic final\n[PROCESS_DONE]\n", reason: 2, enabled: true, endTurn: true },
+    { name: "nonfinal marker", model: "swe-2-max", text: "[PROCESS_DONE]\nSynthetic next step", reason: 2, enabled: true, endTurn: false },
+    { name: "disabled", model: "swe-2-medium", text: "Synthetic next step", reason: 2, enabled: false, endTurn: undefined },
+    { name: "other model", model: "glm-5-3-flash-low", text: "Synthetic next step", reason: 2, enabled: true, endTurn: undefined },
+    { name: "ordinary stop", model: "swe-2-medium", text: "Synthetic final", reason: 1, enabled: true, endTurn: undefined },
+    { name: "truncation", model: "swe-2-medium", text: "Synthetic final\n[PROCESS_DONE]", reason: 3, enabled: true, endTurn: undefined },
+    { name: "tool call", model: "swe-2-medium", text: "[PROCESS_DONE]", reason: 10, enabled: true, endTurn: undefined, tool: true },
+  ]) test(`${fixture.name}: JSON and streaming agree`, async () => {
+    const previous = process.env[flag];
+    process.env[flag] = fixture.enabled ? "1" : "0";
+    const upstream = startUpstream({ chatBody: () => framesBody([dataFrame({
+      text: fixture.text, stopReason: fixture.reason,
+      ...(fixture.tool ? { toolCalls: [{ id: "synthetic-call", name: "exec_command", argumentsJson: '{"cmd":"echo synthetic"}' }] } : {}),
+    })]) });
+    const gateway = await startGateway(upstream.url.origin, "synthetic-token");
+    try {
+      for (const stream of [false, true]) {
+        const result = await fetch(`${gateway.url}/v1/responses`, {
+          method: "POST", headers: { "content-type": "application/json" },
+          body: JSON.stringify({ model: fixture.model, stream, input: "Synthetic task", tools: [{ type: "function", name: "exec_command", parameters: { type: "object" } }] }),
+        });
+        expect(result.status).toBe(200);
+        const events = stream ? parseSse(await result.text()).map(e => JSON.parse(e.data)) : [];
+        const response = stream ? events.find(e => e.type === `response.${fixture.reason === 3 ? "incomplete" : "completed"}`)?.response : await result.json();
+        expect(response.status).toBe(fixture.reason === 3 ? "incomplete" : "completed");
+        expect(response.end_turn).toBe(fixture.endTurn);
+        expect(response.output.find((x: any) => x.type === "message")?.content[0].text).toBe(fixture.text);
+        if (stream) {
+          expect(events.every(e => !("end_turn" in e))).toBe(true);
+          expect(events.filter(e => e.type === "response.output_text.delta").map(e => e.delta).join("")).toBe(fixture.text);
+        }
+        if (fixture.reason === 3) expect(response.incomplete_details).toEqual({ reason: "max_output_tokens" });
+        if (fixture.tool) expect(response.output.find((x: any) => x.type === "function_call").call_id).toBe("synthetic-call");
+      }
+    } finally {
+      await gateway.cleanup(); await upstream.stop();
+      if (previous === undefined) delete process.env[flag]; else process.env[flag] = previous;
+    }
+  });
+
+  test("each client continuation retains history and guidance; gateway does not generate requests", async () => {
+    const previous = process.env[flag]; process.env[flag] = "1";
+    const requests: string[] = [];
+    const upstream = startUpstream({
+      captureChat: async req => {
+        const frame = new Uint8Array(await req.arrayBuffer());
+        requests.push(new TextDecoder().decode(frame[0] === 1 ? gunzipSync(frame.slice(5)) : frame.slice(5)));
+      },
+      chatBody: () => framesBody([dataFrame({ text: "Synthetic progress", stopReason: 2 })]),
+    });
+    const gateway = await startGateway(upstream.url.origin, "synthetic-token");
+    try {
+      const history: any[] = [{ role: "user", content: "Synthetic original task" }];
+      for (let turn = 0; turn < 3; turn++) {
+        const result = await fetch(`${gateway.url}/v1/responses`, {
+          method: "POST", headers: { "content-type": "application/json" },
+          body: JSON.stringify({ model: "swe-2-medium", instructions: "Synthetic native anchor", input: history }),
+        });
+        const response = await result.json();
+        expect(response.end_turn).toBe(false);
+        expect(requests.length).toBe(turn + 1);
+        expect(requests[turn]).toContain("[Gateway SWE completion protocol]");
+        expect(requests[turn]).toContain("Synthetic native anchor");
+        expect(requests[turn]).toContain("Synthetic original task");
+        for (let old = 0; old < turn; old++) expect(requests[turn]).toContain(`Synthetic history ${old}`);
+        expect(requests[turn]).not.toContain('"continue"');
+        history.push({ role: "assistant", content: `Synthetic history ${turn}` });
+      }
+      await Bun.sleep(30);
+      expect(requests.length).toBe(3);
+    } finally {
+      await gateway.cleanup(); await upstream.stop();
+      if (previous === undefined) delete process.env[flag]; else process.env[flag] = previous;
+    }
+  });
+
+  test("upstream errors remain response.failed rather than continuation", async () => {
+    const previous = process.env[flag]; process.env[flag] = "1";
+    const upstream = startUpstream({ chatBody: () => framesBody([dataFrame({ text: "Synthetic progress", stopReason: 2 })], { error: { code: "permission_denied", message: "Synthetic denial" } }) });
+    const gateway = await startGateway(upstream.url.origin, "synthetic-token");
+    try {
+      const result = await fetch(`${gateway.url}/v1/responses`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ model: "swe-2-medium", stream: true, input: "Synthetic task" }) });
+      const events = parseSse(await result.text()).map(e => JSON.parse(e.data));
+      expect(events.some(e => e.type === "response.failed")).toBe(true);
+      expect(events.some(e => e.type === "response.completed")).toBe(false);
+    } finally {
+      await gateway.cleanup(); await upstream.stop();
+      if (previous === undefined) delete process.env[flag]; else process.env[flag] = previous;
+    }
+  });
+});
 
 describe("streamOpenAIChat tool_calls branch", () => {
   test("emits tool_calls delta chunk and finish_reason=tool_calls", async () => {
