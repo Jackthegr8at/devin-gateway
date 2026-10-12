@@ -15,8 +15,11 @@ No reviewer override is added when Medium is not enabled. Other model entries
 are not redirected.
 
 The source for installed Codex `rust-v0.162.0-alpha.17.2` identifies synchronous
-reviewer requests using the exact HTTP header `x-codex-guardian: reviewer`.
-The gateway uses this same discriminator, not model names or instruction text.
+reviewer requests using `x-codex-guardian: reviewer` on Codex-backend routes.
+Custom providers receive `x-openai-subagent: guardian`, also projected as
+`client_metadata["x-openai-subagent"] = "guardian"` in the Responses body.
+The gateway accepts these exact structured discriminators, not model names,
+prompt wording or assessment output. Other subagent labels are ordinary agents.
 These requests retain the supplied native review instructions and omit gateway
 agent supplements, including `[PROCESS_DONE]`. The autonomous feature cannot set
 `end_turn:false` for them. Collapse, upstream errors, cancellation, truncation and

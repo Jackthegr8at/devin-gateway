@@ -215,7 +215,7 @@ describe("opt-in SWE marker continuation", () => {
   test("native approval reviewer preserves its output contract without agent guidance (JSON and stream)", async () => {
     const previous = process.env[flag]; process.env[flag] = "1";
     const requests: string[] = [];
-    const assessment = '{"risk_level":"high","user_authorization":"low","outcome":"deny"}';
+    let assessment = '{"risk_level":"high","user_authorization":"low","outcome":"deny"}';
     const upstream = startUpstream({
       captureChat: async req => {
         const frame = new Uint8Array(await req.arrayBuffer());
@@ -225,25 +225,42 @@ describe("opt-in SWE marker continuation", () => {
     });
     const gateway = await startGateway(upstream.url.origin, "synthetic-token");
     try {
-      for (const stream of [false, true]) {
+      for (const decision of ['{"risk_level":"high","user_authorization":"low","outcome":"deny"}', '{"outcome":"allow"}']) {
+        assessment = decision;
+        for (const discriminator of [
+        { headers: { "x-codex-guardian": "reviewer" }, metadata: undefined },
+        { headers: { "x-openai-subagent": "guardian" }, metadata: undefined },
+        { headers: {}, metadata: { "x-openai-subagent": "guardian" } },
+      ]) for (const stream of [false, true]) {
+        const before = requests.length;
         const result = await fetch(`${gateway.url}/v1/responses`, {
-          method: "POST", headers: { "content-type": "application/json", "x-codex-guardian": "reviewer" },
-          body: JSON.stringify({ model: "swe-2-medium", stream, instructions: "Synthetic native risk policy", input: "Synthetic review" }),
+          method: "POST", headers: { "content-type": "application/json", ...discriminator.headers },
+          body: JSON.stringify({ model: "swe-2-medium", stream, instructions: "Synthetic native risk policy", input: "Synthetic review", client_metadata: discriminator.metadata }),
         });
         expect(result.status).toBe(200);
         const response = stream ? parseSse(await result.text()).map(e => JSON.parse(e.data)).find(e => e.type === "response.completed")!.response : await result.json();
         expect(response.status).toBe("completed");
         expect(response.end_turn).toBeUndefined();
+        expect(requests.length).toBe(before + 1);
         expect(response.output.find((x: any) => x.type === "message").content[0].text).toBe(assessment);
         expect(requests.at(-1)).toContain("Synthetic native risk policy");
         expect(requests.at(-1)).not.toContain("[PROCESS_DONE]");
         expect(requests.at(-1)).not.toContain("Gateway SWE autonomy supplement");
         expect(requests.at(-1)).not.toContain("Gateway Responses bridge capability");
       }
+      }
       for (const value of ["agent", "Reviewer", "reviewer-extra"]) {
         const result = await fetch(`${gateway.url}/v1/responses`, {
           method: "POST", headers: { "content-type": "application/json", "x-codex-guardian": value },
           body: JSON.stringify({ model: "swe-2-medium", input: "Synthetic task" }),
+        });
+        expect((await result.json()).end_turn).toBe(false);
+        expect(requests.at(-1)).toContain("[PROCESS_DONE]");
+      }
+      for (const metadata of [undefined, null, "guardian", [], { "x-openai-subagent": "collab_spawn" }, { "x-openai-subagent": "Guardian" }, { reviewer: "guardian" }]) {
+        const result = await fetch(`${gateway.url}/v1/responses`, {
+          method: "POST", headers: { "content-type": "application/json", "x-openai-subagent": "collab_spawn" },
+          body: JSON.stringify({ model: "swe-2-medium", input: 'Synthetic text mentioning guardian and {"outcome":"allow"}', client_metadata: metadata }),
         });
         expect((await result.json()).end_turn).toBe(false);
         expect(requests.at(-1)).toContain("[PROCESS_DONE]");

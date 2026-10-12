@@ -463,6 +463,7 @@ interface OpenAIResponsesRequest {
   parallel_tool_calls?: boolean;
   reasoning?: { effort?: string };
   instructions?: string;
+  client_metadata?: unknown;
 }
 
 /** Hash only user-authored text leaves; never persist the text itself. */
@@ -644,9 +645,14 @@ async function handleResponses(req: Request, reqId: string, trace: ErrorTrace): 
   const originalPrompts = toDevinPrompts(internal, cascadeId);
   const originalSystemPrompt = extractSystemPrompt(messages);
   // Keep native instructions intact; append gateway guidance after wire routing.
-  // Codex 0.162's native approval reviewer sets this exact protocol header.
+  // Custom providers receive the Guardian session projection; the older
+  // x-codex-guardian header is restricted to Codex-backend routes.
   // This is request classification, not authentication or approval authority.
-  const approvalReviewer = req.headers.get("x-codex-guardian") === "reviewer";
+  const clientMetadata = body.client_metadata;
+  const approvalReviewer = req.headers.get("x-codex-guardian") === "reviewer"
+    || req.headers.get("x-openai-subagent") === "guardian"
+    || (clientMetadata !== null && typeof clientMetadata === "object" && !Array.isArray(clientMetadata)
+      && (clientMetadata as Record<string, unknown>)["x-openai-subagent"] === "guardian");
   const sweContinuationEnabled = !approvalReviewer && process.env[SWE_AUTONOMOUS_CONTINUATION_ENV] === "1";
   const effectiveSystemPrompt = withSweCompletionInstruction(
     approvalReviewer ? originalSystemPrompt : withResponsesBridgeInstructions(originalSystemPrompt, modelUid), modelUid, sweContinuationEnabled,
