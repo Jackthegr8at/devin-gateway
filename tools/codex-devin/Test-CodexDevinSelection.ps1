@@ -89,7 +89,7 @@ try {
             $runtime = Get-CodexDevinDesktopRuntime
             $effective = Invoke-CodexDevinSelectionProcess -Executable $runtime.Path -Arguments @('debug', 'models') | ConvertFrom-Json
             $loaded = @($effective.models)
-            Assert-Selection ($loaded.Count -eq 2) 'installed reviewed runtime loads only the generated reviewed models offline'
+            Assert-Selection ($loaded.Count -eq 3) 'installed runtime loads two logical models and the hidden reviewer preset offline'
             # The generated catalog is BOM-less UTF-8. Windows PowerShell's default
             # ANSI decoding corrupts non-ASCII instructions before the alias probe.
             $generated = Get-Content -LiteralPath $state.catalogPath -Raw -Encoding UTF8 | ConvertFrom-Json
@@ -114,6 +114,8 @@ try {
             Assert-Selection ((Get-CodexDevinSha256 $configPath) -ceq $configHashBeforeAliasProbe) 'alias probe leaves provider and security configuration unchanged'
             $glm = @($loaded | Where-Object slug -CEQ 'glm-5-3-flash-low')[0]
             $swe = @($loaded | Where-Object slug -CEQ 'swe-2')[0]
+            $reviewer = @($loaded | Where-Object slug -CEQ 'swe-2-medium')[0]
+            Assert-Selection ($swe.auto_review_model_override -ceq 'swe-2-medium' -and $reviewer.visibility -ceq 'hide' -and $reviewer.default_reasoning_level -ceq 'medium' -and $reviewer.supported_reasoning_levels.Count -eq 1 -and $reviewer.supported_reasoning_levels[0].effort -ceq 'medium') 'installed backend preserves exact Medium-only reviewer override and hidden preset'
             Assert-Selection ($glm.default_reasoning_level -ceq 'low' -and $swe.default_reasoning_level -ceq 'medium') 'runtime catalog reports exact baseline default efforts'
             Assert-Selection ($glm.supported_reasoning_levels.Count -eq 1 -and $swe.supported_reasoning_levels.Count -eq 1) 'runtime catalog advertises no invented efforts'
         }
@@ -141,6 +143,7 @@ try {
         'gpt-5-6-luna' = @('max','max')
         'gpt-6-1-sol' = @('low','low,medium')
         'swe-2' = @('medium','medium,high,max')
+        'swe-2-medium' = @('medium','medium')
     }
     Assert-Selection ($fullCatalog.models.Count -eq $expected.Count) 'full logical model set accepted by installed backend'
     foreach ($model in $fullCatalog.models) {

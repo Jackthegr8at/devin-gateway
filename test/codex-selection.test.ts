@@ -48,6 +48,38 @@ const generate = (input: unknown, runtimeVersion = SUPPORTED_RUNTIME) => generat
   runtimeRecord: fixtureRuntimeRecord,
 });
 
+test("SWE review override has a hidden exact Medium preset without changing logical efforts or worker role", () => {
+  const input = selectionFixture();
+  const generated = generate(input);
+  const models = JSON.parse(generated.catalogText).models;
+  const swe = models.find((model: any) => model.slug === "swe-2");
+  const reviewer = models.find((model: any) => model.slug === "swe-2-medium");
+  expect(swe.auto_review_model_override).toBe("swe-2-medium");
+  expect(reviewer.visibility).toBe("hide");
+  expect(reviewer.default_reasoning_level).toBe("medium");
+  expect(reviewer.supported_reasoning_levels.map((row: any) => row.effort)).toEqual(["medium"]);
+  expect(generated.roles.swe_worker).toEqual(validateSelection(input).roles.swe_worker);
+  expect(models.find((model: any) => model.slug !== "swe-2" && model.slug !== "swe-2-medium").auto_review_model_override).toBeUndefined();
+});
+
+test("review preset does not broaden agent efforts or enable a missing Medium route", () => {
+  const input = selectionFixture();
+  const swe = input.models.find(model => model.id === "swe-2")!;
+  swe.routing.high = "swe-2-high";
+  swe.supportedReasoningEfforts.push({ effort: "high", description: "Synthetic High" });
+  let models = JSON.parse(generate(input).catalogText).models;
+  expect(models.find((m: any) => m.slug === "swe-2").supported_reasoning_levels.map((r: any) => r.effort)).toEqual(["medium", "high"]);
+  expect(models.find((m: any) => m.slug === "swe-2-medium").supported_reasoning_levels.map((r: any) => r.effort)).toEqual(["medium"]);
+  delete swe.routing.medium;
+  swe.supportedReasoningEfforts = swe.supportedReasoningEfforts.filter(row => row.effort === "high");
+  swe.defaultReasoningEffort = "high";
+  input.roles.swe_worker.reasoningEffort = "high";
+  input.roles.swe_worker.concreteModelId = "swe-2-high";
+  models = JSON.parse(generate(input).catalogText).models;
+  expect(models.some((m: any) => m.slug === "swe-2-medium")).toBe(false);
+  expect(models.find((m: any) => m.slug === "swe-2").auto_review_model_override).toBeUndefined();
+});
+
 test("reviewed runtime instruction provenance pins only a hash and UTF-8 byte length", () => {
   expect(SUPPORTED_RUNTIME).toBe("0.159.2");
   expect(REVIEWED_RUNTIME_INSTRUCTIONS.compatibilityContractVersion).toBe(1);
@@ -175,7 +207,7 @@ test("schema-v2 saved roles generate deterministic logical catalog and exact eff
   expect(result.roles.default).toEqual({ modelId: "glm-5-3-flash-low", reasoningEffort: "low", concreteModelId: "glm-5-3-flash-low" });
   expect(result.roles.swe_worker).toEqual({ modelId: "swe-2", reasoningEffort: "medium", concreteModelId: "swe-2-medium" });
   const models = JSON.parse(result.catalogText).models;
-  expect(models.map((model: any) => model.slug)).toEqual(["glm-5-3-flash-low", "swe-2"]);
+  expect(models.map((model: any) => model.slug)).toEqual(["glm-5-3-flash-low", "swe-2", "swe-2-medium"]);
   expect(models[1].supported_reasoning_levels.map((row: any) => row.effort)).toEqual(["medium"]);
   expect(models[1].default_reasoning_level).toBe("medium");
   expect(sha256(models[0].base_instructions)).toBe(sha256(fixtureInstructions));
