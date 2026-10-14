@@ -237,6 +237,43 @@ describe("decodeChatToolCall", () => {
 
 // ─── encodeChatMessagePrompt ────────────────────────────────────────────────
 
+describe("encodeChatMessagePrompt Responses image transport", () => {
+  test("a Responses-derived user image reaches Devin field 10 with its bytes intact", () => {
+    // Synthetic 1x1 PNG; the same bytes the converter test uses.
+    const pngB64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=";
+    const enc = new ProtoEncoder();
+    encodeChatMessagePrompt(enc, {
+      messageId: "mid-img",
+      source: ChatMessageSource.USER,
+      prompt: "Look at this screenshot.",
+      images: [{ base64Data: pngB64, mimeType: "image/png" }],
+    });
+    const dec = new ProtoDecoder(enc.finish());
+    const images: { data: string; mime: string }[] = [];
+    let prompt = "";
+    while (!dec.done) {
+      const { field, wire } = dec.readTag();
+      if (field === 3 && wire === 2) {
+        prompt = dec.readString();
+      } else if (field === 10 && wire === 2) {
+        const inner = new ProtoDecoder(dec.readBytes());
+        let data = "";
+        let mime = "";
+        while (!inner.done) {
+          const t = inner.readTag();
+          if (t.field === 1 && t.wire === 2) data = inner.readString();
+          else if (t.field === 2 && t.wire === 2) mime = inner.readString();
+          else inner.skip(t.wire);
+        }
+        images.push({ data, mime });
+      } else {
+        dec.skip(wire);
+      }
+    }
+    expect(prompt).toBe("Look at this screenshot.");
+    expect(images).toEqual([{ data: pngB64, mime: "image/png" }]);
+  });
+});
 describe("encodeChatMessagePrompt", () => {
   test("encodes source/prompt/thinking/images/toolCalls with correct field numbers", () => {
     const prompt: ChatMessagePrompt = {

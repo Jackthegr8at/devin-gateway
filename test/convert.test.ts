@@ -100,6 +100,72 @@ describe("Codex Responses input conversion", () => {
       { type: "function", name: "exec_command", parameters: "not-an-object" },
     ])).toThrow(ResponsesInputError);
   });
+
+  // Synthetic 1x1 PNG (valid signature and IHDR); contains no real screenshot bytes.
+  const PNG_B64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=";
+  const PNG_URL = `data:image/png;base64,${PNG_B64}`;
+
+  test("maps a Codex input_image data URL to a Devin image with text order preserved", () => {
+    const messages = responsesInputToOpenAIMessages([
+      {
+        role: "user",
+        content: [
+          { type: "input_text", text: "Look at this " },
+          { type: "input_image", image_url: PNG_URL, detail: "auto" },
+          { type: "input_text", text: "screenshot." },
+        ],
+      },
+    ]);
+    const [prompt] = toDevinPrompts(openaiToInternal(messages), "cascade-image");
+    expect(prompt.source).toBe(ChatMessageSource.USER);
+    expect(prompt.prompt).toBe("Look at this screenshot.");
+    expect(prompt.images).toEqual([{ mimeType: "image/png", base64Data: PNG_B64 }]);
+  });
+  test("keeps an image from earlier conversation history on its own user turn", () => {
+    const messages = responsesInputToOpenAIMessages([
+      {
+        role: "user",
+        content: [
+          { type: "input_text", text: "First look" },
+          { type: "input_image", image_url: PNG_URL },
+        ],
+      },
+      { role: "assistant", content: [{ type: "output_text", text: "I see a blank image." }] },
+      { role: "user", content: [{ type: "input_text", text: "Follow up without an image" }] },
+    ]);
+    const prompts = toDevinPrompts(openaiToInternal(messages), "cascade-history");
+    expect(prompts.map((p) => p.prompt)).toEqual(["First look", "I see a blank image.", "Follow up without an image"]);
+    expect(prompts[0].images).toEqual([{ mimeType: "image/png", base64Data: PNG_B64 }]);
+    expect(prompts[1].images ?? []).toEqual([]);
+    expect(prompts[2].images ?? []).toEqual([]);
+  });
+
+  test("rejects remote, non-image, and malformed input_image parts instead of dropping them", () => {
+    expect(() => responsesInputToOpenAIMessages([
+      { role: "user", content: [{ type: "input_image", image_url: "https://example.com/x.png" }] },
+    ])).toThrow(ResponsesInputError);
+    expect(() => responsesInputToOpenAIMessages([
+      { role: "user", content: [{ type: "input_image", image_url: "data:image/svg+xml;base64,PHN2Zz4=" }] },
+    ])).toThrow(ResponsesInputError);
+    expect(() => responsesInputToOpenAIMessages([
+      { role: "user", content: [{ type: "input_image" }] },
+    ])).toThrow(ResponsesInputError);
+    expect(() => responsesInputToOpenAIMessages([
+      { role: "assistant", content: [{ type: "input_image", image_url: PNG_URL }] },
+    ])).toThrow(ResponsesInputError);
+  });
+
+  test("text-only Responses content is unchanged and carries no images field", () => {
+    const messages = responsesInputToOpenAIMessages([
+      { role: "user", content: [{ type: "input_text", text: "a" }, { type: "text", text: "b" }] },
+      { role: "assistant", content: "plain" },
+    ]);
+    expect(messages).toEqual([
+      { role: "user", content: "ab" },
+      { role: "assistant", content: "plain" },
+    ]);
+    expect("images" in messages[0]).toBe(false);
+  });
 });
 
 // ─── openaiToInternal ────────────────────────────────────────────────────────

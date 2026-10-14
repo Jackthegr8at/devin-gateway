@@ -252,26 +252,57 @@ function responsesReasoningSummary(item: Record<string, unknown>, index: number)
   }).join("");
 }
 
+/**
+ * Responses message content. Text-only content stays a plain string, exactly as
+ * before. When an input_image part is present, the content becomes OpenAI-style
+ * parts in the original order, so the existing openaiToInternal path extracts
+ * the image. Only base64 image data URLs are accepted; remote URLs and other
+ * media types are rejected rather than dropped.
+ */
 function responsesMessageContent(
   content: unknown,
   role: "system" | "developer" | "user" | "assistant",
   messageIndex: number,
-): string {
+): string | OpenAIContentPart[] {
   if (typeof content === "string") return content;
   if (!Array.isArray(content)) {
     throw new ResponsesInputError(`Responses ${role} message at index ${messageIndex} needs text content.`);
   }
-  return content.map((part, partIndex) => {
+  const parts: OpenAIContentPart[] = [];
+  let hasImage = false;
+  for (const [partIndex, part] of content.entries()) {
     if (!isRecord(part)) {
       throw new ResponsesInputError(`Responses content part ${partIndex} in message ${messageIndex} must be an object.`);
+    }
+    if (part.type === "input_image") {
+      if (role !== "user") {
+        throw new ResponsesInputError(`Responses ${role} message at index ${messageIndex} cannot contain input_image parts.`);
+      }
+      const url = responsesInputImageUrl(part.image_url);
+      if (url === null) {
+        throw new ResponsesInputError(
+          `Responses input_image part ${partIndex} in message ${messageIndex} needs a base64 image data URL.`,
+        );
+      }
+      parts.push({ type: "image_url", image_url: { url } });
+      hasImage = true;
+      continue;
     }
     if (!["input_text", "output_text", "text"].includes(String(part.type)) || typeof part.text !== "string") {
       throw new ResponsesInputError(
         `Unsupported Responses content part type ${JSON.stringify(part.type)} in message ${messageIndex}.`,
       );
     }
-    return part.text;
-  }).join("");
+    parts.push({ type: "text", text: part.text });
+  }
+  if (!hasImage) return parts.map((part) => part.text ?? "").join("");
+  return parts;
+}
+
+/** Accept only `data:image/<png|jpeg|gif|webp>;base64,<payload>`; no remote fetch, no SVG. */
+function responsesInputImageUrl(imageUrl: unknown): string | null {
+  if (typeof imageUrl !== "string") return null;
+  return /^data:image\/(?:png|jpeg|gif|webp);base64,[A-Za-z0-9+/]+={0,2}$/.test(imageUrl) ? imageUrl : null;
 }
 
 function requireString(value: unknown, label: string): string {
