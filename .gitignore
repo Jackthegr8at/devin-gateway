@@ -1,0 +1,38 @@
+# Dependencies
+node_modules/
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# Build and test output
+dist/
+coverage/
+*.tsbuildinfo
+
+# Logs
+*.log
+logs/
+
+# Editor and OS files
+.DS_Store
+.idea/
+.vscode/
+
+# Local agent instructions (not committed; imported via @AGENTS.local.md in AGENTS.md)
+AGENTS.local.md
+
+# Private deployment authentication, including temporary bootstrap credentials.
+secrets/
+
+# Private operator artifacts and captured diagnostics
+/deploy/operator/state-*/
+/deploy/operator/test-results/
+*.backup*
+*.bak
+/deploy/operator/operator-config.local.ps1
+
+# Operator material is local unless explicitly published.
+/deploy/operator/*
+!/deploy/operator/operator-config.example.ps1

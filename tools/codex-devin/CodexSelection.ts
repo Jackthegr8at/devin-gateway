@@ -1,0 +1,368 @@
+import { createHash } from "node:crypto";
+import { spawnSync } from "node:child_process";
+import { readFileSync, writeFileSync, mkdtempSync, rmSync } from "node:fs";
+import { isAbsolute, join } from "node:path";
+import { tmpdir } from "node:os";
+import { isDeepStrictEqual } from "node:util";
+import { fileURLToPath } from "node:url";
+import { CODEX_PROFILE_VERSION } from "../../src/admin/codex-model-profiles.js";
+
+const fail = (): never => { throw new Error("Invalid or unsupported Codex selection; no defaults were substituted."); };
+const object = (value: unknown): Record<string, unknown> => {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return fail();
+  return value as Record<string, unknown>;
+};
+const keys = (value: Record<string, unknown>, expected: readonly string[]) => {
+  if (Object.keys(value).length !== expected.length || !expected.every((key) => Object.hasOwn(value, key))) fail();
+};
+const id = (value: unknown): string => {
+  if (typeof value !== "string" || !/^[a-zA-Z0-9][a-zA-Z0-9._:-]{0,199}$/.test(value)) return fail();
+  return value;
+};
+const positive = (value: unknown): number => {
+  if (!Number.isSafeInteger(value) || (value as number) <= 0) return fail();
+  return value as number;
+};
+const text = (value: unknown): string => {
+  if (typeof value !== "string" || !value.length || value.length > 512 || /[\x00-\x1f]/.test(value)) return fail();
+  return value;
+};
+export const sha256 = (bytes: string | Uint8Array) => createHash("sha256").update(bytes).digest("hex").toUpperCase();
+export const COMPATIBILITY_CONTRACT_VERSION = 1;
+export interface RuntimeModelMetadata {
+  multi_agent_version: string;
+  shell_type: string;
+  visibility: string;
+  supported_in_api: boolean;
+  support_verbosity: boolean;
+  truncation_policy: { mode: string; limit: number };
+  experimental_supported_tools: unknown[];
+}
+export interface RuntimeInstructionRecord {
+  compatibilityContractVersion: number;
+  source: string;
+  instructionField: string;
+  expectedInstructionSha256: string;
+  expectedInstructionUtf8ByteLength: number;
+  modelMetadata: RuntimeModelMetadata;
+}
+export interface RuntimeCatalogRunnerResult {
+  status: number | null;
+  stdout: Uint8Array | string | null;
+}
+export type RuntimeCatalogRunner = (runtimePath: string, args: string[], home?: string) => RuntimeCatalogRunnerResult;
+export interface RuntimeSelectionDependencies {
+  runRuntime?: RuntimeCatalogRunner;
+  runtimeRecord?: RuntimeInstructionRecord;
+}
+
+export const loadRuntimeInstructionRecord = (): RuntimeInstructionRecord => {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(readFileSync(new URL("./templates/codex-contract-1.json", import.meta.url), "utf8"));
+  } catch {
+    throw new Error("Reviewed Codex runtime metadata could not be loaded.");
+  }
+  const root = object(parsed);
+  keys(root, ["compatibilityContractVersion", "source", "instructionField", "expectedInstructionSha256", "expectedInstructionUtf8ByteLength", "modelMetadata"]);
+  if (root.compatibilityContractVersion !== COMPATIBILITY_CONTRACT_VERSION || root.source !== "codex_debug_models_bundled" || root.instructionField !== "base_instructions") fail();
+  const expectedInstructionSha256 = root.expectedInstructionSha256;
+  if (typeof expectedInstructionSha256 !== "string" || !/^[A-Fa-f0-9]{64}$/.test(expectedInstructionSha256)) fail();
+  const expectedInstructionUtf8ByteLength = positive(root.expectedInstructionUtf8ByteLength);
+  const metadata = object(root.modelMetadata);
+  keys(metadata, ["multi_agent_version", "shell_type", "visibility", "supported_in_api", "support_verbosity", "truncation_policy", "experimental_supported_tools"]);
+  if (typeof metadata.supported_in_api !== "boolean" || typeof metadata.support_verbosity !== "boolean"
+    || !Array.isArray(metadata.experimental_supported_tools) || metadata.experimental_supported_tools.length !== 0) fail();
+  const supportedInApi = metadata.supported_in_api as boolean;
+  const supportVerbosity = metadata.support_verbosity as boolean;
+  const truncationPolicy = object(metadata.truncation_policy);
+  keys(truncationPolicy, ["mode", "limit"]);
+  const modelMetadata: RuntimeModelMetadata = {
+    multi_agent_version: text(metadata.multi_agent_version),
+    shell_type: text(metadata.shell_type),
+    visibility: text(metadata.visibility),
+    supported_in_api: supportedInApi,
+    support_verbosity: supportVerbosity,
+    truncation_policy: { mode: text(truncationPolicy.mode), limit: positive(truncationPolicy.limit) },
+    experimental_supported_tools: [],
+  };
+  return {
+    compatibilityContractVersion: COMPATIBILITY_CONTRACT_VERSION,
+    source: "codex_debug_models_bundled",
+    instructionField: "base_instructions",
+    expectedInstructionSha256: (expectedInstructionSha256 as string).toUpperCase(),
+    expectedInstructionUtf8ByteLength,
+    modelMetadata,
+  };
+};
+export const REVIEWED_RUNTIME_INSTRUCTIONS = loadRuntimeInstructionRecord();
+export const EXPECTED_INSTRUCTION_SHA256 = REVIEWED_RUNTIME_INSTRUCTIONS.expectedInstructionSha256;
+export const EXPECTED_INSTRUCTION_UTF8_BYTE_LENGTH = REVIEWED_RUNTIME_INSTRUCTIONS.expectedInstructionUtf8ByteLength;
+
+const runBundledRuntimeCatalog: RuntimeCatalogRunner = (runtimePath, args, home) => {
+  const result = spawnSync(runtimePath, args, {
+    windowsHide: true,
+    timeout: 10_000,
+    maxBuffer: 2 * 1024 * 1024,
+    ...(home ? { env: { ...process.env, CODEX_HOME: home }, cwd: home } : {}),
+  });
+  return { status: result.status, stdout: result.stdout };
+};
+
+/** Backend acceptance is tested only in a disposable home, never the active home. */
+export function probeGeneratedCatalog(runtimePath: string, models: Record<string, unknown>[], roles: Selection["roles"], runner: RuntimeCatalogRunner): void {
+  const home = mkdtempSync(join(tmpdir(), "codex-contract-"));
+  const catalogPath = join(home, "catalog.json");
+  const configPath = join(home, "config.toml");
+  const workerPath = join(home, "worker.toml");
+  const toml = (s: string) => JSON.stringify(s.replaceAll("\\", "/"));
+  const config = `model = ${toml(roles.default.modelId)}\nmodel_reasoning_effort = ${toml(roles.default.reasoningEffort)}\nmodel_provider = "devin_gateway"\nmodel_catalog_json = ${toml(catalogPath)}\nmulti_agent_version = "v1"\nsandbox_mode = "workspace-write"\napproval_policy = "never"\n[model_providers.devin_gateway]\nname = "Offline contract probe"\nbase_url = "http://127.0.0.1:1/v1"\nwire_api = "responses"\nrequires_openai_auth = false\nrequest_max_retries = 0\nstream_max_retries = 0\n[agents.swe_worker]\nconfig_file = ${toml(workerPath)}\n`;
+  const worker = `model = ${toml(roles.swe_worker.modelId)}\nmodel_reasoning_effort = ${toml(roles.swe_worker.reasoningEffort)}\n`;
+  const load = (shell: string): Record<string, unknown> => {
+    writeFileSync(catalogPath, JSON.stringify({ models: models.map(m => ({ ...m, shell_type: shell })) }), { mode: 0o600 });
+    const result = runner(runtimePath, ["debug", "models"], home);
+    if (result.status !== 0 || result.stdout === null) throw new Error("generated_catalog_rejected");
+    let parsed: unknown;
+    try {
+      const bytes = typeof result.stdout === "string" ? Buffer.from(result.stdout) : result.stdout;
+      if (bytes.length > 2 * 1024 * 1024) throw new Error();
+      parsed = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
+    } catch { throw new Error("effective_catalog_invalid"); }
+    const root = object(parsed);
+    if (!Array.isArray(root.models) || root.models.length !== models.length) throw new Error("effective_model_set_changed");
+    const seen = new Set<string>();
+    for (const raw of root.models) {
+      const row = object(raw);
+      const expected = models.find(m => m.slug === row.slug);
+      if (!expected || seen.has(row.slug as string)) throw new Error("effective_model_set_changed");
+      seen.add(row.slug as string);
+      for (const key of Object.keys(expected)) {
+        if (key === "shell_type") continue;
+        if (!isDeepStrictEqual(row[key], expected[key])) throw new Error("effective_model_contract_changed");
+      }
+      const allowed = shell === "disabled" ? ["disabled"] : shell === "unified_exec" ? ["unified_exec"] : ["shell_command", "unified_exec"];
+      if (!allowed.includes(row.shell_type as string)) throw new Error("unsupported_shell_normalization");
+    }
+    if (readFileSync(configPath, "utf8") !== config || readFileSync(workerPath, "utf8") !== worker) throw new Error("provider_security_or_role_mutation");
+    return root;
+  };
+  try {
+    writeFileSync(configPath, config, { mode: 0o600 });
+    writeFileSync(workerPath, worker, { mode: 0o600 });
+    const legacy = load("shell_command");
+    const canonical = load("unified_exec");
+    // Require complete effective equality, not merely a permissive shell label.
+    if (!isDeepStrictEqual(legacy, canonical)) throw new Error("shell_alias_not_equivalent");
+    load("disabled");
+  } finally {
+    // Only this invocation's freshly allocated disposable directory is removed.
+    rmSync(home, { recursive: true, force: true });
+  }
+}
+
+/** Capture the installed runtime's bundled catalog in memory; never forward its output to diagnostics. */
+export function extractRuntimeInstructions(
+  runtimeVersion: string,
+  runtimePath: string,
+  runner: RuntimeCatalogRunner = runBundledRuntimeCatalog,
+  record: RuntimeInstructionRecord = loadRuntimeInstructionRecord(),
+): string {
+  if (!/^[0-9]+\.[0-9]+\.[0-9]+(?:-[A-Za-z0-9.-]+)?$/.test(runtimeVersion) || record.compatibilityContractVersion !== COMPATIBILITY_CONTRACT_VERSION
+    || record.instructionField !== "base_instructions" || record.source !== "codex_debug_models_bundled") {
+    throw new Error("Invalid compatibility contract or backend version provenance.");
+  }
+  if (typeof runtimePath !== "string" || !isAbsolute(runtimePath)) throw new Error("The installed Desktop runtime path is invalid.");
+  let result: RuntimeCatalogRunnerResult;
+  const probeHome = mkdtempSync(join(tmpdir(), "codex-instruction-probe-"));
+  try {
+    result = runner(runtimePath, ["debug", "models", "--bundled"], probeHome);
+  } catch {
+    throw new Error("The installed Desktop bundled catalog could not be read.");
+  } finally {
+    rmSync(probeHome, { recursive: true, force: true });
+  }
+  if (result.status !== 0 || result.stdout === null) throw new Error("The installed Desktop bundled catalog could not be read.");
+  let catalog: unknown;
+  try {
+    const output = typeof result.stdout === "string"
+      ? result.stdout
+      : new TextDecoder("utf-8", { fatal: true }).decode(result.stdout);
+    if (Buffer.byteLength(output, "utf8") > 2 * 1024 * 1024) throw new Error();
+    catalog = JSON.parse(output);
+  } catch {
+    throw new Error("The installed Desktop bundled catalog was invalid.");
+  }
+  const root = object(catalog);
+  if (!Array.isArray(root.models) || root.models.length > 1000) throw new Error("The installed Desktop bundled catalog was invalid.");
+  const matches: string[] = [];
+  for (const entry of root.models) {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) throw new Error("The installed Desktop bundled catalog was invalid.");
+    const instructions = (entry as Record<string, unknown>)[record.instructionField];
+    if (instructions !== undefined && typeof instructions !== "string") throw new Error("The installed Desktop bundled catalog was invalid.");
+    if (typeof instructions !== "string") continue;
+    const bytes = Buffer.from(instructions, "utf8");
+    if (bytes.length === record.expectedInstructionUtf8ByteLength
+      && sha256(bytes) === record.expectedInstructionSha256.toUpperCase()) matches.push(instructions);
+  }
+  if (matches.length === 0) throw new Error("instruction_source_unrecognized: reviewed SHA-256 and UTF-8 length absent.");
+  if (matches.length !== 1) throw new Error("instruction_source_ambiguous: reviewed SHA-256 and UTF-8 length duplicated.");
+  return matches[0];
+}
+
+interface Model {
+  id: string; displayName: string; contextWindow: number; maxOutputTokens: number;
+  inputModalities: string[]; defaultReasoningEffort: string;
+  supportedReasoningEfforts: { effort: string; description: string }[];
+  routing: Record<string, string>;
+}
+interface Role { modelId: string; reasoningEffort: string; concreteModelId: string }
+export interface Selection {
+  revision: number; selectionETag: string; models: Model[];
+  roles: { default: Role; swe_worker: Role };
+}
+
+/** Strict allowlist: gateway content never becomes instructions, TOML, or permissions. */
+export function validateSelection(input: unknown): Selection {
+  const root = object(input);
+  keys(root, ["schemaVersion", "revision", "selectionETag", "compatibilityProfileVersion", "includeFutureModels", "models", "roles", "excludedModels"]);
+  if (root.schemaVersion !== 2 || root.compatibilityProfileVersion !== CODEX_PROFILE_VERSION || typeof root.includeFutureModels !== "boolean") fail();
+  const revision = positive(root.revision);
+  if (root.selectionETag !== `"model-selection-v2-${revision}"`) fail();
+  if (!Array.isArray(root.models) || !root.models.length || root.models.length > 2048 || !Array.isArray(root.excludedModels)) fail();
+  const seen = new Set<string>();
+  const concreteSeen = new Set<string>();
+  const models: Model[] = (root.models as unknown[]).map((entry) => {
+    const row = object(entry);
+    keys(row, ["id", "displayName", "contextWindow", "maxOutputTokens", "inputModalities", "defaultReasoningEffort", "supportedReasoningEfforts", "multiAgentVersion", "shellType", "routing", "metadataProvenance", "familyProvenance", "upstreamDefaultEffort"]);
+    const modelId = id(row.id);
+    if (seen.has(modelId)) fail();
+    seen.add(modelId);
+    const routing = object(row.routing);
+    const order = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
+    const efforts = Object.keys(routing).sort((a, b) => order.indexOf(a) - order.indexOf(b));
+    if (!efforts.length || !Array.isArray(row.supportedReasoningEfforts) || row.supportedReasoningEfforts.length !== efforts.length) fail();
+    const supported = efforts.map((effort) => {
+      const concrete = id(routing[effort]);
+      if (!order.includes(effort) || concreteSeen.has(concrete)
+        || (modelId !== concrete && !["upstream_family_metadata", "reviewed_fallback"].includes(row.familyProvenance as string))) fail();
+      if (row.multiAgentVersion !== "v1" || row.shellType !== "shell_command") fail();
+      concreteSeen.add(concrete);
+      const supplied = (row.supportedReasoningEfforts as unknown[]).map(object).filter((item) => item.effort === effort);
+      if (supplied.length !== 1) fail();
+      keys(supplied[0], ["effort", "description"]);
+      return { effort, description: text(supplied[0].description) };
+    });
+    if (!efforts.includes(row.defaultReasoningEffort as string)) fail();
+    const provenance = object(row.metadataProvenance);
+    keys(provenance, ["id", "displayName", "contextWindow", "maxOutputTokens", "imageSupport", "upstreamThinking", "reasoning"]);
+    if (provenance.id !== "upstream" || provenance.contextWindow !== "upstream" || provenance.maxOutputTokens !== "upstream" || provenance.imageSupport !== "upstream") fail();
+    if (!["upstream", "id_fallback"].includes(provenance.displayName as string) || !["upstream", "omitted"].includes(provenance.upstreamThinking as string)
+      || provenance.reasoning !== "upstream_indicator_and_label_heuristic") fail();
+    if (![null, "upstream_family_metadata", "reviewed_fallback"].includes(row.familyProvenance as string | null)) fail();
+    if (row.upstreamDefaultEffort !== null && !["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(row.upstreamDefaultEffort as string)) fail();
+    if (!Array.isArray(row.inputModalities) || !["text", "text,image"].includes(row.inputModalities.join(","))) fail();
+    return { id: modelId, displayName: text(row.displayName), contextWindow: positive(row.contextWindow), maxOutputTokens: positive(row.maxOutputTokens),
+      inputModalities: [...row.inputModalities as string[]], defaultReasoningEffort: row.defaultReasoningEffort as string,
+      supportedReasoningEfforts: supported, routing: Object.fromEntries(efforts.map((effort) => [effort, routing[effort] as string])) };
+  });
+  const excludedSeen = new Set<string>();
+  for (const entry of root.excludedModels as unknown[]) {
+    const excluded = object(entry);
+    keys(excluded, ["id", "reason"]);
+    const excludedId = id(excluded.id);
+    if (excludedSeen.has(excludedId) || concreteSeen.has(excludedId) || seen.has(excludedId) || !["unavailable", "incomplete_metadata", "missing_effort_metadata", "unsupported_family_metadata", "ambiguous_family_metadata", "shadowed_family_route"].includes(excluded.reason as string)) fail();
+    excludedSeen.add(excludedId);
+  }
+  const rolesObject = object(root.roles);
+  keys(rolesObject, ["default", "swe_worker"]);
+  const readRole = (name: string): Role => {
+    const role = object(rolesObject[name]);
+    keys(role, ["modelId", "reasoningEffort", "concreteModelId"]);
+    const model = models.find((entry) => entry.id === role.modelId);
+    if (!model || typeof role.reasoningEffort !== "string" || !Object.hasOwn(model.routing, role.reasoningEffort)
+      || model.routing[role.reasoningEffort] !== role.concreteModelId || excludedSeen.has(role.concreteModelId as string)) fail();
+    return { modelId: role.modelId as string, reasoningEffort: role.reasoningEffort as string, concreteModelId: role.concreteModelId as string };
+  };
+  return { revision, selectionETag: root.selectionETag as string, models: models.sort((a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0), roles: { default: readRole("default"), swe_worker: readRole("swe_worker") } };
+}
+
+export function generateSelection(input: unknown, runtimeVersion: string, runtimePath: string, dependencies: RuntimeSelectionDependencies = {}) {
+  const selection = validateSelection(input);
+  const record = dependencies.runtimeRecord ?? loadRuntimeInstructionRecord();
+  const instructions = extractRuntimeInstructions(runtimeVersion, runtimePath, dependencies.runRuntime, record);
+  const metadata = record.modelMetadata;
+  const reviewerModel = selection.models.find(model => model.id === "swe-2" && model.routing.medium === "swe-2-medium");
+  const models = selection.models.map((model, index) => ({
+    slug: model.id,
+    multi_agent_version: metadata.multi_agent_version,
+    display_name: model.displayName,
+    default_reasoning_level: model.defaultReasoningEffort,
+    supported_reasoning_levels: model.supportedReasoningEfforts,
+    shell_type: metadata.shell_type,
+    visibility: metadata.visibility,
+    supported_in_api: metadata.supported_in_api,
+    priority: index,
+    support_verbosity: metadata.support_verbosity,
+    truncation_policy: metadata.truncation_policy,
+    experimental_supported_tools: metadata.experimental_supported_tools,
+    input_modalities: model.inputModalities,
+    context_window: model.contextWindow,
+    max_context_window: model.contextWindow,
+    base_instructions: instructions,
+    ...(model === reviewerModel ? { auto_review_model_override: "swe-2-medium" } : {}),
+  }));
+  if (reviewerModel) {
+    // A hidden concrete preset prevents review effort from falling back to the
+    // parent's High/Max. It is derived only from enabled, validated Medium data.
+    const parent = models.find(model => model.slug === reviewerModel.id)!;
+    models.push({ ...parent, slug: "swe-2-medium", display_name: "SWE-2 approval reviewer",
+      visibility: "hide", priority: models.length, default_reasoning_level: "medium",
+      supported_reasoning_levels: reviewerModel.supportedReasoningEfforts.filter(row => row.effort === "medium"),
+    });
+  }
+  const catalogText = JSON.stringify({ models }, null, 2) + "\n";
+  probeGeneratedCatalog(runtimePath, models, selection.roles, dependencies.runRuntime ?? runBundledRuntimeCatalog);
+  return { schemaVersion: 1, runtimeVersion, compatibilityContractVersion: COMPATIBILITY_CONTRACT_VERSION,
+    runtimeExecutablePath: runtimePath,
+    runtimeExecutableSha256: dependencies.runRuntime ? undefined : sha256(readFileSync(runtimePath)),
+    revision: selection.revision, selectionETag: selection.selectionETag,
+    instructionSha256: record.expectedInstructionSha256.toUpperCase(), instructionUtf8ByteLength: record.expectedInstructionUtf8ByteLength,
+    catalogSha256: sha256(catalogText), catalogText, roles: selection.roles };
+}
+
+/** JSON.parse alone silently accepts duplicate object keys. Reject those before validation. */
+export function parseSelectionJson(json: string): unknown {
+  const parsed = JSON.parse(json);
+  const tokens = json.match(/"(?:[^"\\]|\\.)*"|[{}\[\],:]|true|false|null|-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?/g) ?? [];
+  let index = 0;
+  const value = (): void => {
+    const token = tokens[index++];
+    if (token === "{") {
+      const names = new Set<string>();
+      if (tokens[index] === "}") { index++; return; }
+      do {
+        const name = JSON.parse(tokens[index++]);
+        if (names.has(name) || tokens[index++] !== ":") fail();
+        names.add(name);
+        value();
+      } while (tokens[index++] === ",");
+    } else if (token === "[") {
+      if (tokens[index] === "]") { index++; return; }
+      do { value(); } while (tokens[index++] === ",");
+    }
+  };
+  value();
+  return parsed;
+}
+
+// Bounded stdin; only disposable offline probe files are written, never active files.
+if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
+  try {
+    const input = readFileSync(0);
+    if (input.length > 262144) fail();
+    process.stdout.write(JSON.stringify(generateSelection(parseSelectionJson(new TextDecoder("utf-8", { fatal: true }).decode(input)), process.argv[2], process.argv[3])));
+  } catch {
+    process.stderr.write("Codex selection preparation failed validation; no defaults or remote instructions were accepted.\n");
+    process.exitCode = 1;
+  }
+}

@@ -1,0 +1,17 @@
+node_modules/
+dist/
+.git/
+.env*
+gateway.env.example
+logs/
+*.log
+*.jsonl
+coverage/
+test/
+tests/
+tools/
+plan/
+AGENTS*.md
+README*
+secrets/
+deploy/

@@ -1,0 +1,1657 @@
+import { foldDevinToolSchema } from "./devin-schema-fold.js";
+/**
+ * Devin Gateway — HTTP server.
+ *
+ * Exposes Devin/Windsurf Cascade models behind standard API surfaces:
+ *   POST /v1/chat/completions   — OpenAI Chat Completions
+ *   POST /v1/responses          — OpenAI Responses API
+ *   POST /v1/messages           — Anthropic Messages
+ *   GET  /v1/models             — OpenAI-style model list
+ *   GET  /health                — health check
+ *
+ * The server holds an optional fallback token in memory. Request credentials
+ * via `Authorization: Bearer <token>` or `x-api-key: <token>` take precedence.
+ * The fallback can be supplied through `DEVIN_API_KEY` or `ServerOptions.token`. With model selection on, the active account profile is the fallback when neither is set.
+ */
+
+import { streamChat, discoverModels, discoverModelMetadata, type ChatStreamEvent } from "./devin.js";
+import { projectModelFamilies, resolveFamilyModelId, FamilyRoutingError } from "./model-families.js";
+import { getCodexModelProfile } from "./admin/codex-model-profiles.js";
+import { withResponsesBridgeInstructions } from "./responses-bridge-capability.js";
+import { withHistoricalToolGuidance, withNativeWebSearchUnavailable } from "./responses-history-guidance.js";
+import { DIAGNOSTIC_CATALOG_HEADER, DIAGNOSTIC_CATALOG_NOTICE, selectDiagnosticCatalog } from "./responses-diagnostic-catalog.js";
+import { BISECTION_ENV, bisectionRequestFingerprint, selectBisectionCatalog } from "./responses-catalog-bisection.js";
+import { claimOptionalDiagnosticArm } from "./responses-bisection-arm.js";
+import { SWE_AUTONOMOUS_CONTINUATION_ENV, withSweCompletionInstruction, sweResponseEndTurn } from "./responses-swe-autonomy.js";
+import { ModelSelectionStore } from "./admin/model-selection-store.js";
+import { CODEX_SELECTION_PATH, createModelSelectionRoutes, managementRequestAllowed } from "./admin/routes.js";
+import { ACCOUNTS_PATH, createAccountRoutes } from "./admin/accounts-routes.js";
+import { AdminProxySecret } from "./admin/proxy-secret.js";
+import { AccountStore } from "./accounts/account-store.js";
+import { AccountRuntime, type CredentialSnapshot } from "./accounts/runtime.js";
+import { CONFIG_DIR } from "./config.js";
+import { createAdminStaticHandler } from "./admin/static.js";
+import { ModelTestStatusStore, ModelValidationTracker, returnedToolSucceeded } from "./admin/model-test-status.js";
+import { createHash } from "node:crypto";
+import { listModels, type ModelInfo } from "./models.js";
+import {
+  openaiToInternal,
+  openaiToolsToDevin,
+  responsesInputToOpenAIMessages,
+  CROSS_PROVIDER_SKIP_COMPACTION_ENV,
+  responsesToolsetToDevin,
+  responsesExecutableDeclarations,
+  historicalToolsAsInertText,
+  ResponsesInputError,
+  anthropicToInternal,
+  anthropicToolsToDevin,
+  toDevinPrompts,
+  stopReasonToOpenAI,
+  stopReasonToAnthropic,
+  type OpenAIMessage,
+  type OpenAITool,
+  type AnthropicMessage,
+  type AnthropicTool,
+} from "./convert.js";
+import { StopReason, type ChatMessagePrompt, type ChatToolChoice, type ChatToolDefinition } from "./proto.js";
+import { log, truncate } from "./log.js";
+import { ErrorTrace, runTrace, runTraceAsync, currentTrace } from "./error-trace.js";
+import {
+  CODEX_DESKTOP_SYSTEM_COLLAPSE_ENV,
+  collapseSystemPromptIntoLatestUserMessage,
+  isCodexDesktopSystemCollapseRequest,
+} from "./responses-system-collapse.js";
+import {
+  currentResponsesDiagnostic,
+  ResponsesSafeDiagnostic,
+  responsesSafeDiagnosticsEnabled,
+  runWithResponsesDiagnostic,
+} from "./responses-diagnostics.js";
+
+// ─── Config (populated by startServer) ──────────────────────────────────────
+
+let PORT = 3000;
+let HOST = "0.0.0.0";
+/** Optional in-memory fallback token when a request carries no credentials. */
+let DEFAULT_DEVIN_KEY = "";
+/** Accounts are on whenever model selection is on, unless DEVIN_ACCOUNTS_DISABLED=1. Shared by every entry path. */
+export function accountProfilesEnabled(selectionEnabled = process.env.DEVIN_MODEL_SELECTION_ENABLED === "1"): boolean {
+  return selectionEnabled && process.env.DEVIN_ACCOUNTS_DISABLED !== "1";
+}
+
+/** Account runtime when model selection is enabled. Undefined otherwise. */
+let ACCOUNT_RUNTIME: AccountRuntime | undefined;
+/** One credential snapshot per request, resolved at entry, so a switch cannot split a request. */
+const REQUEST_CREDENTIALS = new WeakMap<Request, CredentialSnapshot>();
+/** Base URL override for the Devin API (default: https://server.codeium.com). */
+let DEVIN_BASE_URL = "";
+const knownLogicalFamilyIds = new Set<string>();
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
+/** Explicit request-header token only. The fallback is applied by credentialFor. */
+function requestHeaderToken(req: Request): string {
+  const auth = req.headers.get("authorization") ?? "";
+  const bearer = auth.startsWith("Bearer ") ? auth.slice(7) : auth;
+  return bearer || (req.headers.get("x-api-key") ?? "");
+}
+
+/** Request header first, then the static fallback, then the active account profile. */
+async function credentialFor(req: Request): Promise<CredentialSnapshot> {
+  const requestToken = requestHeaderToken(req);
+  if (ACCOUNT_RUNTIME) return ACCOUNT_RUNTIME.snapshot(requestToken);
+  const token = requestToken || DEFAULT_DEVIN_KEY;
+  return { token, origin: requestToken ? "request" : token ? "static" : "none" };
+}
+
+function extractToken(req: Request): string {
+  // Authorization: Bearer <token> (OpenAI) or bare <token>
+  const auth = req.headers.get("authorization") ?? "";
+  const bearer = auth.startsWith("Bearer ") ? auth.slice(7) : auth;
+  // x-api-key: <token> (Anthropic SDK convention)
+  const apiKey = req.headers.get("x-api-key") ?? "";
+  // Requests dispatched through fetch reuse the snapshot resolved at entry, which already applied
+  // the header, static fallback, and active-account precedence.
+  const snapshot = REQUEST_CREDENTIALS.get(req);
+  if (snapshot) return snapshot.token;
+  // Per-request credentials override the optional DEVIN_API_KEY fallback.
+  return bearer || apiKey || DEFAULT_DEVIN_KEY;
+}
+
+async function resolveRequestModel(modelId: string, effort: unknown, token: string, signal: AbortSignal): Promise<string> {
+  // Existing exact concrete IDs retain their direct wire path.
+  if (getCodexModelProfile(modelId) || listModels().some((model) => model.id === modelId)) return modelId;
+  const discovered = await discoverModelMetadata(token, DEVIN_BASE_URL || undefined, signal, 5000).catch(() => []);
+  if (!discovered.length && knownLogicalFamilyIds.has(modelId)) throw new FamilyRoutingError("Logical model family discovery is unavailable; no route was substituted.");
+  const families = projectModelFamilies(discovered);
+  if (knownLogicalFamilyIds.has(modelId) && !families.some((family) => family.id === modelId)) throw new FamilyRoutingError("Logical model family is unavailable; no route was substituted.");
+  for (const family of families) knownLogicalFamilyIds.add(family.id);
+  // Unknown direct IDs historically pass through. Reviewed logical families never do.
+  return resolveFamilyModelId(modelId, effort, families);
+}
+
+/** Extract an error message from a non-2xx Response for trace flushing. */
+function traceFlushError(res: Response, status: number): unknown {
+  // The response body is a JSON error envelope; clone so the original stays
+  // consumable by the caller.
+  return new Error(`HTTP ${status} response (see response body in trace)`);
+}
+
+function jsonResponse(req: Request, body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { "content-type": "application/json", ...corsHeaders(req) },
+  });
+}
+
+function corsHeaders(req: Request): Record<string, string> {
+  const origin = req.headers.get("origin");
+  return origin ? { "access-control-allow-origin": origin, "access-control-allow-headers": "*", "access-control-allow-methods": "*" } : {};
+}
+
+function errorResponse(req: Request, status: number, message: string, type = "invalid_request_error"): Response {
+  return jsonResponse(req, { error: { message, type } }, status);
+}
+
+// ─── Upstream error classification ──────────────────────────────────────────
+
+interface UpstreamErrorClass {
+  /** HTTP status to surface to the caller. */
+  status: number;
+  /** Standard error type (OpenAI/Anthropic conventions). */
+  type: string;
+  /** OpenAI error code, when the class has a canonical one. */
+  code?: string;
+}
+
+/**
+ * Classify an upstream Devin/Codeium error into an HTTP status and a standard
+ * error type. Codeium reports rate limits as a Connect end-stream trailer with
+ * gRPC code `permission_denied` and a message that explicitly mentions the
+ * rate limit, so the message text is the reliable signal — the code alone
+ * would misclassify real permission errors. The standard gRPC quota code
+ * `resource_exhausted` is accepted as a direct signal.
+ */
+function classifyUpstreamError(message: string | undefined, code?: string): UpstreamErrorClass {
+  if (/rate limit|rate_limit|quota/i.test(message ?? "") || code === "resource_exhausted") {
+    return { status: 429, type: "rate_limit_error", code: "rate_limit_exceeded" };
+  }
+  return { status: 502, type: "api_error" };
+}
+
+// ─── tool_choice mapping ────────────────────────────────────────────────────
+
+/** Map an OpenAI `tool_choice` value onto a Devin `ChatToolChoice`. */
+function mapOpenAIToolChoice(choice: OpenAIChatRequest["tool_choice"]): ChatToolChoice | undefined {
+  if (!choice) return undefined;
+  if (typeof choice === "string") {
+    // "auto" | "none" | "required" → optionName; Devin recognises "auto".
+    return { optionName: choice === "required" ? "any" : choice };
+  }
+  if (choice.type === "function" && choice.function?.name) {
+    return { toolName: choice.function.name };
+  }
+  return undefined;
+}
+
+/** Map an Anthropic `tool_choice` value onto a Devin `ChatToolChoice`. */
+function mapAnthropicToolChoice(choice: AnthropicRequest["tool_choice"]): ChatToolChoice | undefined {
+  if (!choice) return undefined;
+  if (choice.type === "auto" || choice.type === "any") return { optionName: choice.type };
+  if (choice.type === "tool" && choice.name) return { toolName: choice.name };
+  return undefined;
+}
+
+// ─── OpenAI Chat Completions ─────────────────────────────────────────────────
+
+interface OpenAIChatRequest {
+  model: string;
+  messages: OpenAIMessage[];
+  stream?: boolean;
+  temperature?: number;
+  max_tokens?: number;
+  max_completion_tokens?: number;
+  top_p?: number;
+  tools?: OpenAITool[];
+  tool_choice?: string | { type: string; function?: { name: string } };
+  stop?: string | string[];
+  reasoning_effort?: string;
+  stream_options?: { include_usage?: boolean };
+}
+
+async function handleChatCompletions(req: Request, reqId: string, trace: ErrorTrace): Promise<Response> {
+  const body = (await req.json()) as OpenAIChatRequest;
+  const token = extractToken(req);
+  if (!token) return errorResponse(req, 401, "No Devin API key. Sign in an account profile, set DEVIN_API_KEY, or pass Authorization: Bearer <token> / x-api-key: <token>.", "authentication_error");
+
+  let modelUid: string;
+  try { modelUid = await resolveRequestModel(body.model, body.reasoning_effort, token, req.signal); }
+  catch (error) { return errorResponse(req, 400, error instanceof FamilyRoutingError ? error.message : "Model family discovery is unavailable.", "invalid_request_error"); }
+  const internal = openaiToInternal(body.messages);
+  const cascadeId = crypto.randomUUID();
+  const prompts = toDevinPrompts(internal, cascadeId);
+  const systemPrompt = extractSystemPrompt(body.messages);
+  const tools = openaiToolsToDevin(body.tools);
+  const toolChoice = mapOpenAIToolChoice(body.tool_choice);
+  const stop = Array.isArray(body.stop) ? body.stop : body.stop ? [body.stop] : undefined;
+  const maxTokens = body.max_completion_tokens ?? body.max_tokens;
+
+  const completionId = `chatcmpl-${crypto.randomUUID().replace(/-/g, "").slice(0, 24)}`;
+  const created = Math.floor(Date.now() / 1000);
+
+  if (body.stream) {
+    return streamOpenAIChat(req, {
+      reqId, trace, token, modelUid, systemPrompt, prompts, tools, maxTokens,
+      temperature: body.temperature, topP: body.top_p, stopSequences: stop,
+      cascadeId, modelId: body.model, completionId, created, toolChoice,
+      includeUsage: body.stream_options?.include_usage ?? false,
+    });
+  }
+
+  // Non-streaming: collect all events
+  try {
+    let text = "";
+    let thinking = "";
+    const toolCalls: { id: string; name: string; arguments: string }[] = [];
+    let stopReason = 0;
+    let usage: { inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheWriteTokens: number } | null | undefined;
+
+    for await (const ev of streamChat({
+      apiKey: token, modelUid, systemPrompt, messages: prompts, tools,
+      maxTokens, temperature: body.temperature, topP: body.top_p, stopSequences: stop, cascadeId, toolChoice,
+      baseUrl: DEVIN_BASE_URL || undefined,
+    })) {
+      if (ev.type === "text") text += ev.deltaText;
+      else if (ev.type === "thinking") thinking += ev.deltaThinking;
+      else if (ev.type === "toolcall" && ev.toolCalls) {
+        for (const tc of ev.toolCalls) {
+          const existing = toolCalls.find((t) => t.id === tc.id);
+          if (existing) {
+            existing.arguments = tc.argumentsJson;
+          } else {
+            toolCalls.push({ id: tc.id, name: tc.name, arguments: tc.argumentsJson });
+          }
+        }
+      } else if (ev.type === "usage") usage = ev.usage;
+      else if (ev.type === "done") stopReason = ev.stopReason ?? 0;
+      else if (ev.type === "error") throw Object.assign(new Error(ev.error), { code: ev.code });
+    }
+
+    const hasToolCalls = toolCalls.length > 0;
+    const message: Record<string, unknown> = {
+      role: "assistant",
+      content: text || null,
+    };
+    if (thinking) message.reasoning_content = thinking;
+    if (hasToolCalls) {
+      message.content = null;
+      message.tool_calls = toolCalls.map((tc, i) => ({
+        id: tc.id || `call_${i}`,
+        type: "function",
+        function: { name: tc.name, arguments: tc.arguments || "{}" },
+      }));
+    }
+
+    return jsonResponse(req, {
+      id: completionId,
+      object: "chat.completion",
+      created,
+      model: body.model,
+      choices: [{
+        index: 0,
+        message,
+        finish_reason: stopReasonToOpenAI(stopReason, hasToolCalls),
+      }],
+      usage: usage ? {
+        prompt_tokens: usage.inputTokens,
+        completion_tokens: usage.outputTokens,
+        total_tokens: usage.inputTokens + usage.outputTokens,
+        prompt_tokens_details: { cached_tokens: usage.cacheReadTokens },
+      } : undefined,
+    });
+  } catch (err) {
+    const msg = String((err as Error).message ?? err);
+    const cls = classifyUpstreamError(msg, (err as Error & { code?: string }).code);
+    log.error(`[chat/completions ${reqId}] non-stream failed:`, err);
+    trace.flush(err, cls.status);
+    return errorResponse(req, cls.status, msg, cls.type);
+  }
+}
+
+function streamOpenAIChat(
+  req: Request,
+  params: {
+    reqId: string; trace: ErrorTrace; token: string; modelUid: string; systemPrompt: string;
+    prompts: ChatMessagePrompt[]; tools: ChatToolDefinition[];
+    cascadeId: string; modelId: string; completionId: string; created: number;
+    maxTokens?: number; temperature?: number; topP?: number; stopSequences?: string[];
+    toolChoice?: ChatToolChoice;
+    includeUsage: boolean;
+  },
+): Response {
+  const { reqId, trace, token, modelUid, systemPrompt, prompts, tools, maxTokens, temperature, topP, stopSequences, cascadeId, modelId, completionId, created, toolChoice, includeUsage } = params;
+
+  const stream = new ReadableStream({
+    async start(controller) {
+      // Re-establish ALS context inside the stream callback so devin.ts can
+      // record upstream events via currentTrace().
+      await runTraceAsync(trace, async () => {
+      const encoder = new TextEncoder();
+      const send = (obj: unknown) => controller.enqueue(encoder.encode(`data: ${JSON.stringify(obj)}\n\n`));
+
+      let upstreamChunks = 0;
+      let sentChunks = 0;
+      const slog = (msg: string) => log.debug(`[stream/chat ${reqId}] ${msg}`);
+
+      try {
+        // Initial role chunk
+        send({
+          id: completionId, object: "chat.completion.chunk", created, model: modelId,
+          choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }],
+        });
+        sentChunks++;
+
+        let hasToolCalls = false;
+        let stopReason = 0;
+        let usage: { inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheWriteTokens: number } | null | undefined;
+
+        for await (const ev of streamChat({
+          apiKey: token, modelUid, systemPrompt, messages: prompts, tools,
+          maxTokens, temperature, topP, stopSequences, cascadeId, toolChoice,
+          baseUrl: DEVIN_BASE_URL || undefined,
+        })) {
+          upstreamChunks++;
+          if (ev.type === "text" && ev.deltaText) {
+            send({
+              id: completionId, object: "chat.completion.chunk", created, model: modelId,
+              choices: [{ index: 0, delta: { content: ev.deltaText }, finish_reason: null }],
+            });
+            sentChunks++;
+          } else if (ev.type === "thinking" && ev.deltaThinking) {
+            // Forward reasoning tokens as reasoning_content so thinking models
+            // keep the SSE stream alive while reasoning (Bun closes idle
+            // streaming connections after idleTimeout seconds of silence).
+            send({
+              id: completionId, object: "chat.completion.chunk", created, model: modelId,
+              choices: [{ index: 0, delta: { reasoning_content: ev.deltaThinking }, finish_reason: null }],
+            });
+            sentChunks++;
+          } else if (ev.type === "toolcall" && ev.toolCalls) {
+            hasToolCalls = true;
+            for (const tc of ev.toolCalls) {
+              send({
+                id: completionId, object: "chat.completion.chunk", created, model: modelId,
+                choices: [{
+                  index: 0,
+                  delta: {
+                    tool_calls: [{
+                      id: tc.id, type: "function",
+                      function: { name: tc.name, arguments: tc.argumentsJson },
+                    }],
+                  },
+                  finish_reason: null,
+                }],
+              });
+              sentChunks++;
+            }
+          } else if (ev.type === "usage") {
+            usage = ev.usage;
+          } else if (ev.type === "done") {
+            stopReason = ev.stopReason ?? 0;
+          } else if (ev.type === "error") {
+            const cls = classifyUpstreamError(ev.error, ev.code);
+            send({ error: { message: ev.error, type: cls.type, code: cls.code } });
+            sentChunks++;
+            slog(`upstream error: ${ev.error}`);
+            trace.flush(new Error(ev.error), cls.status);
+          }
+        }
+        send({
+          id: completionId, object: "chat.completion.chunk", created, model: modelId,
+          choices: [{ index: 0, delta: {}, finish_reason: stopReasonToOpenAI(stopReason, hasToolCalls) }],
+        });
+        sentChunks++;
+        if (includeUsage) {
+          send({
+            id: completionId, object: "chat.completion.chunk", created, model: modelId,
+            choices: [],
+            usage: usage ? {
+              prompt_tokens: usage.inputTokens,
+              completion_tokens: usage.outputTokens,
+              total_tokens: usage.inputTokens + usage.outputTokens,
+              prompt_tokens_details: { cached_tokens: usage.cacheReadTokens },
+            } : undefined,
+          });
+          sentChunks++;
+        }
+        controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+        slog(`done — upstream chunks: ${upstreamChunks}, client chunks: ${sentChunks}`);
+      } catch (err) {
+        const cls = classifyUpstreamError(String((err as Error).message ?? err));
+        send({ error: { message: String((err as Error).message ?? err), type: cls.type, code: cls.code } });
+        sentChunks++;
+        log.error(`[stream/chat ${reqId}] exception after upstream=${upstreamChunks} client=${sentChunks}:`, err);
+        trace.flush(err, cls.status);
+      } finally {
+        controller.close();
+      }
+      }); // runTraceAsync
+    },
+  });
+
+  return new Response(stream, {
+    headers: {
+      "content-type": "text/event-stream",
+      "cache-control": "no-cache",
+      "connection": "keep-alive",
+      ...corsHeaders(req),
+    },
+  });
+}
+
+function extractSystemPrompt(messages: OpenAIMessage[]): string {
+  return messages
+    .filter((m) => m.role === "system" || m.role === "developer")
+    .map((m) => (typeof m.content === "string" ? m.content : ""))
+    .filter(Boolean)
+    .join("\n\n");
+}
+
+// ─── OpenAI Responses API ────────────────────────────────────────────────────
+
+interface OpenAIResponsesRequest {
+  model: string;
+  input: unknown;
+  stream?: boolean;
+  temperature?: number;
+  max_output_tokens?: number;
+  top_p?: number;
+  tools?: unknown;
+  tool_choice?: unknown;
+  parallel_tool_calls?: boolean;
+  reasoning?: { effort?: string };
+  instructions?: string;
+  client_metadata?: unknown;
+}
+
+/** Hash only user-authored text leaves; never persist the text itself. */
+function responsesUserText(messages: OpenAIMessage[]): string {
+  const userMessages = messages.filter((message) => message.role === "user");
+  return userMessages.map((message) => {
+    if (typeof message.content === "string") return message.content;
+    if (!Array.isArray(message.content)) return "";
+    return message.content
+      .filter((part) => part.type === "input_text" || part.type === "text")
+      .map((part) => part.text ?? "")
+      .join("\n");
+  }).join("\n");
+}
+
+function recordResponsesHistoryCalls(diagnostic: ResponsesSafeDiagnostic, messages: OpenAIMessage[]): void {
+  for (const message of messages) {
+    if (message.tool_calls) {
+      for (const call of message.tool_calls) diagnostic.recordToolCall(call.function.name, call.id);
+    }
+    if (message.tool_call_id) diagnostic.recordToolCall(message.name ?? "unknown_tool", message.tool_call_id);
+  }
+}
+
+interface ResponsesToolCall {
+  id: string;
+  name: string;
+  arguments: string;
+}
+
+interface ResponsesToolCallAccumulator {
+  calls: Map<string, ResponsesToolCall>;
+  activeCallId?: string;
+  sawUnidentifiedDelta: boolean;
+}
+
+function collectResponsesToolCall(
+  state: ResponsesToolCallAccumulator,
+  call: { id: string; name: string; argumentsJson: string },
+  diagnostic?: ResponsesSafeDiagnostic,
+): void {
+  diagnostic?.recordNormalizedUpstreamToolCall(call);
+  // Follow-up Devin deltas may omit the ID. Correlate them to the most recent
+  // real ID; ignore unkeyed deltas until an ID arrives, as OMP does.
+  const id = call.id.trim() ? call.id : state.activeCallId;
+  if (!id) {
+    diagnostic?.recordBridgeOutcome("unidentified_delta");
+    state.sawUnidentifiedDelta = true;
+    return;
+  }
+
+  const existing = state.calls.get(id);
+  if (existing) {
+    diagnostic?.recordBridgeOutcome("same_id_delta");
+    if (call.name.trim()) existing.name = call.name;
+    // Devin can send either a cumulative snapshot or the next argument fragment.
+    if (call.argumentsJson) {
+      existing.arguments = call.argumentsJson.startsWith(existing.arguments)
+        ? call.argumentsJson
+        : existing.arguments + call.argumentsJson;
+    }
+    state.activeCallId = id;
+    return;
+  }
+  if (state.calls.size > 0) {
+    diagnostic?.recordBridgeOutcome("multiple_call_conflict");
+    throw new Error("Devin returned multiple function calls; this gateway supports one call per model response.");
+  }
+  state.calls.set(id, { id, name: call.name, arguments: call.argumentsJson });
+  state.activeCallId = id;
+}
+
+function finishResponsesToolCalls(
+  state: ResponsesToolCallAccumulator,
+  declaredTools: ReadonlyMap<string, { name: string; namespace?: string }>,
+  diagnostic?: ResponsesSafeDiagnostic,
+): Map<string, ResponsesToolCall> {
+  if (state.calls.size === 0 && state.sawUnidentifiedDelta) {
+    throw new Error("Devin returned function-call deltas but never supplied a call ID.");
+  }
+  for (const call of state.calls.values()) {
+    if (!call.name.trim()) { diagnostic?.recordBridgeOutcome("missing_name"); throw new Error("Devin returned a function call without a name."); }
+    if (!declaredTools.has(call.name)) { diagnostic?.recordUndeclaredTool(call.name); throw new Error(`Devin returned undeclared function '${call.name}'.`); }
+  }
+  return state.calls;
+}
+
+function responsesFunctionCallItem(
+  call: ResponsesToolCall,
+  declaredTools: ReadonlyMap<string, { name: string; namespace?: string }>,
+  diagnostic?: ResponsesSafeDiagnostic,
+): Record<string, unknown> {
+  const args = call.arguments || "{}";
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(args);
+  } catch {
+    diagnostic?.recordBridgeOutcome("invalid_arguments_json");
+    throw new Error(`Devin returned invalid JSON arguments for function '${call.name}'.`);
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    diagnostic?.recordBridgeOutcome("arguments_not_object");
+    throw new Error(`Devin returned non-object JSON arguments for function '${call.name}'.`);
+  }
+  const identity = declaredTools.get(call.name);
+  if (!identity) { diagnostic?.recordUndeclaredTool(call.name); throw new Error(`Devin returned undeclared function '${call.name}'.`); }
+  return {
+    type: "function_call",
+    id: `fc_${crypto.randomUUID().replace(/-/g, "").slice(0, 24)}`,
+    status: "completed",
+    call_id: call.id,
+    ...(identity.namespace ? { namespace: identity.namespace } : undefined),
+    name: identity.name,
+    arguments: args,
+  };
+}
+
+function mapResponsesToolChoice(
+  choice: unknown,
+  declaredTools: ReadonlyMap<string, { name: string; namespace?: string }>,
+): ChatToolChoice | undefined {
+  if (choice === undefined) return undefined;
+  if (typeof choice === "string") {
+    if (choice === "required") return { optionName: "any" };
+    if (choice === "auto" || choice === "none") return { optionName: choice };
+  } else if (typeof choice === "object" && choice !== null && !Array.isArray(choice)) {
+    const value = choice as Record<string, unknown>;
+    if (value.type === "web_search") throw new ResponsesInputError("Native hosted web_search is unavailable through Devin Gateway; it cannot be required as tool_choice.");
+    if (value.type === "function" && typeof value.name === "string" && value.name.trim()) {
+      if (value.namespace !== undefined && typeof value.namespace !== "string") {
+        throw new ResponsesInputError("Responses function tool_choice namespace must be a string.");
+      }
+      const namespace = value.namespace as string | undefined;
+      const match = [...declaredTools.entries()].find(([, identity]) =>
+        identity.name === value.name && identity.namespace === namespace,
+      );
+      if (match) return { toolName: match[0] };
+    }
+  }
+  throw new ResponsesInputError("Unsupported Responses tool_choice; use auto, none, required, or one declared function name.");
+}
+
+let activeCatalogDiagnostic: string | undefined;
+
+async function handleResponses(req: Request, reqId: string, trace: ErrorTrace): Promise<Response> {
+  const body = (await req.json()) as OpenAIResponsesRequest;
+  const diagnostic = currentResponsesDiagnostic();
+  const token = extractToken(req);
+  if (!token) return errorResponse(req, 401, "No Devin API key. Sign in an account profile, set DEVIN_API_KEY, or pass Authorization: Bearer <token> / x-api-key: <token>.", "authentication_error");
+
+  // Guardian requests may inherit provider headers; never reduce their catalog.
+  const clientMetadata = body.client_metadata;
+  const approvalReviewer = req.headers.get("x-codex-guardian") === "reviewer"
+    || req.headers.get("x-openai-subagent") === "guardian"
+    || (clientMetadata !== null && typeof clientMetadata === "object" && !Array.isArray(clientMetadata)
+      && (clientMetadata as Record<string, unknown>)["x-openai-subagent"] === "guardian");
+  const diagnosticCatalog = approvalReviewer ? null : req.headers.get(DIAGNOSTIC_CATALOG_HEADER);
+  const diagnosticEligible = process.env[BISECTION_ENV] === "1" && !approvalReviewer && diagnosticCatalog === null
+    && body.model === "claude-haiku-5-5" && body.reasoning?.effort === "high";
+  let isCatalogDiagnostic = false;
+  let diagnosticStreamOwnsLock = false;
+  try {
+  if (diagnosticEligible && activeCatalogDiagnostic) return errorResponse(req, 409, "Another catalog diagnostic is still running.", "invalid_request_error");
+  let messages: OpenAIMessage[];
+  let tools: ChatToolDefinition[];
+  let declaredTools: Map<string, { name: string; namespace?: string }>;
+  let toolChoice: ChatToolChoice | undefined;
+  let nativeWebSearchUnavailable = false;
+  try {
+    if (body.instructions !== undefined && typeof body.instructions !== "string") {
+      throw new ResponsesInputError("Responses instructions must be a string.");
+    }
+    if (body.parallel_tool_calls !== undefined && typeof body.parallel_tool_calls !== "boolean") {
+      throw new ResponsesInputError("Responses parallel_tool_calls must be a boolean.");
+    }
+    messages = responsesInputToOpenAIMessages(body.input, {
+      skipCompaction: process.env[CROSS_PROVIDER_SKIP_COMPACTION_ENV] === "1",
+    });
+    const fullToolset = responsesToolsetToDevin(responsesExecutableDeclarations(body.tools, body.input),
+      declaration => diagnostic?.recordRejectedDeclaration(declaration),
+      declaration => diagnostic?.recordDuplicateDeclaration(declaration));
+    let toolset = selectDiagnosticCatalog(fullToolset, diagnosticCatalog);
+    const arm = diagnosticEligible ? claimOptionalDiagnosticArm(process.env.DEVIN_RESPONSES_CATALOG_BISECTION_DIR ?? "/app/logs/catalog-bisection") : undefined;
+    if (arm) {
+      activeCatalogDiagnostic = reqId;
+      isCatalogDiagnostic = true;
+      if (!diagnostic || !responsesSafeDiagnosticsEnabled() || process.env.DEVIN_RESPONSES_FULL_CATALOG_DIAGNOSTICS !== "1") throw new ResponsesInputError("Catalog bisection requires safe and full diagnostics.");
+      const requestFingerprint = bisectionRequestFingerprint(body);
+      const selection = selectBisectionCatalog(fullToolset, arm.selection, {
+        enabled: true, model: body.model, effort: body.reasoning?.effort,
+        guardian: approvalReviewer, legacySelector: diagnosticCatalog !== null, messages, toolChoice: body.tool_choice,
+        diagnosticsEnabled: true,
+      });
+      // Record only sanitized correlation metadata before rejecting a context mismatch.
+      diagnostic.recordBisectionSelection(fullToolset.tools.length, selection.fingerprint, requestFingerprint, selection.mode, selection.ordinals, arm.id);
+      if (arm.requestSha256 && arm.requestSha256 !== requestFingerprint) { diagnostic.recordBisectionContextMismatch(); throw new ResponsesInputError("Catalog bisection: request context fingerprint mismatch."); }
+      toolset = selection.toolset;
+    }
+    if (diagnosticCatalog !== null) diagnostic?.recordCatalogSelection(fullToolset.tools.length, diagnosticCatalog);
+    tools = toolset.tools;
+    declaredTools = toolset.identities;
+    nativeWebSearchUnavailable = toolset.nativeWebSearchUnavailable === true;
+    if (nativeWebSearchUnavailable && body.tool_choice === "required" && declaredTools.size === 0) {
+      throw new ResponsesInputError("Native hosted web_search is unavailable through Devin Gateway; no executable tool remains for required tool_choice.");
+    }
+    toolChoice = mapResponsesToolChoice(body.tool_choice, declaredTools);
+  } catch (err) {
+    if (!(err instanceof ResponsesInputError)) throw err;
+    return errorResponse(req, 400, err.message, "invalid_request_error");
+  }
+
+  if (body.instructions) messages = [{ role: "developer", content: body.instructions }, ...messages];
+
+  let modelUid: string;
+  try { modelUid = await resolveRequestModel(body.model, body.reasoning?.effort, token, req.signal); }
+  catch (error) { return errorResponse(req, 400, error instanceof FamilyRoutingError ? error.message : "Model family discovery is unavailable.", "invalid_request_error"); }
+  const conversationMessages = messages.filter(
+    (message) => message.role !== "system" && message.role !== "developer",
+  );
+  const cascadeId = crypto.randomUUID();
+  const originalSystemPrompt = extractSystemPrompt(messages);
+  // Keep native instructions intact; append gateway guidance after wire routing.
+  // Custom providers receive the Guardian session projection; the older
+  // x-codex-guardian header is restricted to Codex-backend routes.
+  // This is request classification, not authentication or approval authority.
+  const sweContinuationEnabled = !approvalReviewer && process.env[SWE_AUTONOMOUS_CONTINUATION_ENV] === "1";
+  let promptMessages: OpenAIMessage[];
+  try {
+    promptMessages = approvalReviewer ? conversationMessages : historicalToolsAsInertText(conversationMessages, declaredTools);
+  } catch (err) {
+    if (!(err instanceof ResponsesInputError)) throw err;
+    return errorResponse(req, 400, err.message, "invalid_request_error");
+  }
+  const originalPrompts = toDevinPrompts(openaiToInternal(promptMessages), cascadeId);
+  const completionSystemPrompt = withSweCompletionInstruction(
+    approvalReviewer ? originalSystemPrompt : withResponsesBridgeInstructions(originalSystemPrompt, modelUid), modelUid, sweContinuationEnabled,
+  );
+  const historySystemPrompt = approvalReviewer ? completionSystemPrompt
+    : withHistoricalToolGuidance(completionSystemPrompt, conversationMessages, declaredTools);
+  const capabilitySystemPrompt = nativeWebSearchUnavailable ? withNativeWebSearchUnavailable(historySystemPrompt) : historySystemPrompt;
+  const effectiveSystemPrompt = diagnosticCatalog === null ? capabilitySystemPrompt : `${capabilitySystemPrompt}\n\n${DIAGNOSTIC_CATALOG_NOTICE}`;
+  const collapseRequested = isCodexDesktopSystemCollapseRequest({
+    featureFlag: process.env[CODEX_DESKTOP_SYSTEM_COLLAPSE_ENV],
+  });
+  const collapse = collapseRequested
+    ? collapseSystemPromptIntoLatestUserMessage(effectiveSystemPrompt, originalPrompts)
+    : { applied: false, systemPrompt: effectiveSystemPrompt, prompts: originalPrompts };
+  const prompts = collapse.prompts;
+  const systemPrompt = collapse.systemPrompt;
+  diagnostic?.setRequestSummary({
+    modelId: body.model,
+    instructions: originalSystemPrompt,
+    userInput: responsesUserText(messages),
+    tools: tools.map((tool) => {
+      const identity = declaredTools.get(tool.name);
+      return {
+        name: tool.name,
+        namespace: identity?.namespace,
+        originalName: identity?.name ?? tool.name,
+        description: tool.description,
+        jsonSchemaString: foldDevinToolSchema(tool.jsonSchemaString),
+        strict: tool.strict,
+      };
+    }),
+    collapseSystemEnabled: collapse.applied,
+    collapsedUserPayload: collapse.collapsedUserPayload,
+    ...(process.env.DEVIN_RESPONSES_FULL_CATALOG_DIAGNOSTICS === "1" ? {
+      convertedMessageCount: prompts.length,
+      convertedPromptBytes: prompts.reduce((n, p) => n + Buffer.byteLength(p.prompt ?? "", "utf8"), 0),
+      convertedSystemBytes: Buffer.byteLength(systemPrompt, "utf8"),
+    } : {}),
+    sensitiveValues: [token],
+  });
+  diagnostic?.recordResolvedRouting({ logicalModel: body.model, requestedEffort: body.reasoning?.effort, resolvedModelId: modelUid });
+  diagnostic?.recordRequestStructure(messages, body.tool_choice, toolChoice, body.parallel_tool_calls);
+  for (const message of conversationMessages) {
+    if (message.role === "tool") diagnostic?.recordNormalizedFunctionCallOutput(message, returnedToolSucceeded(message.content));
+  }
+  if (diagnostic) recordResponsesHistoryCalls(diagnostic, messages);
+  const responseId = `resp_${crypto.randomUUID().replace(/-/g, "").slice(0, 24)}`;
+  const created = Math.floor(Date.now() / 1000);
+
+  if (body.stream) {
+    const response = streamOpenAIResponses(req, {
+      reqId, trace, token, modelUid, systemPrompt, prompts, tools, sweContinuationEnabled,
+      maxTokens: body.max_output_tokens, temperature: body.temperature, topP: body.top_p,
+      cascadeId, modelId: body.model, responseId, created, toolChoice, declaredTools,
+      diagnostic, blockDiagnosticToolCalls: isCatalogDiagnostic,
+      onDiagnosticSettled: isCatalogDiagnostic ? () => { if (activeCatalogDiagnostic === reqId) activeCatalogDiagnostic = undefined; } : undefined,
+    });
+    diagnosticStreamOwnsLock = isCatalogDiagnostic;
+    return response;
+  }
+
+  try {
+    let text = "";
+    const toolCallState: ResponsesToolCallAccumulator = { calls: new Map(), sawUnidentifiedDelta: false };
+    let stopReason = StopReason.UNSPECIFIED as number;
+    let usage: { inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheWriteTokens: number } | null = null;
+
+    for await (const ev of streamChat({
+      apiKey: token, modelUid, systemPrompt, messages: prompts, tools,
+      maxTokens: body.max_output_tokens, temperature: body.temperature, topP: body.top_p,
+      cascadeId, baseUrl: DEVIN_BASE_URL || undefined, toolChoice, signal: req.signal,
+    })) {
+      diagnostic?.recordUpstreamEvent(ev.type);
+      if (ev.type === "text") text += ev.deltaText;
+      else if (ev.type === "toolcall" && ev.toolCalls) {
+        for (const call of ev.toolCalls) {
+          diagnostic?.recordToolCall(call.name, call.id);
+          collectResponsesToolCall(toolCallState, call, diagnostic);
+        }
+      }
+      else if (ev.type === "usage" && ev.usage) usage = ev.usage;
+      else if (ev.type === "done") stopReason = ev.stopReason ?? StopReason.UNSPECIFIED;
+      else if (ev.type === "error") throw Object.assign(new Error(ev.error), { code: ev.code });
+    }
+    diagnostic?.recordUpstreamComplete();
+    diagnostic?.recordResponsesTermination(stopReason);
+    const status = stopReason === StopReason.MAX_TOKENS ? "incomplete" : "completed";
+
+    const toolCalls = finishResponsesToolCalls(toolCallState, declaredTools, diagnostic);
+    if (isCatalogDiagnostic && toolCalls.size) throw new Error("Diagnostic tool calls are blocked.");
+    const endTurn = sweResponseEndTurn(modelUid, sweContinuationEnabled, text, stopReason, toolCalls.size);
+    for (const call of toolCalls.values()) diagnostic?.recordNormalizedEmittedToolCall(call);
+    const output: Record<string, unknown>[] = [];
+    if (text || toolCalls.size === 0) {
+      output.push({
+        type: "message",
+        id: `msg_${crypto.randomUUID().replace(/-/g, "").slice(0, 24)}`,
+        status,
+        role: "assistant",
+        content: [{ type: "output_text", text }],
+      });
+    }
+    for (const call of toolCalls.values()) {
+      output.push(responsesFunctionCallItem(call, declaredTools, diagnostic));
+      diagnostic?.recordResponsesToolCallEmitted();
+    }
+
+    return jsonResponse(req, {
+      id: responseId,
+      object: "response",
+      created_at: created,
+      model: body.model,
+      status,
+      ...(endTurn !== undefined ? { end_turn: endTurn } : {}),
+      ...(status === "incomplete" ? { incomplete_details: { reason: "max_output_tokens" } } : {}),
+      output,
+      usage: usage ? {
+        input_tokens: usage.inputTokens,
+        output_tokens: usage.outputTokens,
+        total_tokens: usage.inputTokens + usage.outputTokens,
+        input_tokens_details: { cached_tokens: usage.cacheReadTokens },
+      } : undefined,
+    });
+  } catch (err) {
+    const msg = String((err as Error).message ?? err);
+    const upstreamCode = (err as Error & { code?: string }).code;
+    const cls = classifyUpstreamError(msg, upstreamCode);
+    if (diagnostic) {
+      diagnostic.recordFailure({
+        source: "gateway_responses_nonstream_catch",
+        classification: diagnostic.failureClassification
+          ?? (err instanceof ResponsesInputError ? "gateway_conversion_error" : upstreamCode ? "devin_connect_error" : "gateway_internal_error"),
+        message: msg,
+        terminalStatus: diagnostic.upstreamTerminalStatus ?? "gateway_error",
+      });
+    } else {
+      log.error(`[responses ${reqId}] non-stream failed:`, err);
+      trace.flush(err, cls.status);
+    }
+    return errorResponse(req, cls.status, msg, cls.type);
+  }
+  } finally {
+    if (isCatalogDiagnostic && !diagnosticStreamOwnsLock && activeCatalogDiagnostic === reqId) activeCatalogDiagnostic = undefined;
+  }
+}
+
+function streamOpenAIResponses(
+  req: Request,
+  params: {
+    reqId: string; trace: ErrorTrace; token: string; modelUid: string; systemPrompt: string;
+    prompts: ChatMessagePrompt[]; tools: ChatToolDefinition[];
+    maxTokens?: number; temperature?: number; topP?: number;
+    cascadeId: string; modelId: string; responseId: string; created: number;
+    toolChoice?: ChatToolChoice; declaredTools: Map<string, { name: string; namespace?: string }>;
+    diagnostic?: ResponsesSafeDiagnostic;
+    sweContinuationEnabled: boolean;
+    blockDiagnosticToolCalls: boolean;
+    onDiagnosticSettled?: () => void;
+  },
+): Response {
+  const { reqId, trace, token, modelUid, systemPrompt, prompts, tools, maxTokens, temperature, topP, cascadeId, modelId, responseId, created, toolChoice, declaredTools, diagnostic } = params;
+  const upstreamAbort = new AbortController();
+  const requestSignal = AbortSignal.any([req.signal, upstreamAbort.signal]);
+  let consumerCancelled = false;
+  diagnostic?.deferFinalization();
+
+  const stream = new ReadableStream({
+    async start(controller) {
+      const run = async (): Promise<void> => runTraceAsync(trace, async () => {
+      const encoder = new TextEncoder();
+      const send = (event: string, obj: unknown) =>
+        !consumerCancelled && controller.enqueue(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(obj)}\n\n`));
+      const slog = (msg: string) => log.debug(`[stream/responses ${reqId}] ${msg}`);
+      let upstreamChunks = 0;
+
+      try {
+        send("response.created", {
+          type: "response.created",
+          response: { id: responseId, object: "response", created_at: created, model: modelId, status: "in_progress" },
+        });
+
+        const messageId = `msg_${crypto.randomUUID().replace(/-/g, "").slice(0, 24)}`;
+        const reasoningId = `rs_${crypto.randomUUID().replace(/-/g, "").slice(0, 24)}`;
+        let reasoningStarted = false;
+        let messageStarted = false;
+        let fullText = "";
+        let stopReason = StopReason.UNSPECIFIED as number;
+        let outputIndex = 0;
+        const outputItems: unknown[] = [];
+        const toolCallState: ResponsesToolCallAccumulator = { calls: new Map(), sawUnidentifiedDelta: false };
+        let usage: { inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheWriteTokens: number } | null | undefined;
+
+        const startMessage = () => {
+          messageStarted = true;
+          send("response.output_item.added", {
+            type: "response.output_item.added",
+            output_index: outputIndex,
+            item: { type: "message", id: messageId, status: "in_progress", role: "assistant", content: [] },
+          });
+          send("response.content_part.added", {
+            type: "response.content_part.added",
+            item_id: messageId, output_index: outputIndex, content_index: 0,
+            part: { type: "output_text", text: "" },
+          });
+        };
+
+        for await (const ev of streamChat({
+          apiKey: token, modelUid, systemPrompt, messages: prompts, tools,
+          maxTokens, temperature, topP, cascadeId, baseUrl: DEVIN_BASE_URL || undefined,
+          toolChoice, signal: requestSignal,
+        })) {
+          upstreamChunks++;
+          diagnostic?.recordUpstreamEvent(ev.type);
+          if (ev.type === "thinking" && ev.deltaThinking) {
+            // Forward reasoning as a summary_text part so thinking models keep
+            // the SSE stream alive (Bun closes idle streams after idleTimeout).
+            if (!reasoningStarted) {
+              reasoningStarted = true;
+              send("response.output_item.added", {
+                type: "response.output_item.added",
+                output_index: outputIndex,
+                item: { type: "reasoning", id: reasoningId, status: "in_progress", summary: [] },
+              });
+            }
+            send("response.reasoning_summary_text.delta", {
+              type: "response.reasoning_summary_text.delta",
+              item_id: reasoningId, output_index: outputIndex, delta: ev.deltaThinking,
+            });
+          } else if (ev.type === "text" && ev.deltaText) {
+            if (reasoningStarted) {
+              send("response.reasoning_summary_text.done", {
+                type: "response.reasoning_summary_text.done",
+                item_id: reasoningId, output_index: outputIndex,
+              });
+              send("response.output_item.done", {
+                type: "response.output_item.done",
+                output_index: outputIndex,
+                item: { type: "reasoning", id: reasoningId, status: "completed", summary: [] },
+              });
+              outputItems.push({ type: "reasoning", id: reasoningId, status: "completed", summary: [] });
+              reasoningStarted = false;
+              outputIndex++;
+            }
+            if (!messageStarted) startMessage();
+            fullText += ev.deltaText;
+            send("response.output_text.delta", {
+              type: "response.output_text.delta",
+              item_id: messageId, output_index: outputIndex, content_index: 0, delta: ev.deltaText,
+            });
+          } else if (ev.type === "usage") {
+            usage = ev.usage;
+          } else if (ev.type === "toolcall" && ev.toolCalls) {
+            for (const call of ev.toolCalls) {
+              diagnostic?.recordToolCall(call.name, call.id);
+              collectResponsesToolCall(toolCallState, call, diagnostic);
+            }
+          } else if (ev.type === "error") {
+            throw Object.assign(new Error(ev.error), { code: ev.code });
+          } else if (ev.type === "done") {
+            stopReason = ev.stopReason ?? StopReason.UNSPECIFIED;
+          }
+        }
+        diagnostic?.recordUpstreamComplete();
+        diagnostic?.recordResponsesTermination(stopReason);
+        const status = stopReason === StopReason.MAX_TOKENS ? "incomplete" : "completed";
+        slog(`done — upstream chunks: ${upstreamChunks}`);
+        const toolCalls = finishResponsesToolCalls(toolCallState, declaredTools, diagnostic);
+        if (params.blockDiagnosticToolCalls && toolCalls.size) throw new Error("Diagnostic tool calls are blocked.");
+        const endTurn = sweResponseEndTurn(modelUid, params.sweContinuationEnabled, fullText, stopReason, toolCalls.size);
+        for (const call of toolCalls.values()) diagnostic?.recordNormalizedEmittedToolCall(call);
+
+        if (reasoningStarted) {
+          send("response.output_item.done", {
+            type: "response.output_item.done",
+            output_index: outputIndex,
+            item: { type: "reasoning", id: reasoningId, status: "completed", summary: [] },
+          });
+          outputItems.push({ type: "reasoning", id: reasoningId, status: "completed", summary: [] });
+          outputIndex++;
+        }
+
+        if (messageStarted) {
+          send("response.content_part.done", {
+            type: "response.content_part.done",
+            item_id: messageId, output_index: outputIndex, content_index: 0,
+            part: { type: "output_text", text: fullText },
+          });
+          send("response.output_item.done", {
+            type: "response.output_item.done",
+            output_index: outputIndex,
+            item: { type: "message", id: messageId, status, role: "assistant", content: [{ type: "output_text", text: fullText }] },
+          });
+          outputItems.push({ type: "message", id: messageId, status, role: "assistant", content: [{ type: "output_text", text: fullText }] });
+          outputIndex++;
+        }
+
+        for (const call of toolCalls.values()) {
+          const completedItem = responsesFunctionCallItem(call, declaredTools, diagnostic);
+          const outputIndexForCall = outputIndex++;
+          send("response.output_item.added", {
+            type: "response.output_item.added",
+            output_index: outputIndexForCall,
+            item: { ...completedItem, status: "in_progress", arguments: "" },
+          });
+          send("response.function_call_arguments.delta", {
+            type: "response.function_call_arguments.delta",
+            item_id: completedItem.id,
+            output_index: outputIndexForCall,
+            delta: completedItem.arguments,
+          });
+          send("response.function_call_arguments.done", {
+            type: "response.function_call_arguments.done",
+            item_id: completedItem.id,
+            output_index: outputIndexForCall,
+            arguments: completedItem.arguments,
+          });
+          send("response.output_item.done", {
+            type: "response.output_item.done",
+            output_index: outputIndexForCall,
+            item: completedItem,
+          });
+          outputItems.push(completedItem);
+          diagnostic?.recordResponsesToolCallEmitted();
+        }
+
+        send(`response.${status}`, {
+          type: `response.${status}`,
+          response: {
+            id: responseId, object: "response", created_at: created, model: modelId, status, output: outputItems,
+            ...(endTurn !== undefined ? { end_turn: endTurn } : {}),
+            ...(status === "incomplete" ? { incomplete_details: { reason: "max_output_tokens" } } : {}),
+            usage: usage ? {
+              input_tokens: usage.inputTokens,
+              output_tokens: usage.outputTokens,
+              total_tokens: usage.inputTokens + usage.outputTokens,
+              input_tokens_details: { cached_tokens: usage.cacheReadTokens },
+            } : undefined,
+          },
+        });
+        diagnostic?.recordSuccessfulCompletion();
+      } catch (err) {
+        const msg = String((err as Error).message ?? err);
+        const upstreamCode = (err as Error & { code?: string }).code;
+        const cls = classifyUpstreamError(msg, upstreamCode);
+        diagnostic?.recordFailure({
+          source: "gateway_responses_stream_catch",
+          classification: diagnostic.failureClassification
+            ?? (err instanceof ResponsesInputError ? "gateway_conversion_error" : upstreamCode ? "devin_connect_error" : "devin_stream_error"),
+          message: msg,
+          terminalStatus: diagnostic.upstreamTerminalStatus ?? "stream_error",
+        });
+        if (!diagnostic) log.error(`[stream/responses ${reqId}] exception after upstream=${upstreamChunks}:`, err);
+        send("response.failed", { type: "response.failed", error: { message: msg, type: cls.type, code: cls.code } });
+        if (!diagnostic) trace.flush(err, cls.status);
+      } finally {
+        if (diagnostic) diagnostic.finalize();
+        params.onDiagnosticSettled?.();
+        if (!consumerCancelled) controller.close();
+      }
+      });
+      if (diagnostic) await runWithResponsesDiagnostic(diagnostic, run);
+      else await run();
+    },
+    cancel(reason) {
+      consumerCancelled = true;
+      upstreamAbort.abort(reason);
+      diagnostic?.recordFailure({
+        source: "gateway_responses_client_cancel",
+        classification: "devin_stream_error",
+        terminalStatus: "cancelled",
+      });
+      diagnostic?.finalize();
+    },
+  });
+
+  return new Response(stream, {
+    headers: { "content-type": "text/event-stream", "cache-control": "no-cache", ...corsHeaders(req) },
+  });
+}
+
+// ─── Anthropic Messages ──────────────────────────────────────────────────────
+
+interface AnthropicRequest {
+  model: string;
+  messages: AnthropicMessage[];
+  system?: string | { type: string; text: string }[];
+  stream?: boolean;
+  temperature?: number;
+  max_tokens?: number;
+  top_p?: number;
+  tools?: AnthropicTool[];
+  tool_choice?: { type: string; name?: string };
+  stop_sequences?: string[];
+  thinking?: { type: string; budget_tokens?: number };
+}
+
+async function handleAnthropicMessages(req: Request, reqId: string, trace: ErrorTrace): Promise<Response> {
+  const body = (await req.json()) as AnthropicRequest;
+  const token = extractToken(req);
+  if (!token) return errorResponse(req, 401, "No Devin API key. Sign in an account profile, set DEVIN_API_KEY, or pass Authorization: Bearer <token> / x-api-key: <token>.", "authentication_error");
+
+  let modelUid: string;
+  try { modelUid = await resolveRequestModel(body.model, undefined, token, req.signal); }
+  catch (error) { return errorResponse(req, 400, error instanceof FamilyRoutingError ? error.message : "Model family discovery is unavailable.", "invalid_request_error"); }
+  const internal = anthropicToInternal(body.messages);
+  const cascadeId = crypto.randomUUID();
+  const prompts = toDevinPrompts(internal, cascadeId);
+  const systemPrompt = typeof body.system === "string"
+    ? body.system
+    : Array.isArray(body.system)
+      ? body.system.map((s) => s.text).join("\n\n")
+      : "";
+  const tools = anthropicToolsToDevin(body.tools);
+  const toolChoice = mapAnthropicToolChoice(body.tool_choice);
+  const messageId = `msg_${crypto.randomUUID().replace(/-/g, "").slice(0, 24)}`;
+
+  if (body.stream) {
+    return streamAnthropic(req, {
+      reqId, trace, token, modelUid, systemPrompt, prompts, tools,
+      maxTokens: body.max_tokens, temperature: body.temperature, topP: body.top_p,
+      stopSequences: body.stop_sequences, cascadeId, modelId: body.model, messageId, toolChoice,
+    });
+  }
+
+  try {
+    let text = "";
+    let thinking = "";
+    const toolCalls: { id: string; name: string; arguments: string }[] = [];
+    let stopReason = 0;
+    let usage: { inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheWriteTokens: number } | null | undefined;
+
+    for await (const ev of streamChat({
+      apiKey: token, modelUid, systemPrompt, messages: prompts, tools,
+      maxTokens: body.max_tokens, temperature: body.temperature, topP: body.top_p,
+      stopSequences: body.stop_sequences, cascadeId, toolChoice, baseUrl: DEVIN_BASE_URL || undefined,
+    })) {
+      if (ev.type === "text") text += ev.deltaText;
+      else if (ev.type === "thinking") thinking += ev.deltaThinking;
+      else if (ev.type === "toolcall" && ev.toolCalls) {
+        for (const tc of ev.toolCalls) {
+          const existing = toolCalls.find((t) => t.id === tc.id);
+          if (existing) existing.arguments = tc.argumentsJson;
+          else toolCalls.push({ id: tc.id, name: tc.name, arguments: tc.argumentsJson });
+        }
+      } else if (ev.type === "usage") usage = ev.usage;
+      else if (ev.type === "done") stopReason = ev.stopReason ?? 0;
+      else if (ev.type === "error") throw Object.assign(new Error(ev.error), { code: ev.code });
+    }
+
+    const hasToolCalls = toolCalls.length > 0;
+    const content: unknown[] = [];
+    if (thinking) content.push({ type: "thinking", thinking });
+    if (text) content.push({ type: "text", text });
+    if (hasToolCalls) {
+      for (const tc of toolCalls) {
+        content.push({
+          type: "tool_use", id: tc.id || `toolu_${crypto.randomUUID().slice(0, 12)}`,
+          name: tc.name, input: JSON.parse(tc.arguments || "{}"),
+        });
+      }
+    }
+    if (content.length === 0) content.push({ type: "text", text: "" });
+
+    return jsonResponse(req, {
+      id: messageId,
+      type: "message",
+      role: "assistant",
+      model: body.model,
+      content,
+      stop_reason: stopReasonToAnthropic(stopReason, hasToolCalls),
+      stop_sequence: null,
+      usage: usage ? {
+        input_tokens: usage.inputTokens,
+        output_tokens: usage.outputTokens,
+        cache_read_input_tokens: usage.cacheReadTokens,
+        cache_creation_input_tokens: usage.cacheWriteTokens,
+      } : { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
+    });
+  } catch (err) {
+    const msg = String((err as Error).message ?? err);
+    const cls = classifyUpstreamError(msg, (err as Error & { code?: string }).code);
+    log.error(`[messages ${reqId}] non-stream failed:`, err);
+    trace.flush(err, cls.status);
+    return errorResponse(req, cls.status, msg, cls.type);
+  }
+}
+
+function streamAnthropic(
+  req: Request,
+  params: {
+    reqId: string; trace: ErrorTrace; token: string; modelUid: string; systemPrompt: string;
+    prompts: ChatMessagePrompt[]; tools: ChatToolDefinition[];
+    maxTokens?: number; temperature?: number; topP?: number; stopSequences?: string[];
+    cascadeId: string; modelId: string; messageId: string;
+    toolChoice?: ChatToolChoice;
+  },
+): Response {
+  const { reqId, trace, token, modelUid, systemPrompt, prompts, tools, maxTokens, temperature, topP, stopSequences, cascadeId, modelId, messageId, toolChoice } = params;
+
+  const stream = new ReadableStream({
+    async start(controller) {
+      await runTraceAsync(trace, async () => {
+      const encoder = new TextEncoder();
+      const send = (event: string, obj: unknown) =>
+        controller.enqueue(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(obj)}\n\n`));
+      const slog = (msg: string) => log.debug(`[stream/messages ${reqId}] ${msg}`);
+      let upstreamChunks = 0;
+
+      try {
+        send("message_start", {
+          type: "message_start",
+          message: {
+            id: messageId, type: "message", role: "assistant", model: modelId,
+            content: [], stop_reason: null, stop_sequence: null,
+            usage: { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
+          },
+        });
+
+        let contentIndex = 0;
+        let currentBlockType: "text" | "thinking" | null = null;
+        let hasToolCalls = false;
+        let stopReason = 0;
+        let inputTokens = 0, outputTokens = 0, cacheReadTokens = 0, cacheWriteTokens = 0;
+
+        const startBlock = (type: "text" | "thinking") => {
+          currentBlockType = type;
+          send("content_block_start", {
+            type: "content_block_start",
+            index: contentIndex,
+            content_block: type === "thinking" ? { type: "thinking", thinking: "" } : { type: "text", text: "" },
+          });
+        };
+
+        const stopBlock = () => {
+          if (currentBlockType) {
+            send("content_block_stop", { type: "content_block_stop", index: contentIndex });
+            contentIndex++;
+            currentBlockType = null;
+          }
+        };
+
+        for await (const ev of streamChat({
+          apiKey: token, modelUid, systemPrompt, messages: prompts, tools,
+          maxTokens, temperature, topP, stopSequences, cascadeId, toolChoice, baseUrl: DEVIN_BASE_URL || undefined,
+        })) {
+          upstreamChunks++;
+          if (ev.type === "thinking" && ev.deltaThinking) {
+            if (currentBlockType !== "thinking") {
+              stopBlock();
+              startBlock("thinking");
+            }
+            send("content_block_delta", {
+              type: "content_block_delta", index: contentIndex,
+              delta: { type: "thinking_delta", thinking: ev.deltaThinking },
+            });
+          } else if (ev.type === "text" && ev.deltaText) {
+            if (currentBlockType !== "text") {
+              stopBlock();
+              startBlock("text");
+            }
+            send("content_block_delta", {
+              type: "content_block_delta", index: contentIndex,
+              delta: { type: "text_delta", text: ev.deltaText },
+            });
+          } else if (ev.type === "toolcall" && ev.toolCalls) {
+            stopBlock();
+            hasToolCalls = true;
+            for (const tc of ev.toolCalls) {
+              const toolId = tc.id || `toolu_${crypto.randomUUID().slice(0, 12)}`;
+              send("content_block_start", {
+                type: "content_block_start", index: contentIndex,
+                content_block: { type: "tool_use", id: toolId, name: tc.name, input: {} },
+              });
+              send("content_block_delta", {
+                type: "content_block_delta", index: contentIndex,
+                delta: { type: "input_json_delta", partial_json: tc.argumentsJson },
+              });
+              send("content_block_stop", { type: "content_block_stop", index: contentIndex });
+              contentIndex++;
+            }
+          } else if (ev.type === "usage" && ev.usage) {
+            inputTokens = ev.usage.inputTokens;
+            outputTokens = ev.usage.outputTokens;
+            cacheReadTokens = ev.usage.cacheReadTokens;
+            cacheWriteTokens = ev.usage.cacheWriteTokens;
+          } else if (ev.type === "done") {
+            stopReason = ev.stopReason ?? 0;
+          } else if (ev.type === "error") {
+            const cls = classifyUpstreamError(ev.error, ev.code);
+            slog(`upstream error: ${ev.error}`);
+            send("error", { type: "error", error: { type: cls.type, message: ev.error } });
+            trace.flush(new Error(ev.error), cls.status);
+          }
+        }
+
+        stopBlock();
+
+        send("message_delta", {
+          type: "message_delta",
+          delta: { stop_reason: stopReasonToAnthropic(stopReason, hasToolCalls), stop_sequence: null },
+          usage: { output_tokens: outputTokens, cache_read_input_tokens: cacheReadTokens, cache_creation_input_tokens: cacheWriteTokens },
+        });
+        send("message_stop", { type: "message_stop" });
+        slog(`done — upstream chunks: ${upstreamChunks}`);
+      } catch (err) {
+        const msg = String((err as Error).message ?? err);
+        const cls = classifyUpstreamError(msg);
+        log.error(`[stream/messages ${reqId}] exception after upstream=${upstreamChunks}:`, err);
+        send("error", { type: "error", error: { type: cls.type, message: msg } });
+        trace.flush(err, cls.status);
+      } finally {
+        controller.close();
+      }
+      }); // runTraceAsync
+    },
+  });
+
+  return new Response(stream, {
+    headers: { "content-type": "text/event-stream", "cache-control": "no-cache", ...corsHeaders(req) },
+  });
+}
+
+// ─── Models list ─────────────────────────────────────────────────────────────
+
+async function handleModels(req: Request, reqId: string, trace: ErrorTrace): Promise<Response> {
+  const url = new URL(req.url);
+  const source = url.searchParams.get("source");
+
+  // Remote discovery by default; ?source=local explicitly selects the built-in catalog.
+  if (source === "local") {
+    const models = listModels();
+    return jsonResponse(req, {
+      object: "list",
+      data: models.map((m: ModelInfo) => ({
+        id: m.id,
+        object: "model",
+        created: 1700000000,
+        owned_by: "devin",
+        context_window: m.contextWindow,
+        max_tokens: m.maxTokens,
+        reasoning: m.reasoning,
+        supports_images: m.supportsImages,
+      })),
+    });
+  }
+
+  // Remote discovery — requires a valid token.
+  const token = extractToken(req);
+  if (!token) return errorResponse(req, 401, "No Devin API key for model discovery. Sign in an account profile, set DEVIN_API_KEY, or pass a credential.", "authentication_error");
+
+  try {
+    const remote = await discoverModels(token, DEVIN_BASE_URL || undefined);
+    return jsonResponse(req, {
+      object: "list",
+      source: "remote",
+      data: remote.map((m) => ({
+        id: m.id,
+        object: "model",
+        created: 1700000000,
+        owned_by: "devin",
+        context_window: m.contextWindow,
+        max_tokens: m.maxTokens,
+        reasoning: m.reasoning,
+        supports_images: m.supportsImages,
+      })),
+    });
+  } catch (err) {
+    log.error(`[models ${reqId}] discovery failed:`, err);
+    trace.flush(err, 502);
+    return errorResponse(req, 502, `Model discovery failed: ${String((err as Error).message ?? err)}`);
+  }
+}
+
+// ─── Server lifecycle ───────────────────────────────────────────────────────
+
+export interface ServerOptions {
+  /** Listening port (default: `PORT` env or `3000`). */
+  port?: number;
+  /** Listening address (default: `HOST` env or `0.0.0.0`). */
+  host?: string;
+  /** Optional in-memory fallback token when a request carries no credentials. */
+  token?: string;
+  /** Override for the Devin API base URL (default: `DEVIN_BASE_URL` env). */
+  baseUrl?: string;
+  /** Backend selection is opt-in. Docker may bind admin internally on all interfaces; publish only on host loopback. */
+  modelSelection?: { directory?: string; adminPort?: number; adminHost?: "127.0.0.1" | "0.0.0.0"; adminPublicPort?: number };
+}
+
+export interface ServerHandle {
+  port: number;
+  host: string;
+  adminPort?: number;
+  /** Gracefully stop the server. */
+  stop: () => Promise<void>;
+}
+
+/**
+ * Start the HTTP gateway. Reads `PORT`/`HOST`/`DEVIN_API_KEY`/`DEVIN_BASE_URL`
+ * from the environment when the equivalent option is omitted. The executable
+ * also passes a saved login token through `ServerOptions.token`; a fallback
+ * is used only when a request omits `Authorization`/`x-api-key` headers.
+ */
+export async function startServer(options: ServerOptions = {}): Promise<ServerHandle> {
+  PORT = options.port ?? Number(process.env.PORT ?? 3000);
+  HOST = options.host ?? process.env.HOST ?? "0.0.0.0";
+  DEFAULT_DEVIN_KEY = options.token ?? process.env.DEVIN_API_KEY ?? "";
+  DEVIN_BASE_URL = options.baseUrl ?? process.env.DEVIN_BASE_URL ?? "";
+  knownLogicalFamilyIds.clear();
+
+  const selectionEnabled = options.modelSelection !== undefined || process.env.DEVIN_MODEL_SELECTION_ENABLED === "1";
+  const configuredAdminPort = options.modelSelection?.adminPort
+    ?? (process.env.DEVIN_ADMIN_PORT === undefined ? undefined : Number(process.env.DEVIN_ADMIN_PORT));
+  if (configuredAdminPort !== undefined && (!selectionEnabled || !Number.isInteger(configuredAdminPort) || configuredAdminPort < 0 || configuredAdminPort > 65535)) {
+    throw new Error("Management listener requires enabled model selection and a valid port.");
+  }
+  const adminHost = options.modelSelection?.adminHost ?? process.env.DEVIN_ADMIN_HOST ?? "127.0.0.1";
+  const adminPublicPort = options.modelSelection?.adminPublicPort
+    ?? (process.env.DEVIN_ADMIN_PUBLIC_PORT === undefined ? undefined : Number(process.env.DEVIN_ADMIN_PUBLIC_PORT));
+  if (adminHost !== "127.0.0.1" && adminHost !== "0.0.0.0") throw new Error("Management bind must be loopback or the explicit Docker interface bind.");
+  if (adminPublicPort !== undefined && (!Number.isInteger(adminPublicPort) || adminPublicPort < 1 || adminPublicPort > 65535)) {
+    throw new Error("Management public loopback port must be valid.");
+  }
+  const selectionStore = selectionEnabled ? new ModelSelectionStore(options.modelSelection?.directory) : undefined;
+  // Account profiles keep tokens in the auth volume and selection in the settings volume. An overlapping directory refuses startup before this point.
+  // A static fallback here is an explicit operator override; the saved login token is never one.
+  // Accounts are on whenever model selection is enabled for this server, by option or environment. DEVIN_ACCOUNTS_DISABLED=1 turns them off.
+  ACCOUNT_RUNTIME = selectionStore && accountProfilesEnabled(selectionEnabled)
+    ? new AccountRuntime(new AccountStore(selectionStore.directory, CONFIG_DIR), CONFIG_DIR, DEFAULT_DEVIN_KEY)
+    : undefined;
+  if (ACCOUNT_RUNTIME) {
+    try {
+      await ACCOUNT_RUNTIME.initialize();
+    } catch {
+      // A static DEVIN_API_KEY does not need account state, so inference still starts.
+      // Account routes report 503 until the store is repaired. Details are not logged.
+      if (!DEFAULT_DEVIN_KEY) throw new Error("Account storage is unavailable; start with DEVIN_API_KEY or repair accounts.json.");
+      log.warn("[accounts] Account storage is unavailable; continuing with the static DEVIN_API_KEY (details redacted).");
+    }
+  }
+  if (selectionStore) await selectionStore.initialize();
+  const testStatusStore = selectionStore ? new ModelTestStatusStore(selectionStore.directory) : undefined;
+  if (testStatusStore) await testStatusStore.initialize();
+  const validationTracker = testStatusStore ? new ModelValidationTracker(testStatusStore) : undefined;
+  // Management writes require the per-install proxy secret. It is created once in the settings volume.
+  const proxySecret = selectionStore ? new AdminProxySecret(selectionStore.directory) : undefined;
+  if (proxySecret) await proxySecret.initialize();
+  const accountRoutes = ACCOUNT_RUNTIME ? createAccountRoutes({ runtime: ACCOUNT_RUNTIME, configDirectory: CONFIG_DIR, proxySecret }) : undefined;
+  const selectionRoutes = selectionStore ? createModelSelectionRoutes({
+    store: selectionStore,
+    proxySecret,
+    testStatusStore,
+    discover: async (req) => {
+      const token = extractToken(req);
+      if (!token) throw new Error("No model discovery credential configured.");
+      const models = await discoverModelMetadata(token, DEVIN_BASE_URL || undefined, req.signal, 5000);
+      for (const family of projectModelFamilies(models)) knownLogicalFamilyIds.add(family.id);
+      return models;
+    },
+  }) : undefined;
+
+  const server = Bun.serve({
+    port: PORT,
+    hostname: HOST,
+    // Bun closes idle streaming connections after 10s by default. Thinking
+    // models can reason for tens of seconds before emitting text, so raise the
+    // ceiling (255 is Bun's max) to keep SSE streams alive through quiet gaps.
+    idleTimeout: 255,
+    async fetch(req: Request): Promise<Response> {
+      // Resolve the credential once per request. Every later read in this request uses this snapshot.
+      if (!REQUEST_CREDENTIALS.has(req)) REQUEST_CREDENTIALS.set(req, await credentialFor(req));
+      const url = new URL(req.url);
+      const method = req.method;
+      const path = url.pathname;
+      // Management never reaches inference CORS, raw body/header logging, or tracing.
+      if (path === "/admin" || path.startsWith("/admin/")) {
+        return Response.json({ error: { code: "not_found", message: "Management API is not exposed on the inference listener." } }, { status: 404 });
+      }
+      if (path === CODEX_SELECTION_PATH) {
+        return selectionRoutes ? selectionRoutes.codex(req) : Response.json({ error: { code: "selection_disabled", message: "Model selection is disabled." } }, { status: 404 });
+      }
+      const startedAt = Date.now();
+      const id = crypto.randomUUID().slice(0, 8);
+      const useSafeResponsesDiagnostic = path === "/v1/responses"
+        && method === "POST"
+        && responsesSafeDiagnosticsEnabled();
+      const credentialScope = validationTracker ? createHash("sha256").update(extractToken(req)).digest("hex") : "";
+      const diagnostic = path === "/v1/responses" && method === "POST" && (useSafeResponsesDiagnostic || validationTracker)
+        ? new ResponsesSafeDiagnostic(id, startedAt, undefined,
+          validationTracker ? (record, evidence) => validationTracker.observe(credentialScope, record, evidence) : undefined,
+          useSafeResponsesDiagnostic) : undefined;
+
+      // CORS preflight
+      if (method === "OPTIONS") {
+        return new Response(null, { status: 204, headers: corsHeaders(req) });
+      }
+
+      // Error trace: collects request context silently, flushed only on failure.
+      const trace = new ErrorTrace(id, method, path);
+      if (diagnostic) {
+        diagnostic.addCredentialValues([
+          extractToken(req),
+          req.headers.get("authorization"),
+          req.headers.get("x-api-key"),
+          req.headers.get("cookie"),
+        ]);
+      } else {
+        // Account-origin tokens never enter the trace, not even masked. Only the origin label is recorded.
+        const credentialOrigin = REQUEST_CREDENTIALS.get(req)?.origin;
+        trace.setToken(credentialOrigin === "account" ? "" : extractToken(req));
+        const headers: Record<string, string> = {};
+        req.headers.forEach((v, k) => { headers[k] = v; });
+        trace.setRequestHeaders(headers);
+      }
+      if (method === "POST" && !diagnostic) {
+        try {
+          const bodyText = await req.clone().text();
+          trace.setRequestBody(bodyText);
+          if (log.enabled("debug")) log.debug(`body [${id}]: ${truncate(bodyText)}`);
+        } catch { /* body not cloneable/empty */ }
+      }
+
+      log.info(`→ ${method} ${path} [${id}]`);
+
+      let res: Response;
+      let handlerError: unknown = null;
+      try {
+        // Run handlers inside the trace ALS context so devin.ts can record
+        // upstream events via currentTrace().
+        const dispatch = () => runTraceAsync(trace, async () => {
+          if (path === "/health" && method === "GET") {
+            const accountReady = ACCOUNT_RUNTIME ? await ACCOUNT_RUNTIME.activeTokenConfigured() : false;
+            return jsonResponse(req, {
+              status: "ok",
+              // "set" means inference has a credential: a static key or a configured active account. Never the token.
+              fallback_token: DEFAULT_DEVIN_KEY || accountReady ? "set" : "not_set",
+              collapse_system_enabled: process.env.DEVIN_CODEX_DESKTOP_COLLAPSE_SYSTEM === "1",
+            });
+          } else if (path === "/v1/models" && method === "GET") {
+            return await handleModels(req, id, trace);
+          } else if (path === "/v1/chat/completions" && method === "POST") {
+            return await handleChatCompletions(req, id, trace);
+          } else if (path === "/v1/responses" && method === "POST") {
+            return await handleResponses(req, id, trace);
+          } else if (path === "/v1/messages" && method === "POST") {
+            return await handleAnthropicMessages(req, id, trace);
+          } else {
+            return errorResponse(req, 404, `Not found: ${method} ${path}`);
+          }
+        });
+        res = diagnostic
+          ? await runWithResponsesDiagnostic(diagnostic, dispatch)
+          : await dispatch();
+      } catch (err) {
+        handlerError = err;
+        if (diagnostic) {
+          diagnostic.recordFailure({
+            source: "gateway_responses_handler_catch",
+            classification: "gateway_internal_error",
+            message: err,
+            terminalStatus: "handler_error",
+          });
+          log.error(`handler error [${id}] ${method} ${path} (details redacted)`);
+        } else {
+          log.error(`handler error [${id}] ${method} ${path}:`, err);
+        }
+        res = errorResponse(req, 500, String((err as Error).message ?? err));
+      }
+
+      const ms = Date.now() - startedAt;
+      const status = res.status;
+      if (status >= 500) log.error(`← ${status} ${method} ${path} ${ms}ms [${id}]`);
+      else if (status >= 400) log.warn(`← ${status} ${method} ${path} ${ms}ms [${id}]`);
+      else log.info(`← ${status} ${method} ${path} ${ms}ms [${id}]`);
+
+      // Flush error trace on any non-2xx response (4xx auth errors, 5xx
+      // upstream/handler failures). Stream errors are flushed inside the
+      // stream handlers themselves; this covers non-streaming + handler throws.
+      if (diagnostic) {
+        if (status >= 400 && !diagnostic.hasFailure) {
+          diagnostic.recordFailure({
+            source: "gateway_responses_http_error",
+            classification: status === 400 ? "gateway_conversion_error" : "gateway_internal_error",
+            terminalStatus: `http_${status}`,
+          });
+        } else if (status < 400 && !diagnostic.isDeferred) {
+          diagnostic.recordSuccessfulCompletion();
+        }
+        diagnostic.finalizeIfNotDeferred();
+      } else if (status >= 400) {
+        const err = handlerError ?? traceFlushError(res, status);
+        const file = trace.flush(err, status);
+        if (file) log.info(`error trace [${id}] → ${file}`);
+      }
+
+      return res;
+    },
+  });
+
+  let adminServer: ReturnType<typeof Bun.serve> | undefined;
+  if (selectionRoutes && configuredAdminPort !== undefined) {
+    const staticPage = createAdminStaticHandler();
+    try {
+      adminServer = Bun.serve({
+        hostname: adminHost, port: configuredAdminPort, idleTimeout: 10,
+        async fetch(req) {
+          if (!managementRequestAllowed(req, adminServer!.port!, adminPublicPort)) {
+            return Response.json({ error: { code: "management_origin_rejected", message: "Management Host/Origin check failed." } }, { status: 403 });
+          }
+          // Resolve credentials only after the origin check, so rejected requests never read the token file.
+          if (!REQUEST_CREDENTIALS.has(req)) REQUEST_CREDENTIALS.set(req, await credentialFor(req));
+          if (new URL(req.url).pathname === ACCOUNTS_PATH && accountRoutes) return accountRoutes.handle(req);
+          return await staticPage(req) ?? selectionRoutes.admin(req);
+        },
+      });
+    } catch {
+      await server.stop(true);
+      throw new Error("Management listener could not start.");
+    }
+  }
+  let shutdownStarted = false;
+  const stop = async (): Promise<void> => {
+    if (shutdownStarted) return;
+    shutdownStarted = true;
+    await adminServer?.stop();
+    await server.stop();
+    await validationTracker?.drain();
+  };
+
+  const handleShutdown = (): void => {
+    void stop().catch((error) => {
+      log.error("[shutdown] Failed to stop cleanly:", error);
+      process.exit(1);
+    });
+  };
+  process.once("SIGTERM", handleShutdown);
+  process.once("SIGINT", handleShutdown);
+  console.log(`Devin Gateway running at http://${HOST}:${PORT}`);
+  console.log(`  OpenAI:    POST /v1/chat/completions, POST /v1/responses, GET /v1/models`);
+  console.log(`  Anthropic: POST /v1/messages`);
+  console.log(`  Health:    GET  /health`);
+  console.log(DEFAULT_DEVIN_KEY
+    ? "  Fallback:  configured (used when a request sends no credentials)"
+    : ACCOUNT_RUNTIME ? "  Fallback:  active account profile (used when a request sends no credentials)" : "  Fallback:  none — each request must send Authorization / x-api-key");
+  if (log.debugMode) {
+    console.log(`  Debug:     ON — verbose logs tee'd to ${log.filePath}`);
+  } else {
+    console.log("  Debug:     off (set DEBUG=true to enable verbose + file logging)");
+  }
+  return { port: PORT, host: HOST, ...(adminServer ? { adminPort: adminServer.port! } : {}), stop };
+}

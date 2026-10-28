@@ -1,0 +1,300 @@
+import { expect, test } from "bun:test";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+test("numeric stop reasons and Responses terminal status are safe; incomplete is not success", () => {
+  const root = mkdtempSync(join(tmpdir(), "synthetic-stop-diagnostics-"));
+  try {
+    for (const reason of [0, 3, 10]) {
+      const path = join(root, `${reason}.jsonl`);
+      const d = new ResponsesSafeDiagnostic("synthetic-stop", Date.now(), path);
+      d.recordUpstreamEvent("toolcall"); d.recordResponsesToolCallEmitted();
+      d.recordUpstreamComplete(); d.recordResponsesTermination(reason); d.recordSuccessfulCompletion(); d.finalize();
+      const record = JSON.parse(readFileSync(path, "utf8"));
+      expect(record).toMatchObject({ upstream_stop_reason: reason, responses_terminal_status: reason === 3 ? "incomplete" : "completed", upstream_toolcall_event_count: 1, responses_tool_call_emitted_count: 1 });
+      expect(record.response_failed_source).toBe(reason === 3 ? undefined : "none");
+    }
+    const path = join(root, "invalid.jsonl"); const d = new ResponsesSafeDiagnostic("synthetic-invalid-stop", Date.now(), path);
+    for (const reason of [NaN, Infinity, -1, 0.5, 0x100000000]) d.recordResponsesTermination(reason);
+    d.finalize(); expect(JSON.parse(readFileSync(path, "utf8")).upstream_stop_reason).toBeUndefined();
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+import { ProtoEncoder } from "../src/proto.ts";
+import {
+  ResponsesSafeDiagnostic,
+  responsesSafeDiagnosticsEnabled,
+  opaqueCallId,
+  MAX_CORRELATION_CALL_ID_BYTES,
+} from "../src/responses-diagnostics.ts";
+
+test("opaque correlation identities preserve exact spelling and enforce UTF-8 budget/control safety", () => {
+  for (const id of ["chatcmpl-tool-91596c45e5ad039f", "synthetic[provider]+=call@id", "synthetic/" + "x".repeat(180), " Provider ID ", "模型-call", "x".repeat(MAX_CORRELATION_CALL_ID_BYTES)]) expect(opaqueCallId(id)).toBe(id);
+  for (const id of [undefined, null, 42, {}, "", "  ", "x".repeat(MAX_CORRELATION_CALL_ID_BYTES + 1), "é".repeat(MAX_CORRELATION_CALL_ID_BYTES / 2 + 1), "a\0b", "a\nb", "a\rb", "a\tb", "a\u0085b", "a\u2028b", "a\u2029b", "a\ud800b"]) expect(opaqueCallId(id)).toBeUndefined();
+  expect(opaqueCallId("Call")).not.toBe(opaqueCallId("call"));
+  expect(opaqueCallId(" call")).not.toBe(opaqueCallId("call"));
+});
+
+test("only normalized evidence retains opaque identity internally; JSONL never contains raw IDs", () => {
+  const root = mkdtempSync(join(tmpdir(), "synthetic-opaque-evidence-")); const path = join(root, "safe.jsonl");
+  try {
+    const id = "synthetic[provider]+=call@" + "x".repeat(150);
+    let evidence: any;
+    const d = new ResponsesSafeDiagnostic("synthetic-opaque", Date.now(), path, (_record, value) => { evidence = value; });
+    d.addSensitiveValues([`Synthetic history ${id}`]);
+    d.recordNormalizedUpstreamToolCall({ id, name: "exec_command" });
+    d.recordNormalizedEmittedToolCall({ id, name: "exec_command" });
+    d.recordNormalizedFunctionCallOutput({ role: "tool", tool_call_id: id, content: "Synthetic private result" }, true);
+    d.recordNormalizedFunctionCallOutput({ role: "user", tool_call_id: "arbitrary", content: "Synthetic user text" }, true);
+    d.recordToolCall("exec_command", id);
+    d.finalize();
+    expect(evidence.emitted).toEqual([{ id, name: "exec_command" }]);
+    expect(evidence.returned).toEqual([{ id, success: true }]);
+    const json = readFileSync(path, "utf8");
+    expect(json).not.toContain(id);
+    expect(JSON.parse(json)).toMatchObject({ had_tool_call: true, had_function_call_output: true, tool_evidence_emitted_count: 1, tool_evidence_returned_count: 1, tool_calls: [{ name: "exec_command" }] });
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("rejected tool identifier survives exhausted history diagnostics without exposing content", () => {
+  const root = mkdtempSync(join(tmpdir(), "synthetic-rejected-tool-")); const path = join(root, "safe.jsonl");
+  try {
+    const d = new ResponsesSafeDiagnostic("synthetic-rejected", Date.now(), path);
+    d.addSensitiveValues(["Private synthetic history mentions exec and contains arguments/results"]);
+    d.recordResolvedRouting({ logicalModel: "claude-haiku-5-5", requestedEffort: "xhigh", resolvedModelId: "claude-haiku-5-5-xhigh" });
+    for (let i = 0; i < 100; i++) {
+      d.recordToolCall(`historical_${i}`, `call-${i}`);
+      d.recordNormalizedUpstreamToolCall({ id: `call-${i}`, name: `historical_${i}` });
+    }
+    d.recordUndeclaredTool("exec");
+    d.finalize();
+    const raw = readFileSync(path, "utf8"); const record = JSON.parse(raw);
+    expect(record.identifier_checks).toHaveLength(64);
+    expect(record.tool_calls).toHaveLength(16);
+    expect(record.rejected_tool).toEqual({ category: "undeclared_name", name: "exec" });
+    expect(record.resolved_model_id).toBe("claude-haiku-5-5-xhigh");
+    expect(record.bridge_outcomes.undeclared_name).toBe(1);
+    expect(raw).not.toContain("Private synthetic history");
+    expect(raw).not.toContain("arguments/results");
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("rejected tool field omits unsafe, oversized, secret-like or credential identifiers", () => {
+  const root = mkdtempSync(join(tmpdir(), "synthetic-rejected-private-"));
+  try {
+    for (const [i, name] of ["bad\nidentifier", "x".repeat(129), "api_key_value", "syntheticCredentialValue", " padded "].entries()) {
+      const path = join(root, `${i}.jsonl`); const d = new ResponsesSafeDiagnostic("synthetic-private", Date.now(), path);
+      d.addCredentialValues(["syntheticCredentialValue"]);
+      d.recordUndeclaredTool(name); d.finalize();
+      const raw = readFileSync(path, "utf8");
+      expect(JSON.parse(raw).rejected_tool).toEqual({ category: "undeclared_name" });
+      expect(raw).not.toContain(name);
+    }
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("safe Responses diagnostics are explicitly opt-in", () => {
+  expect(responsesSafeDiagnosticsEnabled(undefined)).toBe(false);
+  expect(responsesSafeDiagnosticsEnabled("true")).toBe(false);
+  expect(responsesSafeDiagnosticsEnabled("1")).toBe(true);
+});
+
+test("stage diagnostics contain fixed rejection reasons and normalized counts, never rejected values or input text", () => {
+  const root = mkdtempSync(join(tmpdir(), "synthetic-stage-diagnostics-")); const path = join(root, "safe.jsonl");
+  try {
+    const d = new ResponsesSafeDiagnostic("synthetic-stage", Date.now(), path);
+    const privateValue = "synthetic-sensitive-4917";
+    d.addCredentialValues([privateValue]); d.addSensitiveValues(["Synthetic history references valid-call exec_command", "private-looking-id"]);
+    d.recordRequestStructure([{ role: "developer", content: "Synthetic private developer" }, { role: "tool", tool_call_id: "valid-call", content: "Synthetic private tool output" }], { type: "function", name: "exec_command" }, { toolName: "exec_command" }, true);
+    d.recordUpstreamEvent("toolcall");
+    for (const id of ["", "synthetic\ninvalid value", privateValue, "synthetic-token-value", "valid-call"]) d.recordNormalizedUpstreamToolCall({ id, name: "exec_command" });
+    d.recordToolCall("exec_command", "private-looking-id");
+    d.recordNormalizedEmittedToolCall({ id: "valid-call", name: "exec_command" }); d.recordResponsesToolCallEmitted(); d.finalize();
+    const json = readFileSync(path, "utf8"); const r = JSON.parse(json);
+    expect(r).toMatchObject({ tool_choice_mode: "specific", requested_specific_tool: "exec_command", upstream_tool_choice_mode: "specific", client_parallel_tool_calls: true, upstream_parallel_tool_calls: false, normalized_input_type_counts: { developer: 1, function_call_output: 1 }, function_call_output_input_count: 1, upstream_toolcall_event_count: 1, normalized_tool_call_object_count: 5 });
+    expect(r.identifier_checks.filter((c: any) => c.field === "call_id" && c.state === "rejected").map((c: any) => c.reason)).toEqual(["missing", "invalid_format", "redaction_collision", "secret_like", "redaction_collision"]);
+    expect(r.identifier_checks).toContainEqual({ stage: "emitted_evidence", field: "call_id", state: "accepted", reason: "none", sensitive_text_overlap: true });
+    for (const value of [privateValue, "synthetic invalid value", "synthetic-token-value", "private-looking-id", "Synthetic private", "Synthetic history"]) expect(json).not.toContain(value);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("provider outages, policy denial, generic Connect errors and stream failures remain distinct and redacted", () => {
+  const root = mkdtempSync(join(tmpdir(), "provider-classification-test-"));
+  const info = new ProtoEncoder(); info.string(1, "MODEL_PROVIDER_UNAVAILABLE"); info.string(2, "synthetic-private-domain");
+  const cases = [
+    { code: "invalid_argument", message: "The third-party model provider is experiencing issues and is currently not available. Please try this model again later.", expected: "devin_upstream_model_provider_unavailable" },
+    { code: "unavailable", message: "Third party provider unavailable", expected: "devin_upstream_model_provider_unavailable" },
+    { code: "invalid_argument", message: "synthetic-private-message", details: [{ type: "google.rpc.ErrorInfo", value: Buffer.from(info.finish()).toString("base64") }], expected: "devin_upstream_model_provider_unavailable" },
+    { code: "invalid_argument", message: "Bad argument", expected: "devin_connect_error" },
+    { code: "permission_denied", message: "Content policy denial", expected: "devin_policy_denial" },
+    { code: "unavailable", message: "Network service unavailable", expected: "devin_connect_error" },
+  ];
+  try {
+    for (const [index, row] of cases.entries()) {
+      const path = join(root, `${index}.jsonl`);
+      const diagnostic = new ResponsesSafeDiagnostic(`synthetic-${index}`, Date.now(), path);
+      diagnostic.recordRouting("synthetic-model", "medium", "synthetic-wire-model");
+      diagnostic.recordUpstreamResponse(200, true);
+      diagnostic.recordConnectError(row);
+      diagnostic.finalize();
+      const json = readFileSync(path, "utf8"); const record = JSON.parse(json);
+      expect(record.failure_classification).toBe(row.expected);
+      expect(record.upstream_http_status).toBe(200);
+      expect(record.upstream_error_code).toBe(row.code);
+      expect(json).not.toContain("synthetic-private");
+      expect(record).not.toHaveProperty("details");
+    }
+    const path = join(root, "stream.jsonl");
+    const diagnostic = new ResponsesSafeDiagnostic("synthetic-stream", Date.now(), path);
+    diagnostic.recordUpstreamError({ terminalStatus: "chat_stream_error", message: "synthetic-private-stream" });
+    diagnostic.finalize();
+    expect(JSON.parse(readFileSync(path, "utf8")).failure_classification).toBe("devin_stream_error");
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("routing diagnostics retain safe model metadata and reject secret values", () => {
+  const directory = mkdtempSync(join(tmpdir(), "candidate-diagnostic-test-"));
+  try {
+    const path = join(directory, "safe.jsonl");
+    const diagnostic = new ResponsesSafeDiagnostic("synthetic-candidate", Date.now(), path);
+    diagnostic.recordRouting("SYNTHETIC_SECRET", "high", "swe-2-high");
+    diagnostic.recordRouting("swe-2", "max", "swe-2-max");
+    diagnostic.recordRouting("swe-2", "high", "SYNTHETIC_SECRET");
+    diagnostic.finalize();
+    const record = JSON.parse(readFileSync(path, "utf8"));
+    expect(record.logical_model).toBe("swe-2");
+    expect(record.requested_effort).toBe("max");
+    expect(record.resolved_model_id).toBe("swe-2-max");
+    expect(record).not.toHaveProperty("terminal_status");
+    expect(readFileSync(path, "utf8")).not.toContain("SYNTHETIC_SECRET");
+  } finally { rmSync(directory, { recursive: true, force: true }); }
+});
+
+test("diagnostic JSONL contains allowlisted hashes and normalized errors, never raw input or credentials", () => {
+  const directory = mkdtempSync(join(tmpdir(), "devin-responses-diagnostic-test-"));
+  const path = join(directory, "responses-safe-diagnostic.jsonl");
+  const prompt = "SYNTHETIC_PRIVATE_PROMPT_DO_NOT_PERSIST_8f02";
+  const instruction = "SYNTHETIC_SYSTEM_INSTRUCTION_DO_NOT_PERSIST_b61e";
+  const apiToken = "SYNTHETIC_API_TOKEN_DO_NOT_PERSIST_4c18";
+  const cookie = "SYNTHETIC_COOKIE_DO_NOT_PERSIST_23a1";
+  const description = "SYNTHETIC_TOOL_DESCRIPTION_DO_NOT_PERSIST_9b2d";
+  const schema = '{"description":"SYNTHETIC_SCHEMA_DO_NOT_PERSIST_70e1"}';
+
+  try {
+    const diagnostic = new ResponsesSafeDiagnostic("req_safe_1", Date.now(), path);
+    diagnostic.addSensitiveValues([apiToken, cookie, JSON.stringify({ prompt, instruction })]);
+    diagnostic.setRequestSummary({
+      modelId: "glm-5-3-flash-low",
+      instructions: instruction,
+      userInput: prompt,
+      collapseSystemEnabled: true,
+      collapsedUserPayload: `<system>${instruction}</system>${prompt}`,
+      tools: [{
+        name: "exec_command",
+        originalName: "exec_command",
+        description,
+        jsonSchemaString: schema,
+        strict: true,
+      }],
+    });
+    diagnostic.recordUpstreamResponse(200, true, ["trace-12345678"]);
+    diagnostic.recordUpstreamResponse(200, false, [], "auth");
+    diagnostic.recordUpstreamEvent("toolcall");
+    diagnostic.recordUpstreamEvent("text");
+    diagnostic.recordToolCall("exec_command", "call-123");
+    diagnostic.recordConnectError({
+      code: "permission_denied",
+      message: `MCP configuration issue: ${prompt}; Authorization: Bearer ${apiToken}; Cookie: ${cookie}`,
+      traceIds: ["trace-12345678"],
+    });
+    diagnostic.recordFailure({
+      source: "gateway_responses_stream_catch",
+      classification: "devin_policy_denial",
+      message: prompt,
+      terminalStatus: "connect_error",
+    });
+    expect(diagnostic.finalize()).toBe(true);
+
+    const serialized = readFileSync(path, "utf8");
+    const lines = serialized.trim().split(/\r?\n/);
+    expect(lines).toHaveLength(1);
+    for (const raw of [prompt, instruction, apiToken, cookie, description, schema, "SYNTHETIC_SCHEMA_DO_NOT_PERSIST_70e1"]) {
+      expect(serialized).not.toContain(raw);
+    }
+
+    const record = JSON.parse(lines[0]);
+    expect(record).toMatchObject({
+      request_id: "req_safe_1",
+      model_id: "glm-5-3-flash-low",
+      tool_names: ["exec_command"],
+      collapse_system_enabled: true,
+      upstream_http_status: 200,
+      upstream_http_statuses: [{ stage: "chat", status: 200 }, { stage: "auth", status: 200 }],
+      upstream_event_count: 2,
+      connect_error_code: "permission_denied",
+      connect_error_message: "MCP configuration issue",
+      devin_trace_id: "trace-12345678",
+      response_failed_source: "gateway_responses_stream_catch",
+      failure_classification: "devin_policy_denial",
+    });
+    expect(record.instruction_byte_length).toBe(Buffer.byteLength(instruction, "utf8"));
+    expect(record.user_input_byte_length).toBe(Buffer.byteLength(prompt, "utf8"));
+    expect(record.forwarded_tool_fingerprints[0].schema_sha256).toMatch(/^[a-f0-9]{64}$/);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("unsafe or secret-like trace IDs are omitted", () => {
+  const directory = mkdtempSync(join(tmpdir(), "devin-responses-trace-test-"));
+  const path = join(directory, "record.jsonl");
+  try {
+    const diagnostic = new ResponsesSafeDiagnostic("req_safe_2", Date.now(), path);
+    diagnostic.addSensitiveValues(["private-token-value"]);
+    diagnostic.recordUpstreamResponse(200, true, ["private-token-value", "Bearer-secret-123456"]);
+    diagnostic.finalize();
+    const record = JSON.parse(readFileSync(path, "utf8"));
+    expect(record.devin_trace_id).toBeUndefined();
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("diagnostic fields reject unrecognized Connect codes and count only recognized upstream event types", () => {
+  const directory = mkdtempSync(join(tmpdir(), "devin-responses-allowlist-test-"));
+  const path = join(directory, "record.jsonl");
+  try {
+    const diagnostic = new ResponsesSafeDiagnostic("req_safe_3", Date.now(), path);
+    (diagnostic as unknown as { record: Record<string, unknown> }).record.raw_prompt = "UNALLOWLISTED_FIELD_MUST_NOT_BE_WRITTEN";
+    diagnostic.recordUpstreamEvent("thinking");
+    diagnostic.recordUpstreamEvent("private prompt should not be an event");
+    diagnostic.recordConnectError({ code: "synthetic-private-token", message: "unclassified backend prose" });
+    diagnostic.finalize();
+    const record = JSON.parse(readFileSync(path, "utf8"));
+    expect(record).toMatchObject({
+      upstream_event_count: 1,
+      upstream_event_types: ["thinking"],
+      connect_error_code: "unknown",
+      connect_error_message: "Upstream error message redacted",
+    });
+    expect(readFileSync(path, "utf8")).not.toContain("synthetic-private-token");
+    expect(readFileSync(path, "utf8")).not.toContain("private prompt should not be an event");
+    expect(readFileSync(path, "utf8")).not.toContain("UNALLOWLISTED_FIELD_MUST_NOT_BE_WRITTEN");
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("duplicate declaration diagnostics persist bounded content-free outcomes", () => {
+ const root = mkdtempSync(join(tmpdir(), "synthetic-declaration-")); const path = join(root, "safe.jsonl");
+ try {
+  const d = new ResponsesSafeDiagnostic("synthetic-declaration", Date.now(), path);
+  for (let i = 0; i < 40; i++) d.recordDuplicateDeclaration({ outcome: ["identical", "key_order_equivalent", "conflicting"][i % 3] as any,
+   first: { container: "tools", index: 0, structural_hash: "a".repeat(64) }, second: { container: "additional_tools", index: 1, structural_hash: "b".repeat(64) } });
+  d.finalize();
+  const records = JSON.parse(readFileSync(path, "utf8")).duplicate_declarations;
+  expect(records).toHaveLength(32);
+  expect(records.slice(0, 3).map((r: any) => r.outcome)).toEqual(["identical", "key_order_equivalent", "conflicting"]);
+  expect(Object.keys(records[0]).sort()).toEqual(["first", "outcome", "second"]);
+ } finally { rmSync(root, { recursive: true, force: true }); }
+});

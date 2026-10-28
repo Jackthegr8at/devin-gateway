@@ -1,0 +1,58 @@
+services:
+  devin-gateway:
+    image: devin-gateway-codex:local
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "${DEVIN_GATEWAY_BIND_IP:?Set DEVIN_GATEWAY_BIND_IP in .env to a private gateway host interface IP}:38643:3000"
+      # Install the persistent source-restricted firewall BEFORE publication.
+      - "${DEVIN_GATEWAY_BIND_IP:?Set DEVIN_GATEWAY_BIND_IP in .env to a private gateway host interface IP}:38644:3001"
+    environment:
+      PORT: "3000"
+      HOST: "0.0.0.0"
+      DEVIN_GATEWAY_CONFIG_DIR: "/home/gateway/.devin-gateway"
+      DEVIN_GATEWAY_SETTINGS_DIR: "/home/gateway/.devin-gateway-settings"
+      DEVIN_MODEL_SELECTION_ENABLED: "1"
+      DEVIN_ADMIN_HOST: "0.0.0.0"
+      DEVIN_ADMIN_PORT: "3001"
+      DEVIN_CODEX_DESKTOP_COLLAPSE_SYSTEM: "1"
+      DEVIN_SWE_AUTONOMOUS_CONTINUATION: "${DEVIN_SWE_AUTONOMOUS_CONTINUATION:-0}"
+      DEVIN_CROSS_PROVIDER_SKIP_COMPACTION: "${DEVIN_CROSS_PROVIDER_SKIP_COMPACTION:-0}"
+      DEVIN_RESPONSES_SAFE_DIAGNOSTICS: "${DEVIN_RESPONSES_SAFE_DIAGNOSTICS:-0}"
+      DEVIN_RESPONSES_SAFE_DIAGNOSTICS_PATH: "/app/logs/responses-safe-diagnostic.jsonl"
+      DEVIN_RESPONSES_FULL_CATALOG_DIAGNOSTICS: "${DEVIN_RESPONSES_FULL_CATALOG_DIAGNOSTICS:-0}"
+      DEVIN_RESPONSES_CATALOG_BISECTION: "${DEVIN_RESPONSES_CATALOG_BISECTION:-0}"
+      DEVIN_RESPONSES_CATALOG_BISECTION_DIR: "/app/logs/catalog-bisection"
+      DEVIN_RESPONSES_FULL_CATALOG_RETENTION: "${DEVIN_RESPONSES_FULL_CATALOG_RETENTION:-20}"
+      DEVIN_RESPONSES_FULL_CATALOG_DIR: "${DEVIN_RESPONSES_FULL_CATALOG_DIR:-/app/logs/full-catalog}"
+      ERROR_TRACE: "false"
+      LOG_LEVEL: "info"
+      DEBUG: "false"
+      LOG_FILE: "/app/logs/gateway.log"
+    volumes:
+      - ./logs:/app/logs
+      - devin-gateway-auth:/home/gateway/.devin-gateway
+      - devin-gateway-settings:/home/gateway/.devin-gateway-settings
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:$${PORT:-3000}/health | grep -q '\"status\":\"ok\".*\"collapse_system_enabled\":true'"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+
+  devin-login:
+    image: devin-gateway-codex:local
+    profiles: ["auth"]
+    entrypoint: ["su-exec", "gateway", "bun", "run", "src/cli/login.ts", "--paste", "--no-display-token"]
+    environment:
+      DEVIN_GATEWAY_CONFIG_DIR: "/home/gateway/.devin-gateway"
+    volumes:
+      - devin-gateway-auth:/home/gateway/.devin-gateway
+    stdin_open: true
+    tty: true
+
+volumes:
+  devin-gateway-auth:
+  devin-gateway-settings:
